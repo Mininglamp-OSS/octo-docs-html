@@ -10,7 +10,7 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
@@ -56,7 +56,7 @@ jobs:
       OCTO_TEST_S3_ACCESS_KEY_ID: minioadmin
       OCTO_TEST_S3_SECRET_ACCESS_KEY: minioadmin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
@@ -81,6 +81,6 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build image
         run: docker build -f deploy/Dockerfile -t octo-doc:ci .
