@@ -25,6 +25,8 @@ import (
 )
 
 func TestFullLifecycle(t *testing.T) {
+	// Exercise the current proxy-trusted Octo identity contract end to end.
+	// Legacy WRITE_TOKEN bearer auth is not an author identity.
 	dbURL := os.Getenv("OCTO_TEST_DATABASE_URL")
 	bucket := os.Getenv("OCTO_TEST_S3_BUCKET")
 	if dbURL == "" || bucket == "" {
