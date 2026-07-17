@@ -94,8 +94,12 @@ for workflow in auto-add-to-project.yml check-sprint.yml; do
   fi
 done
 
-if ! grep -Fq "- 'deploy/Dockerfile*'" .github/workflows/docker-lint.yml; then
+if ! grep -Fq -- "- 'deploy/Dockerfile*'" .github/workflows/docker-lint.yml; then
   echo 'docker lint must watch deploy/Dockerfile' >&2
+  exit 1
+fi
+if ! grep -Fq "dockerfiles: 'deploy/Dockerfile'" .github/workflows/docker-lint.yml; then
+  echo 'docker lint must lint deploy/Dockerfile' >&2
   exit 1
 fi
 
