@@ -13,13 +13,13 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/transport/httpx"
 )
 
-// P1-A / P1b regression tests (yujiawei rounds 2 & 3 on PR #17).
+// P1-A / P1b regression tests.
 //
 // P1-A: doc_member rows register asynchronously (DocService.afterPublished
-// go-routine) and thread-mount / non-mounted docs never register, so a WIRED
-// mirror can legitimately return DocIDBySlug ok=false on a live doc. In that
-// state A3② / A4 must fall back to the meta-based legacy match, otherwise a
-// bot-behind-owner would 404 its own freshly published doc and a legacy
+// go-routine) and non-mounted / failed-registration docs never register, so a
+// WIRED mirror can legitimately return DocIDBySlug ok=false on a live doc. In
+// that state A3② / A4 must fall back to the meta-based legacy match, otherwise
+// a bot-behind-owner would 404 its own freshly published doc and a legacy
 // reader grant that landed pre-registration would disappear.
 //
 // P1b (round 3): the fallback is ONLY safe when the doc is truly unregistered.
@@ -48,9 +48,8 @@ func newServerWithMirrorAndBotAuth(t *testing.T, mirror *stubMirror) (http.Handl
 
 // A3② unregistered doc: DocIDBySlug returns ok=false (doc not in doc_member
 // yet) -> docRegistered=false -> meta fallback allowed -> creator_uid==ownerUID
-// authors the bot. Mirrors the real async/thread-mount case yujiawei
-// documented on PR #17: bot bearer would otherwise 404 its own freshly
-// published doc.
+// authors the bot. Mirrors the real async pre-registration gap: bot bearer
+// would otherwise 404 its own freshly published doc.
 func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	mirror := &stubMirror{} // no slugToDoc, no roles -> DocIDBySlug ok=false
@@ -67,13 +66,14 @@ func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 	}
 }
 
-// A3② P1-a lockout close (yujiawei round-5): doc IS registered but no
+// A3② P1-a lockout close: doc IS registered but no
 // doc_member owner-admin row (M1 has not backfilled yet, or docs-backend
-// registered the doc atomically without owner-admin, or thread-mount
-// state). A3②'s fallback keys on creator_uid, which is stamped at
+// registered the doc atomically without owner-admin). A3②'s fallback keys on
+// creator_uid, which is stamped at
 // publish and never revocable, so falling back is safe: it cannot
-// resurrect a revoked grant. Round-3 gated this path on docRegistered
-// and locked the owner out of their own doc; round-5 removes the gate
+// resurrect a revoked grant. An earlier revision gated this path on
+// docRegistered
+// and locked the owner out of their own doc; the gate was later removed
 // on A3② only (A4 keeps its gate, see TestA4RegisteredDocDeletedRowNoFallback).
 func TestA3OwnerFallbackAllowedWhenDocRegisteredButRowMissing(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-2", botName: "Bot Two", botSpaceID: "s2", botOwnerUID: "owner-2"})
@@ -134,7 +134,7 @@ func TestA3OwnerAdminInDocMemberStillWinsAfterFallback(t *testing.T) {
 }
 
 // A4 unregistered doc falls back to meta.grants: mirror wired but no
-// slug->docID mapping (thread-mount / async pre-registration state). The
+// slug->docID mapping (async pre-registration state). The
 // reader tier's wired probe returns docRegistered=false and legacy
 // meta.grants[uid]=reader keeps the caller readable.
 func TestA4UnregisteredDocFallsBackToMeta(t *testing.T) {

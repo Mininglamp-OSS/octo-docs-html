@@ -614,10 +614,10 @@ func TestRoleBySlugUIDRegisteredHitReturnsRole(t *testing.T) {
 	}
 }
 
-// yujiawei round-3 P2: AddGrant on an unregistered doc must fall back to
+// AddGrant on an unregistered doc must fall back to
 // meta.grants, matching reads / ListGrants / RemoveGrant. Prior to this fix
-// it 404'd, which made thread-mount / non-mounted docs (which never register
-// in doc_member) permanently un-grantable while still readable — an
+// it 404'd, which made docs still in the pre-registration gap (or non-mounted /
+// failed registration) permanently un-grantable while still readable — an
 // asymmetric API surface.
 func TestAddGrantUnregisteredFallsBackToMeta(t *testing.T) {
 	svc, slug := newGrantSvc(t)

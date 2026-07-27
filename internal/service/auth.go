@@ -120,7 +120,8 @@ func (s *AuthService) DocMembersWired() bool { return s.docMembers != nil }
 // still granting read (revoke bypass). docRegistered separates them:
 //
 //   - docRegistered=false, ok=false: mirror unwired, uid empty, or doc has no
-//     doc_member registration yet (async publish, thread-mount, non-mounted).
+//     doc_member registration yet (async publish gap, non-mounted, or a failed
+//     registration).
 //     Callers may fall back to legacy meta.
 //   - docRegistered=true, ok=false: doc IS registered but uid has no row.
 //     Caller MUST treat this as "no access via this tier" and MUST NOT fall

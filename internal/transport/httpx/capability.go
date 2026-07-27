@@ -147,8 +147,8 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 		// row exists, falls back to the pre-plan③ owner-preferring match on
 		// meta.creator_uid. The fallback is not just an unwired-deploy escape:
 		// doc_member rows are registered asynchronously (DocService.afterPublished
-		// go func) and thread-mount / non-mounted docs are never registered at
-		// all, so a wired mirror can legitimately return ok=false on a live doc.
+		// go func) and non-mounted / failed-registration docs are never registered
+		// at all, so a wired mirror can legitimately return ok=false on a live doc.
 		// Without this fallback the same-owner bot session (Bearer bot-token)
 		// would 404 on a doc it just published. Skipped when ownerUID == "".
 		if ownerUID != "" {

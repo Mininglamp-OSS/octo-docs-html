@@ -305,25 +305,31 @@ func TestDocsBackendRegisterUsesCallerContext(t *testing.T) {
 	}
 }
 
-func TestPublishSkipsThreadMountedDocRegistration(t *testing.T) {
+func TestPublishRegistersThreadMountedDoc(t *testing.T) {
 	ts, reqs := newDocsBackendStub(t, http.StatusOK)
 	defer ts.Close()
 	ds := newDocWithDocsBackend(t, ts.URL+"/v1/bot/docs")
 
 	result, err := ds.Publish(context.Background(), service.PublishInput{
 		Slug: "thread-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Thread Title",
-		MountType: "thread", GroupNo: "g-1", ThreadID: "t-1",
+		MountType: "thread", GroupNo: "g-1", ThreadID: "t-1", PublisherToken: "publisher-token",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Registered || result.Status != "published_unregistered" {
+	if !result.Registered || result.Status != "published" || result.DocID != "doc-thread-doc" || result.ShareURL == "" {
 		t.Fatalf("result = %+v", result)
 	}
-	if result.URL != "" || result.ShareURL != "" || result.RenderURL != "/d/thread-doc/v/1" {
-		t.Fatalf("unregistered result exposes a non-canonical url: %+v", result)
+	if result.URL != result.ShareURL {
+		t.Fatalf("url = %q, share_url = %q; want canonical URLs to match", result.URL, result.ShareURL)
 	}
-	assertNoDocsBackendRequest(t, reqs)
+	req := waitDocsBackendRequest(t, reqs)
+	if req.Authorization != "Bearer publisher-token" {
+		t.Fatalf("Authorization = %q, want Bearer publisher-token", req.Authorization)
+	}
+	if req.Body["mountType"] != "thread" || req.Body["octoDocSlug"] != "thread-doc" || req.Body["title"] != "Thread Title" {
+		t.Fatalf("registration body = %#v", req.Body)
+	}
 }
 
 func TestPublishSkipsRegistrationWhenNoMountType(t *testing.T) {

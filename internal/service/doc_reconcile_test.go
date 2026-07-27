@@ -100,10 +100,7 @@ func TestAfterPublishedNilReconcilerSafe(t *testing.T) {
 	}
 }
 
-// thread-mount docs never register, so afterPublished must not fire the
-// reconciler for them — matching the "not registerable ⇒ nothing to
-// reconcile" invariant.
-func TestAfterPublishedThreadMountSkipsReconciler(t *testing.T) {
+func TestAfterPublishedThreadMountTriggersReconciler(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()
 	comments := service.NewCommentService(store, locker)
@@ -123,12 +120,11 @@ func TestAfterPublishedThreadMountSkipsReconciler(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	time.Sleep(50 * time.Millisecond)
-	if called.Load() != 0 {
-		t.Fatalf("reconciler fired on thread-mount doc: %d calls", called.Load())
+	if called.Load() != 1 {
+		t.Fatalf("reconciler calls = %d; want 1", called.Load())
 	}
-	if registrar.registered.Load() != 0 {
-		t.Fatalf("registrar called on thread-mount doc: %d", registrar.registered.Load())
+	if registrar.registered.Load() != 1 {
+		t.Fatalf("register calls = %d; want 1", registrar.registered.Load())
 	}
 }
 
@@ -147,7 +143,7 @@ func TestReplaceElementRestoresPersistedMountContext(t *testing.T) {
 
 	ctx := context.Background()
 	if _, err := docs.Publish(ctx, service.PublishInput{
-		Slug: "replace-mounted", HTML: "<html><body><section><p>old</p></section></body></html>", MountType: "group",
+		Slug: "replace-mounted", HTML: "<html><body><section><p>old</p></section></body></html>", MountType: "thread",
 	}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
@@ -182,8 +178,8 @@ func TestReplaceElementRestoresPersistedMountContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mountType, ok := meta.MountType(); !ok || mountType != "group" {
-		t.Fatalf("persisted mount = %q, %v; want group, true", mountType, ok)
+	if mountType, ok := meta.MountType(); !ok || mountType != "thread" {
+		t.Fatalf("persisted mount = %q, %v; want thread, true", mountType, ok)
 	}
 }
 
@@ -269,7 +265,7 @@ func TestPromoteRestoresMountAndRenames(t *testing.T) {
 
 	ctx := context.Background()
 	if _, err := docs.Publish(ctx, service.PublishInput{
-		Slug: "promote-mounted", HTML: "<html><body><p>v1</p></body></html>", Title: "Old", MountType: "space",
+		Slug: "promote-mounted", HTML: "<html><body><p>v1</p></body></html>", Title: "Old", MountType: "thread",
 	}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}

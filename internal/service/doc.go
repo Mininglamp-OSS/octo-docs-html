@@ -112,7 +112,7 @@ type PublishInput struct {
 	// caller (bot) knows where it is publishing, so no user-token binding query
 	// is needed. MountTypePresent distinguishes an omitted field from an explicit
 	// empty value; neither implicitly unmounts an existing mounted document.
-	MountType        string // "group" | "space" | "thread" (thread ⇒ skipped)
+	MountType        string // "group" | "space" | "thread" (all registerable)
 	MountTypePresent bool
 	GroupNo          string
 	ThreadID         string
@@ -827,10 +827,7 @@ func (s *DocService) registrationForMount(slug, title, mountType string) (docsba
 	case "":
 		s.log().Debug("docs_backend_register skipped: no mount_type", "slug", slug)
 		return docsbackend.Registration{}, false
-	case "thread":
-		s.log().Debug("docs_backend_register skipped: thread mount", "slug", slug)
-		return docsbackend.Registration{}, false
-	case "group", "space":
+	case "group", "space", "thread":
 	default:
 		s.log().Debug("docs_backend_register skipped: unsupported mount_type", "slug", slug, "mount_type", mountType)
 		return docsbackend.Registration{}, false

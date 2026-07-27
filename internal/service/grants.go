@@ -168,12 +168,13 @@ func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grante
 		return err
 	}
 	if !ok {
-		// yujiawei round-3 P2: doc not yet registered in doc_member (async
-		// afterPublished, or thread-mount/non-mounted which never register).
-		// Reads / ListGrants / RemoveGrant all fall back to meta.grants in
-		// this state; AddGrant used to 404 here, breaking API symmetry and
-		// making thread-mount docs un-grantable forever. Fall back to the
-		// legacy meta.grants writer so the four operations stay aligned.
+		// Doc not yet registered in doc_member (async afterPublished gap, or a
+		// non-mounted / failed registration). Thread mounts are registerable,
+		// but may transiently land here during the async gap. Reads /
+		// ListGrants / RemoveGrant all fall back to meta.grants in this state;
+		// AddGrant used to 404 here, breaking API symmetry and making such docs
+		// un-grantable. Fall back to the legacy meta.grants writer so the four
+		// operations stay aligned.
 		return s.addGrantToMeta(ctx, slug, uid, grantRoleReader, grantedBy)
 	}
 	role, ok, err := s.docMembers.RoleByDocUID(ctx, docID, uid)
@@ -272,9 +273,10 @@ func (s *AuthService) removeGrantFromDocMember(ctx context.Context, slug, uid st
 		return err
 	}
 	if !ok {
-		// Doc not registered in rich-doc yet (async publish gap, thread-mount,
-		// non-mounted). Nothing to delete from doc_member — the caller
-		// (RemoveGrant) still sweeps meta.grants unconditionally.
+		// Doc not registered in rich-doc yet (async publish gap, or a
+		// non-mounted / failed registration). Nothing to delete from
+		// doc_member — the caller (RemoveGrant) still sweeps meta.grants
+		// unconditionally.
 		return nil
 	}
 	// Probe first so an absent uid is a true no-op (no wasted DELETE, no
