@@ -15,12 +15,12 @@ import (
 
 // P1-A / P1b regression tests.
 //
-// P1-A: doc_member rows register asynchronously (DocService.afterPublished
-// go-routine) and non-mounted / failed-registration docs never register, so a
-// WIRED mirror can legitimately return DocIDBySlug ok=false on a live doc. In
-// that state A3② / A4 must fall back to the meta-based legacy match, otherwise
-// a bot-behind-owner would 404 its own freshly published doc and a legacy
-// reader grant that landed pre-registration would disappear.
+// P1-A: doc_member rows appear after the HTML commit during the publish request,
+// and non-mounted / failed-registration docs never register. A wired mirror can
+// therefore return DocIDBySlug ok=false on a live doc. In that state A3② / A4
+// must fall back to the meta-based legacy match, otherwise a bot-behind-owner
+// would 404 its own freshly published doc and a grant created in the
+// registration gap would disappear.
 //
 // P1b (round 3): the fallback is ONLY safe when the doc is truly unregistered.
 // If the doc IS registered but the caller has no doc_member row (e.g. a M2
@@ -48,7 +48,7 @@ func newServerWithMirrorAndBotAuth(t *testing.T, mirror *stubMirror) (http.Handl
 
 // A3② unregistered doc: DocIDBySlug returns ok=false (doc not in doc_member
 // yet) -> docRegistered=false -> meta fallback allowed -> creator_uid==ownerUID
-// authors the bot. Mirrors the real async pre-registration gap: bot bearer
+// authors the bot. Mirrors the post-commit registration gap: bot bearer
 // would otherwise 404 its own freshly published doc.
 func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
@@ -69,11 +69,9 @@ func TestA3OwnerFallsBackToMetaWhenDocUnregistered(t *testing.T) {
 // A3② P1-a lockout close: doc IS registered but no
 // doc_member owner-admin row (M1 has not backfilled yet, or docs-backend
 // registered the doc atomically without owner-admin). A3②'s fallback keys on
-// creator_uid, which is stamped at
-// publish and never revocable, so falling back is safe: it cannot
-// resurrect a revoked grant. An earlier revision gated this path on
-// docRegistered
-// and locked the owner out of their own doc; the gate was later removed
+// creator_uid, which is stamped at publish and never revocable, so falling back
+// is safe: it cannot resurrect a revoked grant. An earlier revision gated this
+// path on docRegistered and locked the owner out of their own doc; the gate was removed
 // on A3② only (A4 keeps its gate, see TestA4RegisteredDocDeletedRowNoFallback).
 func TestA3OwnerFallbackAllowedWhenDocRegisteredButRowMissing(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-2", botName: "Bot Two", botSpaceID: "s2", botOwnerUID: "owner-2"})
@@ -82,7 +80,7 @@ func TestA3OwnerFallbackAllowedWhenDocRegisteredButRowMissing(t *testing.T) {
 	publishAsBot(t, h, "docReg") // creator_uid = owner-2
 
 	// A3① misses (bot uid != owner-2); A3② wired returns docRegistered=true,
-	// ok=false; without the round-3 gate, fallback proceeds and
+	// ok=false; without the old gate, fallback proceeds and
 	// creator_uid==ownerUID lands owner-2 as CapAuthor.
 	rec := do(t, h, http.MethodPost, "/v1/docs/docReg/share",
 		map[string]string{"Authorization": "Bearer bot-token"}, "")
@@ -134,7 +132,7 @@ func TestA3OwnerAdminInDocMemberStillWinsAfterFallback(t *testing.T) {
 }
 
 // A4 unregistered doc falls back to meta.grants: mirror wired but no
-// slug->docID mapping (async pre-registration state). The
+// slug->docID mapping (post-commit registration gap). The
 // reader tier's wired probe returns docRegistered=false and legacy
 // meta.grants[uid]=reader keeps the caller readable.
 func TestA4UnregisteredDocFallsBackToMeta(t *testing.T) {
@@ -210,8 +208,7 @@ func seedLegacyReaderGrant(t *testing.T, store *memory.Store, slug, uid string) 
 	}
 }
 
-// yujiawei round-3 P1b end-to-end revoke-bypass regression. Mirrors his
-// HTTP repro from the round-3 review: an M2-migrated reader has BOTH a
+// End-to-end revoke-bypass regression: an M2-migrated reader has both a
 // doc_member row AND a stale meta.grants[uid] entry (M2 copies, does not
 // delete). A DELETE /grants/{uid} used to remove the doc_member row but
 // leave meta.grants alone; the next read fell through the wired probe

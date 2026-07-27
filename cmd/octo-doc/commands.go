@@ -70,8 +70,8 @@ func buildServices(ctx context.Context, cfg *config.Config) (deps *httpx.Deps, c
 			docsbackend.New(cfg.DocsBackendRegisterURL, cfg.DocsBackendRegisterToken, nil),
 			nil,
 		)
-		// Drain legacy meta.grants into doc_member after each async
-		// registration so grants issued in the pre-registration gap survive the
+		// Drain legacy meta.grants into doc_member after each registration so
+		// grants issued in the post-commit registration gap survive the
 		// strict wired A4 gate. Only wired when the docs-backend registrar is on
 		// (non-mounted / failed-registration docs never register and never
 		// reconcile).

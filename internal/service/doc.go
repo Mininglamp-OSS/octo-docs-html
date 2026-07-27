@@ -36,10 +36,8 @@ type DocService struct {
 // GrantReconciler drains legacy meta.grants entries into doc_member after
 // confirmed registration. Injected (not a hard dep on AuthService) so DocService
 // stays testable in isolation and single-node deploys without a mirror wire a
-// no-op. yujiawei round-4 P1: without this hook, a grant issued while the doc
-// is unregistered (AddGrant → addGrantToMeta fallback) evaporates once
-// registration flips docRegistered=true and the strict wired gate closes the
-// meta fallback.
+// no-op. Without this hook, a grant issued while the doc is unregistered
+// evaporates once registration closes the meta fallback.
 type GrantReconciler func(ctx context.Context, slug string) error
 
 // DocRegistrar is the docs-backend side-effect sink.
@@ -148,12 +146,11 @@ type PublishResult struct {
 	hadMeta      bool
 	titleChanged bool
 
-	// Mount info carried from PublishInput into afterPublished for registration.
+	// Mount info carried through the synchronous post-publish registration step.
 	mountType         string
 	mountContextKnown bool
 
-	// publisherToken carries the publishing bot's own token from PublishInput
-	// into afterPublished so registration authenticates as the publisher.
+	// publisherToken authenticates synchronous registration as the publisher.
 	publisherToken string
 }
 

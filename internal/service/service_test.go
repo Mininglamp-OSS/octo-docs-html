@@ -312,7 +312,7 @@ func TestPublishRegistersThreadMountedDoc(t *testing.T) {
 
 	result, err := ds.Publish(context.Background(), service.PublishInput{
 		Slug: "thread-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Thread Title",
-		MountType: "thread", GroupNo: "g-1", ThreadID: "t-1", PublisherToken: "publisher-token",
+		MountType: "thread", PublisherToken: "publisher-token",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -330,6 +330,8 @@ func TestPublishRegistersThreadMountedDoc(t *testing.T) {
 	if req.Body["mountType"] != "thread" || req.Body["octoDocSlug"] != "thread-doc" || req.Body["title"] != "Thread Title" {
 		t.Fatalf("registration body = %#v", req.Body)
 	}
+	// The current backend contract persists mountType only. Thread/group source
+	// attribution needs a future backend schema and contract design.
 }
 
 func TestPublishSkipsRegistrationWhenNoMountType(t *testing.T) {
@@ -354,22 +356,26 @@ func TestPublishSkipsRegistrationWhenNoMountType(t *testing.T) {
 }
 
 func TestPublishSkipsRegistrationWhenURLDisabled(t *testing.T) {
-	ts, reqs := newDocsBackendStub(t, http.StatusOK)
-	defer ts.Close()
-	// Registrar URL empty ⇒ no registrar wired ⇒ no request even with mount info.
-	ds := newDocWithDocsBackend(t, "")
+	for _, mountType := range []string{"group", "thread"} {
+		t.Run(mountType, func(t *testing.T) {
+			ts, reqs := newDocsBackendStub(t, http.StatusOK)
+			defer ts.Close()
+			// Registrar URL empty means mounted publishes fail closed.
+			ds := newDocWithDocsBackend(t, "")
 
-	result, err := ds.Publish(context.Background(), service.PublishInput{
-		Slug: "disabled-doc", HTML: "<html><body><p>x</p></body></html>", Title: "Disabled",
-		MountType: "group", GroupNo: "g-1",
-	})
-	if err != nil {
-		t.Fatal(err)
+			result, err := ds.Publish(context.Background(), service.PublishInput{
+				Slug: "disabled-" + mountType, HTML: "<html><body><p>x</p></body></html>", Title: "Disabled",
+				MountType: mountType,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Registered || result.Status != "registration_failed" {
+				t.Fatalf("result = %+v", result)
+			}
+			assertNoDocsBackendRequest(t, reqs)
+		})
 	}
-	if result.Registered || result.Status != "registration_failed" {
-		t.Fatalf("result = %+v", result)
-	}
-	assertNoDocsBackendRequest(t, reqs)
 }
 
 func TestPublishRenamesExistingRegistrationWhenTitleChanges(t *testing.T) {

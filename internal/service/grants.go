@@ -21,7 +21,7 @@ const grantRoleReader = "reader"
 // is the doc's creator or a doc_member admin — those rows must never be
 // revoked or downgraded through the grants API (that path is reader-scoped).
 //
-// yujiawei P2-A: this is an *apperr.Error so writeErr surfaces a 409 instead
+// This is an *apperr.Error so writeErr surfaces a 409 instead
 // of collapsing to 500 through the errors.As(*apperr.Error) fallthrough.
 // Callers still use errors.Is(err, ErrGrantProtected); pointer identity is
 // preserved because the sentinel is a single package-level *apperr.Error.
@@ -80,7 +80,7 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 // legacyListGrantsFromMeta reads the pre-plan③ meta.grants map. Used only in
 // the mirror-unwired fallback path so single-node deploys keep working.
 //
-// yujiawei round-3 P3: skip the creator uid so the caller (handler
+// Skip the creator uid so the caller (handler
 // synthesises the "author"/"owner" row) does not receive a duplicate row on
 // the unwired path — mirrors the wired-side dedup in ListGrants above.
 func legacyListGrantsFromMeta(meta *storage.DocMeta, creator string) map[string]string {
@@ -143,7 +143,7 @@ func (s *AuthService) AddGrant(ctx context.Context, slug, uid, role, grantedBy s
 // idempotent — repeated calls for the same (docID,uid,role) update
 // updated_at only, no duplicate row.
 //
-// yujiawei P1-B: probe RoleByDocUID first and refuse reader-grants that would
+// Probe RoleByDocUID first and refuse reader-grants that would
 // silently downgrade an admin (role=3) or the creator uid. UpsertDirectGrant
 // runs ON DUPLICATE KEY UPDATE role=VALUES(role), so a naive reader upsert on
 // an existing admin row would clobber it — and once A1 flips creator_uid to
@@ -168,9 +168,9 @@ func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grante
 		return err
 	}
 	if !ok {
-		// Doc not yet registered in doc_member (async afterPublished gap, or a
-		// non-mounted / failed registration). Thread mounts are registerable,
-		// but may transiently land here during the async gap. Reads /
+		// Doc not yet registered in doc_member (post-commit registration gap, or
+		// a non-mounted / failed registration). Thread mounts are registerable,
+		// but may transiently land here during that gap. Reads /
 		// ListGrants / RemoveGrant all fall back to meta.grants in this state;
 		// AddGrant used to 404 here, breaking API symmetry and making such docs
 		// un-grantable. Fall back to the legacy meta.grants writer so the four
@@ -245,7 +245,7 @@ func (s *AuthService) RemoveGrant(ctx context.Context, slug, uid string) error {
 		return ErrGrantProtected
 	}
 	if s.docMembers != nil {
-		// yujiawei round-5 P1-b: hold the slug lock across BOTH the
+		// Hold the slug lock across both the
 		// doc_member DELETE and the meta sweep. Without this, reconcile
 		// could snapshot meta.grants[uid], then RemoveGrant deletes the
 		// doc_member row and sweeps meta.grants, and finally reconcile
@@ -257,7 +257,7 @@ func (s *AuthService) RemoveGrant(ctx context.Context, slug, uid string) error {
 			if err := s.removeGrantFromDocMember(ctx, slug, uid); err != nil {
 				return err
 			}
-			// yujiawei round-4 P2 sweep: purge any legacy meta.grants[uid]
+			// Purge any legacy meta.grants[uid]
 			// on every remove path so a later unmount / soft-delete flipping
 			// DocIDBySlug back to ok=false cannot resurrect via the A4
 			// fallback. Absent entry ⇒ nil (idempotent).
@@ -273,7 +273,7 @@ func (s *AuthService) removeGrantFromDocMember(ctx context.Context, slug, uid st
 		return err
 	}
 	if !ok {
-		// Doc not registered in rich-doc yet (async publish gap, or a
+		// Doc not registered in rich-doc yet (post-commit registration gap, or a
 		// non-mounted / failed registration). Nothing to delete from
 		// doc_member — the caller (RemoveGrant) still sweeps meta.grants
 		// unconditionally.
@@ -314,7 +314,7 @@ func (s *AuthService) removeGrantFromMeta(ctx context.Context, slug, uid string)
 }
 
 // removeGrantFromMetaLocked is the body of removeGrantFromMeta assuming the
-// caller already holds s.lock for slug. yujiawei round-5 P1-b: RemoveGrant's
+// caller already holds s.lock for slug. RemoveGrant's
 // wired branch takes one slug lock across both the doc_member DELETE and the
 // meta sweep, so this helper serialises with reconcile (which also holds the
 // same lock) — reconcile can no longer resurrect a revoked reader from a
@@ -404,11 +404,11 @@ func (s *AuthService) mirrorGrantDelete(ctx context.Context, slug, uid string) {
 // doc_member. Called by DocService.afterPublished after confirmed registration so
 // that grants issued during the registration gap (AddGrant → meta.grants
 // fallback while DocIDBySlug ok=false) do not evaporate once bestCred flips to
-// the strict wired gate (yujiawei round-4 P1). Best-effort: per-uid errors are
+// the strict wired gate. Best-effort: per-uid errors are
 // logged and skipped so one bad row cannot block the rest. meta.grants entries are
 // left in place so mirror-unwired deploys keep working; A7 cleanup drops them.
 //
-// yujiawei round-5 P1-b: the entire read-then-upsert sequence runs under the
+// The entire read-then-upsert sequence runs under the
 // slug lock (same lock removeGrantFromMeta takes) and re-fetches meta inside
 // the critical section. Without this, RemoveGrant could delete a doc_member
 // row and sweep meta.grants between reconcile's read and its upsert,
