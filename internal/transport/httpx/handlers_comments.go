@@ -1,8 +1,11 @@
 package httpx
 
 import (
+	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
@@ -17,11 +20,32 @@ type mutationLike service.MutationResult
 type mutationVersion int
 
 func (v *mutationVersion) UnmarshalJSON(data []byte) error {
-	if len(data) == 0 || data[0] == '"' {
-		return strconv.ErrSyntax
+	raw := strings.TrimSpace(string(data))
+	if raw == "null" {
+		*v = 0
+		return nil
 	}
-	n, err := strconv.Atoi(string(data))
-	if err != nil || n <= 0 {
+	if len(raw) >= 2 && raw[0] == '"' {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		switch text {
+		case "latest":
+			*v = mutationVersion(core.VersionLatest)
+			return nil
+		default:
+			text = strings.TrimPrefix(text, "v")
+			n, err := strconv.Atoi(text)
+			if err != nil || n < 0 {
+				return strconv.ErrSyntax
+			}
+			*v = mutationVersion(n)
+			return nil
+		}
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
 		return strconv.ErrSyntax
 	}
 	*v = mutationVersion(n)
@@ -29,15 +53,33 @@ func (v *mutationVersion) UnmarshalJSON(data []byte) error {
 }
 
 func decodeCommentMutation(w http.ResponseWriter, r *http.Request, body any) error {
-	if err := decodeJSON(w, r, body); err != nil {
+	if r.Body == nil {
+		return apperr.Validation("invalid request body", "invalid_body")
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(body); err != nil {
+		return apperr.Validation("invalid request body", "invalid_body")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
 		return apperr.Validation("invalid request body", "invalid_body")
 	}
 	return nil
 }
 
-func requireMutationVersion(version mutationVersion) (int, error) {
+func (s *Server) resolveMutationVersion(r *http.Request, slug string, version mutationVersion) (int, error) {
+	if version == mutationVersion(core.VersionLatest) {
+		versions, err := s.docs.ListVersions(r.Context(), slug)
+		if err != nil {
+			return 0, err
+		}
+		if versions != nil && len(versions.Versions) > 0 {
+			return versions.Versions[len(versions.Versions)-1].N, nil
+		}
+	}
 	if version <= 0 {
-		return 0, apperr.Validation("version must be a positive number", "invalid_version")
+		return 1, nil
 	}
 	return int(version), nil
 }
@@ -105,7 +147,7 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) err
 	if body.Text == "" {
 		return apperr.Validation("slug and text required", "text_required")
 	}
-	version, err := requireMutationVersion(body.Version)
+	version, err := s.resolveMutationVersion(r, slug, body.Version)
 	if err != nil {
 		return err
 	}
@@ -148,7 +190,7 @@ func (s *Server) handlePatchComment(w http.ResponseWriter, r *http.Request) erro
 	if body.ID == "" || body.Anchor == nil {
 		return apperr.Validation("slug, id, anchor required", "anchor_required")
 	}
-	version, err := requireMutationVersion(body.Version)
+	version, err := s.resolveMutationVersion(r, slug, body.Version)
 	if err != nil {
 		return err
 	}
@@ -225,7 +267,7 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) error {
 	if len(body.Emoji) == 0 || len(body.Emoji) > 32 {
 		return apperr.Validation("invalid emoji", "invalid_emoji")
 	}
-	version, err := requireMutationVersion(body.Version)
+	version, err := s.resolveMutationVersion(r, slug, body.Version)
 	if err != nil {
 		return err
 	}

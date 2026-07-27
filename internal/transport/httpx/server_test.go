@@ -526,68 +526,43 @@ func TestCommentLifecycle(t *testing.T) {
 func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
-	if rec := do(t, h, http.MethodPost, "/v1/docs", auth,
-		`{"slug":"anchors","html":"<html><body><p>hello world</p></body></html>"}`); rec.Code != http.StatusOK {
-		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
-	}
-
-	assertCount := func(want int) {
-		t.Helper()
-		rec := do(t, h, http.MethodGet, "/v1/comments?slug=anchors&version=1", authorHdrNoCT(), "")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("list = %d: %s", rec.Code, rec.Body.String())
-		}
-		var body struct {
-			Data []struct {
-				ID     string         `json:"id"`
-				Anchor map[string]any `json:"anchor"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-			t.Fatal(err)
-		}
-		if len(body.Data) != want {
-			t.Fatalf("comment count = %d, want %d: %s", len(body.Data), want, rec.Body.String())
+	for _, html := range []string{
+		`{"slug":"anchors","html":"<html><body><p>v1</p></body></html>"}`,
+		`{"slug":"anchors","html":"<html><body><p>v2</p></body></html>"}`,
+	} {
+		if rec := do(t, h, http.MethodPost, "/v1/docs", auth, html); rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
 		}
 	}
 
 	for _, payload := range []string{
-		`{"slug":"anchors","text":"bad","version":"latest","anchor":{"kind":"element","aid":"a1"}}`,
-		`{"slug":"anchors","text":"bad","version":0}`,
-		`{"slug":"anchors","text":"bad","version":-1}`,
-		`{"slug":"anchors","text":"bad"}`,
+		`{"slug":"anchors","text":"element","version":2,"anchor":{"kind":"element","aid":"a1","selector":"p"}}`,
+		`{"slug":"anchors","text":"text","version":"2","anchor":{"kind":"text","text":"hello","context_before":"before","context_after":"after"}}`,
+		`{"slug":"anchors","text":"latest","version":"latest","anchor":{"kind":"element","aid":"a-latest"}}`,
+		`{"slug":"anchors","text":"v2","version":"v2"}`,
+		`{"slug":"anchors","text":"zero","version":0}`,
+		`{"slug":"anchors","text":"null","version":null}`,
+		`{"slug":"anchors","text":"omitted"}`,
 	} {
 		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("invalid create = %d, want 400: %s", rec.Code, rec.Body.String())
-		}
-	}
-	assertCount(0)
-
-	payloads := []string{
-		`{"slug":"anchors","text":"element","version":1,"anchor":{"kind":"element","aid":"a1","selector":"p"}}`,
-		`{"slug":"anchors","text":"text","version":1,"anchor":{"kind":"text","text":"hello","context_before":"before","context_after":"after"}}`,
-		`{"slug":"anchors","text":"plain","version":1}`,
-	}
-	for _, payload := range payloads {
-		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
 		if rec.Code != http.StatusOK {
-			t.Fatalf("valid create = %d: %s", rec.Code, rec.Body.String())
+			t.Fatalf("compatible create = %d: %s", rec.Code, rec.Body.String())
 		}
 	}
 
-	rec := do(t, h, http.MethodGet, "/v1/comments?slug=anchors&version=1", authorHdrNoCT(), "")
+	rec := do(t, h, http.MethodGet, "/v1/comments?slug=anchors&version=all", authorHdrNoCT(), "")
 	var listed struct {
 		Data []struct {
-			ID     string         `json:"id"`
-			Anchor map[string]any `json:"anchor"`
+			ID        string         `json:"id"`
+			CreatedIn int            `json:"created_in"`
+			Anchor    map[string]any `json:"anchor"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
 		t.Fatal(err)
 	}
-	if len(listed.Data) != 3 {
-		t.Fatalf("comment count = %d, want 3: %s", len(listed.Data), rec.Body.String())
+	if len(listed.Data) != 7 {
+		t.Fatalf("comment count = %d, want 7: %s", len(listed.Data), rec.Body.String())
 	}
 	if listed.Data[0].Anchor["kind"] != "element" || listed.Data[0].Anchor["aid"] != "a1" || listed.Data[0].Anchor["selector"] != "p" {
 		t.Fatalf("element anchor not preserved: %#v", listed.Data[0].Anchor)
@@ -595,21 +570,41 @@ func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 	if listed.Data[1].Anchor["kind"] != "text" || listed.Data[1].Anchor["text"] != "hello" || listed.Data[1].Anchor["context_before"] != "before" || listed.Data[1].Anchor["context_after"] != "after" {
 		t.Fatalf("text anchor not preserved: %#v", listed.Data[1].Anchor)
 	}
-	if listed.Data[2].Anchor != nil {
-		t.Fatalf("unanchored comment gained anchor: %#v", listed.Data[2].Anchor)
+	if listed.Data[2].CreatedIn != 2 || listed.Data[2].Anchor["aid"] != "a-latest" {
+		t.Fatalf("latest did not resolve to rendered latest version: %#v", listed.Data[2])
+	}
+	for i := 3; i < len(listed.Data); i++ {
+		if listed.Data[i].Anchor != nil {
+			t.Fatalf("unanchored comment %d gained anchor: %#v", i, listed.Data[i].Anchor)
+		}
+	}
+
+	for _, tc := range []struct {
+		method, target, payload string
+	}{
+		{http.MethodPost, "/v1/comments", `{"slug":"anchors","text":"bad","version":-1}`},
+		{http.MethodPost, "/v1/comments", `{"slug":"anchors","text":"bad","version":"garbage"}`},
+		{http.MethodPost, "/v1/comments", `{"slug":"anchors","text":"bad","version":2}{"anchor":{"kind":"element","aid":"a2"}}`},
+		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":`},
+		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":2} trailing`},
+		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":`},
+		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":2}{}`},
+	} {
+		rec := do(t, h, tc.method, tc.target, auth, tc.payload)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("malformed %s = %d, want 400: %s", tc.target, rec.Code, rec.Body.String())
+		}
 	}
 
 	for _, tc := range []struct {
 		method, target, payload string
 	}{
 		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":"latest"}`},
-		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":`},
-		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":"latest"}`},
-		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":`},
+		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[4].ID + `","emoji":"x","version":0}`},
 	} {
 		rec := do(t, h, tc.method, tc.target, auth, tc.payload)
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("malformed %s = %d, want 400: %s", tc.target, rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK {
+			t.Fatalf("compatible %s = %d: %s", tc.target, rec.Code, rec.Body.String())
 		}
 	}
 }
