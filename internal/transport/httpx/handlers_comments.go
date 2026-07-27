@@ -1,8 +1,8 @@
 package httpx
 
 import (
-	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
@@ -13,6 +13,34 @@ import (
 // mutationLike mirrors service.MutationResult so both create/reply branches can
 // be assigned to one variable.
 type mutationLike service.MutationResult
+
+type mutationVersion int
+
+func (v *mutationVersion) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || data[0] == '"' {
+		return strconv.ErrSyntax
+	}
+	n, err := strconv.Atoi(string(data))
+	if err != nil || n <= 0 {
+		return strconv.ErrSyntax
+	}
+	*v = mutationVersion(n)
+	return nil
+}
+
+func decodeCommentMutation(w http.ResponseWriter, r *http.Request, body any) error {
+	if err := decodeJSON(w, r, body); err != nil {
+		return apperr.Validation("invalid request body", "invalid_body")
+	}
+	return nil
+}
+
+func requireMutationVersion(version mutationVersion) (int, error) {
+	if version <= 0 {
+		return 0, apperr.Validation("version must be a positive number", "invalid_version")
+	}
+	return int(version), nil
+}
 
 // viewer resolves the current viewer (octo bridge first, then legacy cookie),
 // or nil for anonymous. Never errors on "no session".
@@ -56,13 +84,15 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) err
 		return err
 	}
 	var body struct {
-		Slug     string       `json:"slug"`
-		Text     string       `json:"text"`
-		Version  json.Number  `json:"version"`
-		ParentID *string      `json:"parent_id"`
-		Anchor   *core.Anchor `json:"anchor"`
+		Slug     string          `json:"slug"`
+		Text     string          `json:"text"`
+		Version  mutationVersion `json:"version"`
+		ParentID *string         `json:"parent_id"`
+		Anchor   *core.Anchor    `json:"anchor"`
 	}
-	_ = decodeJSON(w, r, &body)
+	if err := decodeCommentMutation(w, r, &body); err != nil {
+		return err
+	}
 	slug, err := requireSlug(body.Slug)
 	if err != nil {
 		return err
@@ -75,7 +105,10 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) err
 	if body.Text == "" {
 		return apperr.Validation("slug and text required", "text_required")
 	}
-	version := numOr1(body.Version)
+	version, err := requireMutationVersion(body.Version)
+	if err != nil {
+		return err
+	}
 	var res mutationLike
 	if body.ParentID != nil && *body.ParentID != "" {
 		mr, merr := s.comments.Reply(r.Context(), slug, *body.ParentID, authorFromSession(session), body.Text, version)
@@ -100,18 +133,24 @@ func (s *Server) handlePatchComment(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 	var body struct {
-		Slug    string       `json:"slug"`
-		ID      string       `json:"id"`
-		Anchor  *core.Anchor `json:"anchor"`
-		Version json.Number  `json:"version"`
+		Slug    string          `json:"slug"`
+		ID      string          `json:"id"`
+		Anchor  *core.Anchor    `json:"anchor"`
+		Version mutationVersion `json:"version"`
 	}
-	_ = decodeJSON(w, r, &body)
+	if err := decodeCommentMutation(w, r, &body); err != nil {
+		return err
+	}
 	slug, err := requireSlug(body.Slug)
 	if err != nil {
 		return err
 	}
 	if body.ID == "" || body.Anchor == nil {
 		return apperr.Validation("slug, id, anchor required", "anchor_required")
+	}
+	version, err := requireMutationVersion(body.Version)
+	if err != nil {
+		return err
 	}
 	if err := s.requireDocCap(r, slug); err != nil {
 		return err
@@ -120,7 +159,7 @@ func (s *Server) handlePatchComment(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 	actor := actorLogin(session)
-	mr, err := s.comments.Reanchor(r.Context(), slug, body.ID, body.Anchor, numOr1(body.Version), actor)
+	mr, err := s.comments.Reanchor(r.Context(), slug, body.ID, body.Anchor, version, actor)
 	if err != nil {
 		return err
 	}
@@ -168,12 +207,14 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	var body struct {
-		Slug      string      `json:"slug"`
-		CommentID string      `json:"comment_id"`
-		Emoji     string      `json:"emoji"`
-		Version   json.Number `json:"version"`
+		Slug      string          `json:"slug"`
+		CommentID string          `json:"comment_id"`
+		Emoji     string          `json:"emoji"`
+		Version   mutationVersion `json:"version"`
 	}
-	_ = decodeJSON(w, r, &body)
+	if err := decodeCommentMutation(w, r, &body); err != nil {
+		return err
+	}
 	slug, err := requireSlug(body.Slug)
 	if err != nil {
 		return err
@@ -184,6 +225,10 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) error {
 	if len(body.Emoji) == 0 || len(body.Emoji) > 32 {
 		return apperr.Validation("invalid emoji", "invalid_emoji")
 	}
+	version, err := requireMutationVersion(body.Version)
+	if err != nil {
+		return err
+	}
 	if err := s.requireDocCap(r, slug); err != nil {
 		return err
 	}
@@ -191,7 +236,7 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) error {
 	if session != nil {
 		by = session.Login
 	}
-	mr, err := s.comments.React(r.Context(), slug, body.CommentID, body.Emoji, by, numOr1(body.Version))
+	mr, err := s.comments.React(r.Context(), slug, body.CommentID, body.Emoji, by, version)
 	if err != nil {
 		return err
 	}
@@ -261,15 +306,4 @@ func actorLogin(session *storage.Session) string {
 		return session.Login
 	}
 	return "local"
-}
-
-func numOr1(n json.Number) int {
-	if n == "" {
-		return 1
-	}
-	v, err := n.Int64()
-	if err != nil || v == 0 {
-		return 1
-	}
-	return int(v)
 }
