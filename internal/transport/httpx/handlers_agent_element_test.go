@@ -220,11 +220,12 @@ func TestAgentElementReplaceRejectsInjection(t *testing.T) {
 	}
 }
 
-// Fix E: a comment whose anchor is an ELEMENT anchor pointing at the replaced
-// aid must be reconciled on republish — either rebound to the new aid or marked
-// lost — never silently dropped. (The prior test only exercised a text anchor and
-// only asserted the text was still readable, which does not prove element-anchor
-// rebind/lost.)
+// issue-21: a comment whose anchor is an ELEMENT anchor pointing at the replaced
+// aid must stay anchored to that SAME aid across the republish. The backend
+// injects the old aid onto the replacement root and re-stamps preserving it, so
+// the element keeps its identity and the anchor never drifts to a new aid or
+// goes lost. (The prior test only exercised a text anchor and only asserted the
+// text was still readable, which does not prove element-anchor persistence.)
 func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
@@ -240,15 +241,18 @@ func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 		t.Fatalf("seed element comment = %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Replace the targeted element; Publish re-stamps (new aid) and reconciles.
+	// Replace the targeted element; the backend injects the OLD aid onto the
+	// replacement root and re-stamps preserving it, so the element keeps its
+	// identity across the republish (issue-21).
 	rec = do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
 		`{"slug":"elanchor","aid":"`+aid+`","new_html":`+jsonString(`<section><p>replaced text</p></section>`)+`}`)
 	if rec.Code != 200 {
 		t.Fatalf("element replace = %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Read v2 comments: the seeded comment must still exist and its anchor must be
-	// reconciled — rebound to a NEW element aid, or marked lost — never left stale.
+	// Read v2 comments: the seeded comment must still exist and stay ELEMENT-
+	// anchored to the SAME aid — the replacement inherited it, so the anchor never
+	// drifts to a new aid or goes lost.
 	list := do(t, h, http.MethodGet, "/v1/comments?slug=elanchor&version=2", auth, "").Body.String()
 	if !strings.Contains(list, "element note") {
 		t.Fatalf("element-anchored comment lost after republish: %s", list)
@@ -271,18 +275,11 @@ func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 			continue
 		}
 		found = true
-		switch c.Anchor.Kind {
-		case "element":
-			if c.Anchor.AID == "" {
-				t.Errorf("rebound element anchor has empty aid: %s", list)
-			}
-			if c.Anchor.AID == aid {
-				t.Errorf("anchor still points at the stale replaced aid %q; reconcile did not run", aid)
-			}
-		case "lost":
-			// acceptable: reconcile ran but could not confidently rebind
-		default:
-			t.Errorf("unexpected anchor kind %q after reconcile: %s", c.Anchor.Kind, list)
+		if c.Anchor.Kind != "element" {
+			t.Errorf("anchor kind = %q; want element (aid preserved across replace): %s", c.Anchor.Kind, list)
+		}
+		if c.Anchor.AID != aid {
+			t.Errorf("anchor aid = %q; want the preserved aid %q: %s", c.Anchor.AID, aid, list)
 		}
 	}
 	if !found {

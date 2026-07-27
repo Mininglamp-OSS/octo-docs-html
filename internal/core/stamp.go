@@ -80,7 +80,7 @@ var (
 	jsURLRe = regexp.MustCompile(`(?i)javascript:`)
 	// dataOdocAnyRe matches any data-odoc-* attribute; hand-written replacements
 	// must not carry stamper-owned attributes (would make DOM selectors ambiguous).
-	dataOdocAnyRe   = regexp.MustCompile(`(?i)data-odoc-[a-z-]*` + wsClass + `*=`)
+	dataOdocAnyRe   = regexp.MustCompile(`(?i)data-odoc-[^` + jsSpace + `"'=<>/]*` + wsClass + `*=`)
 	optInArtifactRe = regexp.MustCompile(`(?i)\bdata-odoc-artifact\b`)
 	optInClassRe    = regexp.MustCompile(`(?i)class` + wsClass + `*=` + wsClass + `*"[^"]*\bodoc-artifact\b[^"]*"`)
 	probeTagRe      = regexp.MustCompile(`(?i)<([a-z][\w-]*)\b`)
@@ -307,6 +307,27 @@ func harvest(html string, openStart, openEnd int, tag, attrs string, seen map[in
 	})
 }
 
+// harvestAt force-harvests the element whose open tag begins at start, whatever
+// its tag. StampAidsPinned uses it so a safe but non-stampable replacement root
+// (div/p/...) is still indexed and can carry the pinned aid. No-op if start is
+// out of range, not a '<', or the open tag is unterminated.
+func harvestAt(html string, start int, seen map[int]bool, elements *[]stampElement) {
+	if start < 0 || start >= len(html) || html[start] != '<' {
+		return
+	}
+	loc := probeTagRe.FindStringSubmatchIndex(html[start:])
+	if loc == nil || loc[0] != 0 {
+		return
+	}
+	tag := strings.ToLower(html[start+loc[2] : start+loc[3]])
+	end := attrAwareOpenTagEnd(html, start)
+	if end < 0 {
+		return
+	}
+	attrs := html[start+1+len(tag) : end-1]
+	harvest(html, start, end, tag, attrs, seen, elements)
+}
+
 func harvestStampableTags(html string, seen map[int]bool, elements *[]stampElement) {
 	for _, tag := range stampableTags {
 		openRe := regexp.MustCompile(`(?i)<` + regexp.QuoteMeta(tag) + `\b`)
@@ -384,6 +405,18 @@ func ElementByAID(html, aid string) (outer, tag string, ok bool) {
 // boundaries (same parse as the stamper) so exactly one element is swapped and
 // the caller re-stamps via Publish. ok is false if aid is not present.
 func ReplaceElementByAID(html, aid, replacement string) (result string, ok bool) {
+	result, _, ok = ReplaceElementByAIDAt(html, aid, replacement)
+	return result, ok
+}
+
+// ReplaceElementByAIDAt is ReplaceElementByAID that also returns boundary: the
+// byte index in result where the replacement begins (== the replaced element's
+// original openStart, since everything before it is byte-identical). The
+// element/replace path adds InjectRootAIDAt's localRootOffset to this boundary to
+// get the exact offset of the replacement's root '<', which it passes to
+// StampAidsPinned so stamping pins exactly that root — not every previously-
+// stamped element — to the injected aid. boundary is -1 when ok is false.
+func ReplaceElementByAIDAt(html, aid, replacement string) (result string, boundary int, ok bool) {
 	seen := map[int]bool{}
 	var harvested []stampElement
 	harvestStampableTags(html, seen, &harvested)
@@ -391,10 +424,10 @@ func ReplaceElementByAID(html, aid, replacement string) (result string, ok bool)
 	for _, e := range harvested {
 		m := aidValueRe.FindStringSubmatch(e.attrs)
 		if m != nil && m[1] == aid {
-			return html[:e.openStart] + replacement + html[e.closeEnd:], true
+			return html[:e.openStart] + replacement + html[e.closeEnd:], e.openStart, true
 		}
 	}
-	return "", false
+	return "", -1, false
 }
 
 // SingleTopLevelTag reports the lowercased tag name if s parses to exactly one
@@ -466,6 +499,44 @@ func HasDataOdocAttr(s string) bool {
 	return dataOdocAnyRe.MatchString(s)
 }
 
+// InjectRootAID stamps data-odoc-aid="aid" onto the root open tag of fragment.
+// See InjectRootAIDAt; this drops the returned root offset.
+func InjectRootAID(fragment, aid string) string {
+	out, _ := InjectRootAIDAt(fragment, aid)
+	return out
+}
+
+// InjectRootAIDAt stamps data-odoc-aid="aid" onto the root open tag of fragment
+// (a single top-level element, SafeReplacementFragment-validated, carrying no
+// data-odoc-* of its own) and returns the byte index of that root's '<' in out.
+// The element/replace path uses this so the replacement inherits the target's
+// OLD aid: StampAidsPinned keeps that aid verbatim on the root at the reported
+// offset, so the comment anchor persists across the re-stamp even when the
+// tag/content changed. The fragment may carry leading whitespace (allowed by
+// SafeReplacementFragment), so the root '<' is NOT necessarily at offset 0 —
+// callers must add localRootOffset to the insertion boundary. Only the outermost
+// element is stamped. Returns (fragment, -1) if it has no well-formed open tag.
+func InjectRootAIDAt(fragment, aid string) (out string, localRootOffset int) {
+	lt := strings.IndexByte(fragment, '<')
+	if aid == "" || lt < 0 {
+		return fragment, lt
+	}
+	openEnd := attrAwareOpenTagEnd(fragment, lt)
+	if openEnd < 0 {
+		return fragment, lt
+	}
+	// openEnd is just past '>'; the tag's last char is at openEnd-1. A void tag may
+	// self-terminate ("... />"): insert the aid before that trailing slash so the
+	// tag stays well-formed.
+	insertAt := openEnd - 1
+	if selfCloseEndRe.MatchString(fragment[lt+1 : insertAt]) {
+		if slash := strings.LastIndexByte(fragment[:insertAt], '/'); slash > lt {
+			insertAt = slash
+		}
+	}
+	return fragment[:insertAt] + ` data-odoc-aid="` + aid + `"` + fragment[insertAt:], lt
+}
+
 // utf16Slice returns the first n UTF-16 code units of s, matching JS slice(0,n).
 func utf16Slice(s string, n int) string {
 	units := utf16.Encode([]rune(s))
@@ -475,8 +546,36 @@ func utf16Slice(s string, n int) string {
 	return string(utf16.Decode(units[:n]))
 }
 
-// StampAids stamps data-odoc-aid on every commentable artifact in rawHTML.
+// StampAids stamps data-odoc-aid on every commentable artifact in rawHTML,
+// (re)computing each element's aid from its content. Callers pass HTML that
+// carries no stamper-owned attributes; any pre-existing data-odoc-aid is stripped
+// before hashing so the output is purely content-addressed.
 func StampAids(rawHTML string) StampResult {
+	return stampAids(rawHTML, "", -1)
+}
+
+// StampAidsPinned is StampAids with exactly ONE element pinned: the element whose
+// open tag begins at pinnedOffset keeps pinnedAID verbatim instead of getting a
+// content hash, and is force-indexed even when its tag is not normally stampable
+// (e.g. a safe <div>/<p> replacement root). Every OTHER element — including a
+// stampable ancestor of the pinned root — follows normal content-addressed
+// stamping, so an ancestor whose content changed rehashes rather than keeping a
+// stale aid.
+//
+// The element/replace path uses this: after validation the backend injects the
+// target's OLD aid onto the replacement root (InjectRootAID) at a known offset,
+// so the swapped element keeps its identity and any comment anchored to it
+// survives reconciliation even when the replacement's tag or content changed.
+// pinnedOffset < 0 (or an offset that resolves to no element) degrades to plain
+// StampAids.
+func StampAidsPinned(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
+	return stampAids(rawHTML, pinnedAID, pinnedOffset)
+}
+
+// stampAids implements StampAids / StampAidsPinned. When pinnedOffset >= 0 the
+// element whose open tag starts there is force-harvested (even if non-stampable)
+// and keeps pinnedAID instead of a content hash.
+func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 	headings := collectHeadings(rawHTML)
 	nearestHeadingAt := func(idx int) *string {
 		var best *string
@@ -493,6 +592,12 @@ func StampAids(rawHTML string) StampResult {
 
 	seen := map[int]bool{}
 	var harvested []stampElement
+	// Force-harvest the pinned root FIRST so seen[] blocks a duplicate if its tag
+	// also happens to be stampable; this guarantees the pinned root is indexed even
+	// when its tag (div/p/...) is not in stampableTags.
+	if pinnedOffset >= 0 && pinnedAID != "" {
+		harvestAt(rawHTML, pinnedOffset, seen, &harvested)
+	}
 	harvestStampableTags(rawHTML, seen, &harvested)
 	harvestOptInMarkers(rawHTML, seen, &harvested)
 
@@ -501,7 +606,12 @@ func StampAids(rawHTML string) StampResult {
 	for _, e := range harvested {
 		cleanedAttrs := dataOdocAidRe.ReplaceAllString(e.attrs, "")
 		cleanedInner := dataOdocAidRe2.ReplaceAllString(e.innerHTML, "")
-		aid := aidFor(e.tag, cleanedInner, cleanedAttrs)
+		var aid string
+		if pinnedAID != "" && e.openStart == pinnedOffset {
+			aid = pinnedAID // pin exactly the replacement root
+		} else {
+			aid = aidFor(e.tag, cleanedInner, cleanedAttrs)
+		}
 		aids = append(aids, StampedArtifact{
 			AID:     aid,
 			Tag:     e.tag,
@@ -519,13 +629,17 @@ func StampAids(rawHTML string) StampResult {
 	})
 	out := rawHTML
 	for _, e := range elements {
-		selfClose := ""
-		if selfCloseEndRe.MatchString(e.attrs) {
-			selfClose = "/"
-		}
 		var stampedOpen string
 		if e.isVoid {
-			stampedOpen = "<" + e.tag + e.cleanedAttrs + ` data-odoc-aid="` + e.aid + `"` + selfClose + ">"
+			// Strip any trailing self-close slash from cleanedAttrs so we don't emit a
+			// stray '/' before data-odoc-aid, then re-add exactly one closing slash for
+			// a self-terminated void tag: <img ... data-odoc-aid="x"/>.
+			attrs := selfCloseEndRe.ReplaceAllString(e.cleanedAttrs, "")
+			selfClose := ""
+			if selfCloseEndRe.MatchString(e.attrs) {
+				selfClose = "/"
+			}
+			stampedOpen = "<" + e.tag + attrs + ` data-odoc-aid="` + e.aid + `"` + selfClose + ">"
 		} else {
 			stampedOpen = "<" + e.tag + e.cleanedAttrs + ` data-odoc-aid="` + e.aid + `">`
 		}

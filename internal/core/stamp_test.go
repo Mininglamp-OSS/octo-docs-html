@@ -291,6 +291,8 @@ func TestHasDataOdocAttr(t *testing.T) {
 		`<section data-odoc-aid="abc"><p>x</p></section>`,
 		`<div data-odoc-artifact="1">y</div>`,
 		`<img data-odoc-aid = "z">`,
+		`<section data-odoc-aid2="forged"></section>`,
+		`<section data-odoc-_private="forged"></section>`,
 	}
 	for _, s := range has {
 		if !HasDataOdocAttr(s) {
@@ -306,4 +308,218 @@ func TestHasDataOdocAttr(t *testing.T) {
 			t.Errorf("false positive data-odoc: %q", s)
 		}
 	}
+}
+
+// issue-21: the element/replace path injects the target's OLD aid onto the
+// replacement root, then re-stamps with StampAidsPinned so exactly that root —
+// and thus the comment anchored to it — keeps the aid even when the tag/content
+// changed. InjectRootAID must stamp only the outermost element (block and void
+// forms).
+func TestInjectRootAIDStampsOuterElementOnly(t *testing.T) {
+	// Block element: aid lands on the root open tag, not the nested <figure>.
+	if got := InjectRootAID(`<section><figure>x</figure></section>`, "old1"); got != `<section data-odoc-aid="old1"><figure>x</figure></section>` {
+		t.Errorf("block inject:\n got %q", got)
+	}
+	// Void tag without slash.
+	if got := InjectRootAID(`<img src="a.png">`, "old2"); got != `<img src="a.png" data-odoc-aid="old2">` {
+		t.Errorf("void inject:\n got %q", got)
+	}
+	// Self-terminating void tag: aid goes before the trailing slash.
+	if got := InjectRootAID(`<img src="a.png"/>`, "old3"); got != `<img src="a.png" data-odoc-aid="old3"/>` {
+		t.Errorf("self-close inject:\n got %q", got)
+	}
+	// Empty aid is a no-op.
+	if got := InjectRootAID(`<section></section>`, ""); got != `<section></section>` {
+		t.Errorf("empty aid must be a no-op: %q", got)
+	}
+}
+
+// StampAidsPinned keeps the pinned root's aid while every OTHER element rehashes
+// normally. Here the replacement changes tag (section -> figure) and content;
+// after the pinned re-stamp the root still carries the OLD aid and the nested
+// <img> gets a fresh content-addressed aid.
+func TestStampAidsPinnedKeepsPinnedRootOnly(t *testing.T) {
+	const prefix = `<body>`
+	injected := InjectRootAID(`<figure><p>new</p><img src="a.png"></figure>`, "oldaid")
+	doc := prefix + injected + `</body>`
+	res := StampAidsPinned(doc, "oldaid", len(prefix))
+
+	var rootAID, imgAID string
+	for _, a := range res.AIDs {
+		switch a.Tag {
+		case "figure":
+			rootAID = a.AID
+		case "img":
+			imgAID = a.AID
+		}
+	}
+	if rootAID != "oldaid" {
+		t.Fatalf("root aid = %q; want the pinned oldaid", rootAID)
+	}
+	if imgAID == "" || imgAID == "oldaid" {
+		t.Fatalf("nested img aid = %q; want a fresh content-addressed aid", imgAID)
+	}
+	if !strings.Contains(res.HTML, `<figure data-odoc-aid="oldaid">`) {
+		t.Errorf("stamped HTML lost the pinned root aid: %q", res.HTML)
+	}
+	// Plain StampAids recomputes the root from content, so it must NOT reproduce
+	// the injected aid — proving the pin is opt-in and scoped to StampAidsPinned.
+	if got := StampAids(doc); strings.Contains(got.HTML, `<figure data-odoc-aid="oldaid">`) {
+		t.Errorf("StampAids should recompute, not keep, the injected aid: %q", got.HTML)
+	}
+}
+
+// P1(1): pinning must be scoped to the replacement root ONLY. When the replaced
+// element is nested inside a stampable ancestor (a <section>), editing it changes
+// the ancestor's content — so the ancestor MUST rehash to a new aid rather than
+// keep its stale one. We simulate the post-replace document: the ancestor still
+// carries its previously-stamped (now stale) aid, and the pinned inner root
+// carries the injected old inner aid.
+func TestStampAidsPinnedRehashesChangedAncestor(t *testing.T) {
+	// First stamp a v1 with a section wrapping a figure to learn the section's aid.
+	v1 := StampAids(`<body><section><figure>original</figure></section></body>`)
+	var staleSectionAID, oldFigureAID string
+	for _, a := range v1.AIDs {
+		switch a.Tag {
+		case "section":
+			staleSectionAID = a.AID
+		case "figure":
+			oldFigureAID = a.AID
+		}
+	}
+	if staleSectionAID == "" || oldFigureAID == "" {
+		t.Fatalf("v1 aids incomplete: %+v", v1.AIDs)
+	}
+	// Replace only the inner <figure> (content changed), injecting its old aid; the
+	// ancestor <section> keeps the stale aid v1 stamped onto it. This is exactly
+	// the string ReplaceElementByAIDAt would hand to StampAidsPinned.
+	inner := InjectRootAID(`<figure>edited</figure>`, oldFigureAID)
+	pre := `<body><section data-odoc-aid="` + staleSectionAID + `">`
+	doc := pre + inner + `</section></body>`
+	res := StampAidsPinned(doc, oldFigureAID, len(pre))
+
+	var newSectionAID, figureAID string
+	for _, a := range res.AIDs {
+		switch a.Tag {
+		case "section":
+			newSectionAID = a.AID
+		case "figure":
+			figureAID = a.AID
+		}
+	}
+	if figureAID != oldFigureAID {
+		t.Errorf("pinned figure aid = %q; want preserved %q", figureAID, oldFigureAID)
+	}
+	// The ancestor's content changed, so it must NOT keep the stale aid.
+	if newSectionAID == staleSectionAID {
+		t.Errorf("ancestor kept stale aid %q; it must rehash on content change", staleSectionAID)
+	}
+	if strings.Contains(res.HTML, `data-odoc-aid="`+staleSectionAID+`"`) {
+		t.Errorf("stale ancestor aid survived in HTML: %q", res.HTML)
+	}
+}
+
+// P1(2): a safe replacement root may be a NON-stampable tag (div/p). StampAidsPinned
+// must still force-index that root and carry the pinned aid, so a comment anchored
+// to it survives reconciliation (which only keeps anchors whose aid is in the
+// stamped set).
+func TestStampAidsPinnedIndexesNonStampableRoot(t *testing.T) {
+	for _, tag := range []string{"div", "p"} {
+		const prefix = `<body>`
+		injected := InjectRootAID(`<`+tag+`>hello</`+tag+`>`, "pinaid")
+		doc := prefix + injected + `</body>`
+		res := StampAidsPinned(doc, "pinaid", len(prefix))
+
+		var found bool
+		for _, a := range res.AIDs {
+			if a.AID == "pinaid" {
+				found = true
+				if a.Tag != tag {
+					t.Errorf("pinned %s indexed with tag %q", tag, a.Tag)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("non-stampable <%s> root not indexed: %+v", tag, res.AIDs)
+		}
+		if !strings.Contains(res.HTML, `<`+tag+` data-odoc-aid="pinaid">`) {
+			t.Errorf("non-stampable <%s> root missing pinned aid in HTML: %q", tag, res.HTML)
+		}
+	}
+}
+
+// P1(1): a SafeReplacementFragment may carry leading whitespace, so the root '<'
+// is not at the fragment start. InjectRootAIDAt reports the root offset; adding it
+// to the insertion boundary must point StampAidsPinned at the true root. Covers a
+// stampable root (figure) and a non-stampable root (div): both keep/index the old
+// aid despite the padding.
+func TestStampAidsPinnedWhitespacePaddedRoot(t *testing.T) {
+	for _, tag := range []string{"figure", "div"} {
+		const boundary = len(`<body>`)
+		injected, localRoot := InjectRootAIDAt("  \n\t<"+tag+">padded</"+tag+">", "padaid")
+		if localRoot <= 0 {
+			t.Fatalf("<%s>: localRoot = %d; want > 0 for whitespace-padded fragment", tag, localRoot)
+		}
+		doc := `<body>` + injected + `</body>`
+		res := StampAidsPinned(doc, "padaid", boundary+localRoot)
+
+		var found bool
+		for _, a := range res.AIDs {
+			if a.AID == "padaid" {
+				found = true
+				if a.Tag != tag {
+					t.Errorf("<%s>: pinned aid indexed with tag %q", tag, a.Tag)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("<%s>: whitespace-padded root not pinned/indexed: %+v", tag, res.AIDs)
+		}
+		if !strings.Contains(res.HTML, `<`+tag+` data-odoc-aid="padaid">`) {
+			t.Errorf("<%s>: whitespace-padded root missing pinned aid in HTML: %q", tag, res.HTML)
+		}
+	}
+}
+
+// P1(2): a self-closing stampable void root must be reconstructed with exactly one
+// closing slash and data-odoc-aid before it — never a malformed
+// "<img .../ data-odoc-aid/...>". Covers the final StampAidsPinned output.
+func TestStampAidsPinnedSelfClosingVoidRoot(t *testing.T) {
+	const boundary = len(`<body>`)
+	injected, localRoot := InjectRootAIDAt(`<img src="a.png" alt="x"/>`, "imgaid")
+	doc := `<body>` + injected + `</body>`
+	res := StampAidsPinned(doc, "imgaid", boundary+localRoot)
+
+	if want := `<img src="a.png" alt="x" data-odoc-aid="imgaid"/>`; !strings.Contains(res.HTML, want) {
+		t.Errorf("self-closing void root malformed:\n got %q\nwant substring %q", res.HTML, want)
+	}
+	// Guard against the P1(2) regression: no double slash / slash-before-aid.
+	if strings.Contains(res.HTML, `/ data-odoc-aid`) || strings.Contains(res.HTML, `"/data-odoc-aid`) {
+		t.Errorf("self-closing void root retained a stray slash: %q", res.HTML)
+	}
+}
+
+// Plain StampAids must reconstruct a self-closing void with exactly one slash too.
+func TestStampAidsSelfClosingVoidSingleSlash(t *testing.T) {
+	res := StampAids(`<body><img src="a.png"/></body>`)
+	if strings.Contains(res.HTML, `/ data-odoc-aid`) {
+		t.Errorf("stray slash before aid: %q", res.HTML)
+	}
+	if !imgSelfCloseOk(res.HTML) {
+		t.Errorf("self-closing img not normalized to a single trailing slash: %q", res.HTML)
+	}
+}
+
+func imgSelfCloseOk(html string) bool {
+	i := strings.Index(html, "<img")
+	if i < 0 {
+		return false
+	}
+	end := strings.IndexByte(html[i:], '>')
+	if end < 0 {
+		return false
+	}
+	tag := html[i : i+end+1]
+	return strings.Count(tag, "/") == 1 && strings.HasSuffix(tag, `"/>`) &&
+		strings.Contains(tag, `data-odoc-aid="`)
 }

@@ -335,6 +335,10 @@ func (s *DocService) GetElement(ctx context.Context, slug string, version int, a
 // stamp here (StampAids) since publishLocked takes an already-stamped result.
 // newHTML must be a single top-level element (no multiple elements, no
 // script/style, no inline event handlers, no javascript: URLs, no data-odoc-*).
+// After validation the backend injects the target's existing aid onto the
+// replacement root so the swapped element keeps its identity across the re-stamp
+// and any comment anchored to it persists (reconcile keeps it, even if the
+// replacement's tag or content changed).
 func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersion int, aid, newHTML string) (*PublishResult, error) {
 	if aid == "" {
 		return nil, apperr.Validation("aid required", "aid_required")
@@ -374,7 +378,8 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 		if rd == nil {
 			return apperr.NotFound("document version not found")
 		}
-		replaced, ok := core.ReplaceElementByAID(rd.HTML, aid, newHTML)
+		injected, localRoot := core.InjectRootAIDAt(newHTML, aid)
+		replaced, boundary, ok := core.ReplaceElementByAIDAt(rd.HTML, aid, injected)
 		if !ok {
 			return apperr.NotFound("aid not found in this version")
 		}
@@ -383,7 +388,14 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 		}
 		// Stamp here (publishLocked expects a stamped result) and publish without
 		// re-acquiring the lock — Publish would deadlock via a nested lock.With.
-		stamped := core.StampAids(replaced)
+		// Pin ONLY the replacement root to the injected old aid so the artifact keeps
+		// its identity and its comment anchor survives reconciliation — even when the
+		// replacement's tag/content changed, and even when the root is a safe
+		// non-stampable tag (div/p). The root '<' sits at boundary+localRoot in the
+		// result (localRoot accounts for any leading whitespace in the fragment).
+		// Every other element, including a stampable ancestor whose content shifted,
+		// still rehashes normally.
+		stamped := core.StampAidsPinned(replaced, aid, boundary+localRoot)
 		in, ierr := s.existingPublishInput(ctx, slug, replaced, "")
 		if ierr != nil {
 			return ierr
