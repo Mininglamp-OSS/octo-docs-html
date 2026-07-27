@@ -114,13 +114,13 @@ func (s *AuthService) DocMembersWired() bool { return s.docMembers != nil }
 // slug -> doc_id (via mirror) -> role. Callers use this for plan③ A3
 // owner-admin (role=3) short-circuit and A4 reader (role>=1) decisions.
 //
-// yujiawei round-3 P1a: two very different states must not collapse into the
-// same "ok=false" — otherwise capability.go's meta fallback covers both, and
-// a revoke on a registered doc silently leaves the legacy meta.grants entry
-// still granting read (revoke bypass). docRegistered separates them:
+// Two different states must not collapse into the same "ok=false", or a stale
+// meta.grants entry could restore access after a registered grant is revoked.
+// docRegistered separates them:
 //
 //   - docRegistered=false, ok=false: mirror unwired, uid empty, or doc has no
-//     doc_member registration yet (async publish, thread-mount, non-mounted).
+//     doc_member registration yet (post-commit registration gap, non-mounted,
+//     or failed registration).
 //     Callers may fall back to legacy meta.
 //   - docRegistered=true, ok=false: doc IS registered but uid has no row.
 //     Caller MUST treat this as "no access via this tier" and MUST NOT fall

@@ -36,10 +36,8 @@ type DocService struct {
 // GrantReconciler drains legacy meta.grants entries into doc_member after
 // confirmed registration. Injected (not a hard dep on AuthService) so DocService
 // stays testable in isolation and single-node deploys without a mirror wire a
-// no-op. yujiawei round-4 P1: without this hook, a grant issued while the doc
-// is unregistered (AddGrant → addGrantToMeta fallback) evaporates once
-// registration flips docRegistered=true and the strict wired gate closes the
-// meta fallback.
+// no-op. Without this hook, a grant issued while the doc is unregistered
+// evaporates once registration closes the meta fallback.
 type GrantReconciler func(ctx context.Context, slug string) error
 
 // DocRegistrar is the docs-backend side-effect sink.
@@ -112,7 +110,7 @@ type PublishInput struct {
 	// caller (bot) knows where it is publishing, so no user-token binding query
 	// is needed. MountTypePresent distinguishes an omitted field from an explicit
 	// empty value; neither implicitly unmounts an existing mounted document.
-	MountType        string // "group" | "space" | "thread" (thread ⇒ skipped)
+	MountType        string // "group" | "space" | "thread" (all registerable)
 	MountTypePresent bool
 	GroupNo          string
 	ThreadID         string
@@ -148,12 +146,11 @@ type PublishResult struct {
 	hadMeta      bool
 	titleChanged bool
 
-	// Mount info carried from PublishInput into afterPublished for registration.
+	// Mount info carried through the synchronous post-publish registration step.
 	mountType         string
 	mountContextKnown bool
 
-	// publisherToken carries the publishing bot's own token from PublishInput
-	// into afterPublished so registration authenticates as the publisher.
+	// publisherToken authenticates synchronous registration as the publisher.
 	publisherToken string
 }
 
@@ -827,10 +824,7 @@ func (s *DocService) registrationForMount(slug, title, mountType string) (docsba
 	case "":
 		s.log().Debug("docs_backend_register skipped: no mount_type", "slug", slug)
 		return docsbackend.Registration{}, false
-	case "thread":
-		s.log().Debug("docs_backend_register skipped: thread mount", "slug", slug)
-		return docsbackend.Registration{}, false
-	case "group", "space":
+	case "group", "space", "thread":
 	default:
 		s.log().Debug("docs_backend_register skipped: unsupported mount_type", "slug", slug, "mount_type", mountType)
 		return docsbackend.Registration{}, false

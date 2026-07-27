@@ -13,9 +13,8 @@ import (
 // sessions on octoSessionCtxKey which are not sufficient for publish auth.
 type botSessionCtxKey struct{}
 
-// botTokenCtxKey carries the publishing bot's own bearer token so the async
-// docs-backend registration can authenticate as that bot (registering the doc
-// under the publisher, not a fixed process identity).
+// botTokenCtxKey carries the publishing bot's bearer token so docs-backend
+// registration authenticates as that bot, not a fixed process identity.
 type botTokenCtxKey struct{}
 
 // botAuthMiddleware enriches Bearer bot tokens into the same context session

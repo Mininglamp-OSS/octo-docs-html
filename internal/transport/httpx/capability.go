@@ -146,9 +146,9 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 		// ② owner has admin row in doc_member (M1 contract) — or, until that
 		// row exists, falls back to the pre-plan③ owner-preferring match on
 		// meta.creator_uid. The fallback is not just an unwired-deploy escape:
-		// doc_member rows are registered asynchronously (DocService.afterPublished
-		// go func) and thread-mount / non-mounted docs are never registered at
-		// all, so a wired mirror can legitimately return ok=false on a live doc.
+		// doc_member rows appear after the HTML commit during the same request, and
+		// non-mounted / failed-registration docs are never registered. A wired
+		// mirror can therefore legitimately return ok=false on a live doc.
 		// Without this fallback the same-owner bot session (Bearer bot-token)
 		// would 404 on a doc it just published. Skipped when ownerUID == "".
 		if ownerUID != "" {
@@ -161,8 +161,8 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 				if ok && role == service.DocMemberRoleAdmin {
 					hit = true
 				}
-				// yujiawei round-5 P1-a: no docRegistered gate here. A3②'s
-				// fallback keys on creator_uid, which is stamped at publish
+				// No docRegistered gate here. A3②'s fallback keys on
+				// creator_uid, which is stamped at publish
 				// (doc.go) and never revocable (RemoveGrant refuses it), so it
 				// cannot resurrect a revoked grant. Gating it locks owners out
 				// when the owner-admin row is missing (registered-but-no-row) —
@@ -199,8 +199,8 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 			if ok && role >= service.DocMemberRoleReader {
 				hit = true
 			}
-			// yujiawei round-3 P1a: registered doc + no reader row → do NOT
-			// fall back to meta.GrantRole. Otherwise a stale meta.grants
+			// Registered doc + no reader row must not fall back to
+			// meta.GrantRole. Otherwise a stale meta.grants
 			// entry left after M2 (M2 copies, does not delete) or after a
 			// revoke would still grant read = revoke bypass.
 			if docRegistered {
@@ -212,7 +212,7 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 			if err != nil {
 				return service.CapNone, err
 			}
-			if meta != nil && meta.GrantRole(matchUID) != "" { //nolint:staticcheck // A4 fallback: reader read of meta.grants covers pre-registration + unwired
+			if meta != nil && meta.GrantRole(matchUID) != "" { //nolint:staticcheck // A4 fallback covers the registration gap and unwired deployments
 				hit = true
 			}
 		}

@@ -37,7 +37,7 @@ type fakeDocMemberMirror struct {
 	listMembers []service.DocMember
 	readErr     error
 	// unregistered=true makes DocIDBySlug return ok=false so tests can drive
-	// the "doc not in doc_member yet" state (yujiawei round-3 P1a).
+	// the "doc not in doc_member yet" state.
 	unregistered bool
 }
 
@@ -573,7 +573,7 @@ func (unregisteredMirror) ListMembers(context.Context, string) ([]service.DocMem
 	return nil, nil
 }
 
-// yujiawei round-3 P1a: RoleBySlugUID must distinguish two "ok=false" states
+// RoleBySlugUID must distinguish two "ok=false" states
 // so bestCred can gate its meta fallback correctly. docRegistered=false means
 // "doc has no rich-doc row yet — legacy fallback allowed"; docRegistered=true
 // with ok=false means "doc IS registered, uid just has no row — do NOT fall
@@ -614,10 +614,10 @@ func TestRoleBySlugUIDRegisteredHitReturnsRole(t *testing.T) {
 	}
 }
 
-// yujiawei round-3 P2: AddGrant on an unregistered doc must fall back to
+// AddGrant on an unregistered doc must fall back to
 // meta.grants, matching reads / ListGrants / RemoveGrant. Prior to this fix
-// it 404'd, which made thread-mount / non-mounted docs (which never register
-// in doc_member) permanently un-grantable while still readable — an
+// it 404'd, which made docs still in the registration gap (or non-mounted /
+// failed registration) permanently un-grantable while still readable — an
 // asymmetric API surface.
 func TestAddGrantUnregisteredFallsBackToMeta(t *testing.T) {
 	svc, slug := newGrantSvc(t)
@@ -637,10 +637,8 @@ func TestAddGrantUnregisteredFallsBackToMeta(t *testing.T) {
 	}
 }
 
-// yujiawei round-4 P1: grants issued during the pre-registration gap land in
-// meta.grants (AddGrant unregistered fallback). Once afterPublished registers
-// the doc, the strict wired A4 gate refuses to serve them from meta.grants,
-// so they must be reconciled into doc_member or the reader silently 404s.
+// Grants issued during the registration gap land in meta.grants. Once the
+// publish request registers the doc, they must be reconciled into doc_member.
 func TestReconcileMetaGrantsPromotesReaderIntoDocMember(t *testing.T) {
 	store := memory.New()
 	slug := "docReconcile"
@@ -746,7 +744,7 @@ func TestReconcileMetaGrantsUnwiredNoop(t *testing.T) {
 	}
 }
 
-// yujiawei round-4 P2: on the registered branch, RemoveGrant must also sweep
+// On the registered branch, RemoveGrant must also sweep
 // any stale meta.grants[uid] entry (M2 copies rather than moves), otherwise a
 // later unmount / soft-delete flipping DocIDBySlug back to ok=false would let
 // the A4 fallback resurrect read access after a revoke.
@@ -804,7 +802,7 @@ func TestRemoveGrantSweepIdempotentOnAbsentMeta(t *testing.T) {
 	// No panic, no error — that's the assertion.
 }
 
-// yujiawei round-4 P2 race guard: Upsert must preserve an admin row when the
+// Upsert must preserve an admin row when the
 // caller writes a non-admin role. Simulates a backfill promoting owner-2 to
 // admin between AddGrant's probe and the mirror write; the SQL WHERE role<>3
 // invariant (fakeDocMemberMirror mirrors it) keeps the admin.
@@ -832,7 +830,7 @@ func TestUpsertDirectGrantAdminWriterPromotes(t *testing.T) {
 	}
 }
 
-// yujiawei round-4 P2 race guard: DeleteGrant must refuse an admin row and
+// DeleteGrant must refuse an admin row and
 // return ErrDocMemberAdminGuard so callers surface a protected error rather
 // than silently deleting an admin promoted between probe and DELETE.
 func TestDeleteGrantRefusesAdminRow(t *testing.T) {
@@ -931,7 +929,7 @@ func TestReconcileMetaGrantsSkipsAdminRow(t *testing.T) {
 	}
 }
 
-// yujiawei round-5 P1-b: reconcile ∥ revoke TOCTOU. Without the slug lock,
+// Reconcile and revoke have a TOCTOU risk without the slug lock:
 // reconcile snapshots meta.grants[uid], then RemoveGrant deletes the
 // doc_member row and sweeps meta.grants, and finally reconcile's stale
 // snapshot re-inserts the doc_member row = resurrected revoked grant.
