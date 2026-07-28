@@ -22,6 +22,9 @@ const (
 	maxDiffChanges      = 1000
 	maxDiffInputLines   = 12000
 	maxDiffHunkLines    = 2000
+	maxDiffTagBytes     = 256
+	maxDiffPathBytes    = 16 << 10
+	maxDiffPathsBytes   = 2 << 20
 	maxDiffSnippetBytes = 8 << 10
 	maxDiffOpeningBytes = 1024
 	maxDiffOutputBytes  = 512 << 10
@@ -175,6 +178,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 	rootCounts := map[string]int{}
 	childCounts := map[int]map[string]int{}
 	rawScanBytes := 0
+	pathBytes := 0
 	for cursor := 0; cursor < len(source); {
 		lt := strings.IndexByte(source[cursor:], '<')
 		if lt < 0 {
@@ -203,7 +207,10 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			continue
 		}
 		if trimmed[0] == '/' {
-			tag := diffTagName(trimmed[1:])
+			tag, ok := diffTagName(trimmed[1:])
+			if !ok {
+				return nil, errDiffLimit
+			}
 			for pos := len(stack) - 1; pos >= 0; pos-- {
 				entry := stack[pos]
 				if nodes[entry.index].tag != tag {
@@ -216,7 +223,10 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			cursor = end + 1
 			continue
 		}
-		tag := diffTagName(trimmed)
+		tag, ok := diffTagName(trimmed)
+		if !ok {
+			return nil, errDiffLimit
+		}
 		if tag == "" {
 			cursor = end + 1
 			continue
@@ -235,10 +245,19 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			}
 		}
 		counts[tag]++
-		path := "/" + tag + fmt.Sprintf("[%d]", counts[tag])
+		segment := "/" + tag + fmt.Sprintf("[%d]", counts[tag])
+		pathLen := len(segment)
 		if parent >= 0 {
-			path = nodes[parent].path + path
+			pathLen += len(nodes[parent].path)
 		}
+		if pathLen > maxDiffPathBytes || pathBytes > maxDiffPathsBytes-pathLen {
+			return nil, errDiffLimit
+		}
+		path := segment
+		if parent >= 0 {
+			path = nodes[parent].path + segment
+		}
+		pathBytes += pathLen
 		attrs := parseDiffAttrs(trimmed[len(tag):])
 		node := htmlDiffNode{tag: tag, aid: attrs["data-odoc-aid"], attrs: attrs, path: path, parent: parent, order: len(nodes)}
 		nodes = append(nodes, node)
@@ -323,7 +342,7 @@ func diffTagEnd(source string, start int) int {
 	return -1
 }
 
-func diffTagName(raw string) string {
+func diffTagName(raw string) (string, bool) {
 	raw = strings.TrimLeftFunc(raw, unicode.IsSpace)
 	end := 0
 	for end < len(raw) {
@@ -334,8 +353,11 @@ func diffTagName(raw string) string {
 			break
 		}
 		end++
+		if end > maxDiffTagBytes {
+			return "", false
+		}
 	}
-	return strings.ToLower(raw[:end])
+	return strings.ToLower(raw[:end]), true
 }
 
 func parseDiffAttrs(raw string) map[string]string {
@@ -944,21 +966,64 @@ func normalizedHTMLLines(source string) ([]string, bool) {
 			if end < 0 {
 				end = len(source) - 1
 			}
+			rawTag := source[cursor+1 : end]
+			trimmed := strings.TrimSpace(rawTag)
 			lines = append(lines, limitDiffLine(normalizeDiffHTML(source[cursor:end+1])))
 			cursor = end + 1
+			if trimmed == "" || trimmed[0] == '/' || trimmed[0] == '!' || trimmed[0] == '?' || strings.HasSuffix(strings.TrimSpace(rawTag), "/") {
+				continue
+			}
+			tag, ok := diffTagName(trimmed)
+			if !ok {
+				return nil, false
+			}
+			if !isDiffLiteralRawTextTag(tag) {
+				continue
+			}
+			closeStart, _ := indexDiffRawClose(source, cursor, tag)
+			if closeStart < 0 {
+				if !appendNormalizedDiffText(&lines, source[cursor:], true) {
+					return nil, false
+				}
+				cursor = len(source)
+				continue
+			}
+			if !appendNormalizedDiffText(&lines, source[cursor:closeStart], true) || len(lines) >= maxDiffInputLines {
+				return nil, false
+			}
+			closeEnd := diffTagEnd(source, closeStart)
+			if closeEnd < 0 {
+				closeEnd = len(source) - 1
+			}
+			lines = append(lines, limitDiffLine(normalizeDiffHTML(source[closeStart:closeEnd+1])))
+			cursor = closeEnd + 1
 			continue
 		}
 		end := strings.IndexByte(source[cursor:], '<')
 		if end < 0 {
 			end = len(source) - cursor
 		}
-		text := strings.Join(strings.Fields(html.UnescapeString(source[cursor:cursor+end])), " ")
-		if text != "" {
-			lines = append(lines, limitDiffLine(text))
+		if !appendNormalizedDiffText(&lines, source[cursor:cursor+end], false) {
+			return nil, false
 		}
 		cursor += end
 	}
 	return lines, true
+}
+
+func appendNormalizedDiffText(lines *[]string, text string, literal bool) bool {
+	if !literal {
+		text = html.UnescapeString(text)
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	if text == "" {
+		return true
+	}
+	if len(*lines) >= maxDiffInputLines {
+		return false
+	}
+	*lines = append(*lines, limitDiffLine(text))
+	return true
 }
 
 func limitDiffLine(line string) string {

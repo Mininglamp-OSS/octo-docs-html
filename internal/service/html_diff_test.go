@@ -2,9 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
@@ -53,6 +56,76 @@ func TestBuildVersionDiffRejectsExcessiveDepth(t *testing.T) {
 	}
 	if _, err := buildVersionDiff(1, 2, source.String(), source.String()); err != errDiffLimit {
 		t.Fatalf("error = %v; want diff limit", err)
+	}
+}
+
+func TestParseDiffHTMLBoundsDeepLongTagPaths(t *testing.T) {
+	tag := "x" + strings.Repeat("a", maxDiffTagBytes-1)
+	var source strings.Builder
+	source.Grow(5 << 20)
+	for range maxDiffDepth {
+		source.WriteByte('<')
+		source.WriteString(tag)
+		source.WriteByte('>')
+	}
+	for source.Len() < 5<<20 {
+		source.WriteString("<!-- padding -->")
+	}
+	for range maxDiffDepth {
+		source.WriteString("</")
+		source.WriteString(tag)
+		source.WriteByte('>')
+	}
+	htmlSource := source.String()
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := parseDiffHTML(htmlSource); err != errDiffLimit {
+		t.Fatalf("error = %v; want diff limit", err)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 6<<20 {
+		t.Fatalf("parse allocated %d bytes before rejecting oversized paths", allocated)
+	}
+}
+
+func TestParseDiffHTMLRejectsOversizedTagName(t *testing.T) {
+	source := "<x" + strings.Repeat("a", maxDiffTagBytes) + "></x>"
+	if _, err := parseDiffHTML(source); err != errDiffLimit {
+		t.Fatalf("error = %v; want diff limit", err)
+	}
+}
+
+func TestDiffMapsPathLimitToPayloadTooLarge(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	docs := NewDocService(store, store, NewCommentService(store, sluglock.NewMemory()), sluglock.NewMemory(), "", 5<<20)
+	tag := "x" + strings.Repeat("a", maxDiffTagBytes-1)
+	var source strings.Builder
+	for range maxDiffDepth {
+		source.WriteByte('<')
+		source.WriteString(tag)
+		source.WriteByte('>')
+	}
+	for range maxDiffDepth {
+		source.WriteString("</")
+		source.WriteString(tag)
+		source.WriteByte('>')
+	}
+	for version := 1; version <= 2; version++ {
+		if _, err := store.PutDoc(ctx, "path-limit", version, source.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.PutMeta(ctx, "path-limit", storage.DocMeta{Slug: "path-limit", Versions: []storage.VersionRef{{N: 1}, {N: 2}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := docs.Diff(ctx, "path-limit", 1, 2)
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Status != 413 || appErr.Code != "diff_too_complex" {
+		t.Fatalf("error = %#v; want 413 diff_too_complex", err)
 	}
 }
 
@@ -143,6 +216,27 @@ func TestBuildVersionDiffPreservesScriptEntityLiterals(t *testing.T) {
 	}
 	if len(result.Changes) != 1 || result.Changes[0].DOMPath != "/html[1]/head[1]/script[1]" {
 		t.Fatalf("changes = %+v", result.Changes)
+	}
+}
+
+func TestBuildVersionDiffCodeHunksPreserveLiteralRawTextEntities(t *testing.T) {
+	for _, tag := range []string{"script", "style"} {
+		t.Run(tag, func(t *testing.T) {
+			before := "<html><head><" + tag + `>value = "&amp;";</` + tag + "></head><body></body></html>"
+			after := "<html><head><" + tag + `>value = "&";</` + tag + "></head><body></body></html>"
+
+			result, err := buildVersionDiff(1, 2, before, after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.CodeHunks) != 1 {
+				t.Fatalf("code hunks = %+v", result.CodeHunks)
+			}
+			lines := strings.Join(result.CodeHunks[0].Lines, "\n")
+			if !strings.Contains(lines, `-value = "&amp;";`) || !strings.Contains(lines, `+value = "&";`) {
+				t.Fatalf("code hunk lost raw-text difference:\n%s", lines)
+			}
+		})
 	}
 }
 
