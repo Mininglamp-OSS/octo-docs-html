@@ -114,6 +114,73 @@ func TestBuildVersionDiffListHeadInsertionDoesNotCascade(t *testing.T) {
 	}
 }
 
+func TestBuildVersionDiffDuplicateListHeadInsertionDoesNotCascade(t *testing.T) {
+	before := `<html><body><ul><li>x</li><li>x</li></ul></body></html>`
+	after := `<html><body><ul><li>new</li><li>x</li><li>x</li></ul></body></html>`
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Added != 1 || result.Summary.Modified != 0 || result.Summary.Removed != 0 {
+		t.Fatalf("summary = %+v; changes = %+v", result.Summary, result.Changes)
+	}
+	if len(result.Changes) != 1 || result.Changes[0].AfterHTML != "<li>new</li>" {
+		t.Fatalf("changes = %+v", result.Changes)
+	}
+}
+
+func TestParseDiffHTMLBoundsCommentSeparatedTextStorage(t *testing.T) {
+	var source strings.Builder
+	source.Grow(5 << 20)
+	source.WriteString("<main>")
+	for source.Len() < 5<<20 {
+		source.WriteString("x<!-- separator -->")
+	}
+	source.WriteString("</main>")
+
+	nodes, err := parseDiffHTML(source.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %d", len(nodes))
+	}
+	if len(nodes[0].text) > maxDiffCompareText || len(nodes[0].compareText) > maxDiffCompareText {
+		t.Fatalf("stored text sizes = %d, %d", len(nodes[0].text), len(nodes[0].compareText))
+	}
+}
+
+func TestParseDiffHTMLBoundsMultipleRawTextElements(t *testing.T) {
+	payload := strings.Repeat("A", 256<<10)
+	var source strings.Builder
+	source.WriteString("<html><head>")
+	for range 8 {
+		source.WriteString("<style>")
+		source.WriteString(payload)
+		source.WriteString("</STYLE><script>")
+		source.WriteString(payload)
+		source.WriteString("</SCRIPT>")
+	}
+	source.WriteString("</head><body><p>after raw text</p></body></html>")
+
+	nodes, err := parseDiffHTML(source.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 20 {
+		t.Fatalf("nodes = %d", len(nodes))
+	}
+	for _, node := range nodes {
+		if len(node.text) > maxDiffCompareText || len(node.compareText) > maxDiffCompareText {
+			t.Fatalf("%s stored text sizes = %d, %d", node.tag, len(node.text), len(node.compareText))
+		}
+	}
+	if nodes[len(nodes)-1].tag != "p" || nodes[len(nodes)-1].text != "after raw text" {
+		t.Fatalf("last node = %+v", nodes[len(nodes)-1])
+	}
+}
+
 func TestReplaceElementPersistsCompatibleVersionChangeMetadata(t *testing.T) {
 	ctx := context.Background()
 	store := memory.New()

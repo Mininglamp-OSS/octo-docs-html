@@ -18,6 +18,7 @@ const (
 	maxDiffComparisons  = 200000
 	maxDiffCompareBytes = 16 << 20
 	maxDiffCompareText  = 4096
+	maxDiffRawScanBytes = 16 << 20
 	maxDiffChanges      = 1000
 	maxDiffInputLines   = 12000
 	maxDiffHunkLines    = 2000
@@ -69,6 +70,8 @@ type htmlDiffNode struct {
 	aid         string
 	attrs       map[string]string
 	text        string
+	textParts   []string
+	textBytes   int
 	compareText string
 	signature   string
 	path        string
@@ -171,6 +174,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 	stack := make([]diffOpenNode, 0, 32)
 	rootCounts := map[string]int{}
 	childCounts := map[int]map[string]int{}
+	rawScanBytes := 0
 	for cursor := 0; cursor < len(source); {
 		lt := strings.IndexByte(source[cursor:], '<')
 		if lt < 0 {
@@ -246,19 +250,22 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		if selfClosing {
 			nodes[index].outer = source[lt : end+1]
 		} else if isDiffRawTextTag(tag) {
-			closeStart := strings.Index(strings.ToLower(source[end+1:]), "</"+tag)
+			closeStart, scanned := indexDiffRawClose(source, end+1, tag)
+			rawScanBytes += scanned
+			if rawScanBytes > maxDiffRawScanBytes {
+				return nil, errDiffLimit
+			}
 			if closeStart < 0 {
-				nodes[index].text = strings.Join(strings.Fields(source[end+1:]), " ")
+				appendDiffNodeText(&nodes[index], source[end+1:])
 				nodes[index].outer = source[lt:]
 				cursor = len(source)
 				continue
 			}
-			closeStart += end + 1
 			closeEnd := diffTagEnd(source, closeStart)
 			if closeEnd < 0 {
 				closeEnd = len(source) - 1
 			}
-			nodes[index].text = strings.Join(strings.Fields(source[end+1:closeStart]), " ")
+			appendDiffNodeText(&nodes[index], source[end+1:closeStart])
 			nodes[index].outer = source[lt : closeEnd+1]
 			cursor = closeEnd + 1
 			continue
@@ -271,10 +278,29 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		nodes[entry.index].outer = source[entry.start:]
 	}
 	for index := range nodes {
+		nodes[index].text = strings.Join(nodes[index].textParts, " ")
+		nodes[index].textParts = nil
 		nodes[index].compareText = normalizeCompareText(nodes[index].text)
 		nodes[index].signature = computeDiffNodeSignature(nodes[index])
 	}
 	return nodes, nil
+}
+
+func indexDiffRawClose(source string, start int, tag string) (int, int) {
+	for cursor := start; cursor < len(source); {
+		relative := strings.IndexByte(source[cursor:], '<')
+		if relative < 0 {
+			return -1, len(source) - start
+		}
+		candidate := cursor + relative
+		nameStart := candidate + 2
+		nameEnd := nameStart + len(tag)
+		if candidate+1 < len(source) && source[candidate+1] == '/' && nameEnd <= len(source) && strings.EqualFold(source[nameStart:nameEnd], tag) && (nameEnd == len(source) || unicode.IsSpace(rune(source[nameEnd])) || source[nameEnd] == '>') {
+			return candidate, candidate - start + 1
+		}
+		cursor = candidate + 1
+	}
+	return -1, len(source) - start
 }
 
 func diffTagEnd(source string, start int) int {
@@ -361,14 +387,36 @@ func parseDiffAttrs(raw string) map[string]string {
 }
 
 func appendDiffText(nodes []htmlDiffNode, stack []diffOpenNode, text string) {
-	if len(stack) == 0 || strings.TrimSpace(text) == "" {
+	if len(stack) == 0 {
 		return
 	}
 	index := stack[len(stack)-1].index
-	if nodes[index].text != "" {
-		nodes[index].text += " "
+	appendDiffNodeText(&nodes[index], text)
+}
+
+func appendDiffNodeText(node *htmlDiffNode, text string) {
+	remaining := maxDiffCompareText - node.textBytes
+	separatorBytes := 0
+	if len(node.textParts) > 0 {
+		separatorBytes = 1
 	}
-	nodes[index].text += strings.Join(strings.Fields(html.UnescapeString(text)), " ")
+	if remaining <= separatorBytes || text == "" {
+		return
+	}
+	remaining -= separatorBytes
+	limit := remaining * 8
+	if len(text) > limit {
+		text = text[:limit]
+	}
+	normalized := strings.Join(strings.Fields(html.UnescapeString(text)), " ")
+	if normalized == "" {
+		return
+	}
+	if len(normalized) > remaining {
+		normalized = normalized[:remaining]
+	}
+	node.textParts = append(node.textParts, normalized)
+	node.textBytes += separatorBytes + len(normalized)
 }
 
 func isDiffVoidTag(tag string) bool {
@@ -404,7 +452,11 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 			if matchAIDChildren(before, after, beforeParent, afterParent, matches, used) {
 				changed = true
 			}
-			if matchExactChildren(before, after, beforeParent, afterParent, matches, used) {
+			exactChanged, err := matchExactChildSequence(before, after, beforeParent, afterParent, matches, used, &budget)
+			if err != nil {
+				return nil, err
+			}
+			if exactChanged {
 				changed = true
 			}
 		}
@@ -496,28 +548,114 @@ func matchRootNodes(before, after []htmlDiffNode, matches map[int]int, used map[
 	}
 }
 
-func matchExactChildren(before, after []htmlDiffNode, beforeParent, afterParent int, matches map[int]int, used map[int]bool) bool {
-	afterBySignature := map[string][]int{}
-	for _, afterIndex := range after[afterParent].children {
-		if !used[afterIndex] {
-			signature := diffNodeSignature(after[afterIndex])
-			afterBySignature[signature] = append(afterBySignature[signature], afterIndex)
-		}
+func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterParent int, matches map[int]int, used map[int]bool, budget *diffMatchBudget) (bool, error) {
+	beforeChildren := unmatchedDiffChildren(before[beforeParent].children, matches, nil)
+	afterChildren := unmatchedDiffChildren(after[afterParent].children, nil, used)
+	if len(beforeChildren) == 0 || len(afterChildren) == 0 {
+		return false, nil
 	}
 	changed := false
-	for _, beforeIndex := range before[beforeParent].children {
-		if _, ok := matches[beforeIndex]; ok {
-			continue
+	beforeStart, afterStart := 0, 0
+	for beforeStart < len(beforeChildren) && afterStart < len(afterChildren) {
+		equal, err := diffSignaturesEqual(before[beforeChildren[beforeStart]], after[afterChildren[afterStart]], budget)
+		if err != nil {
+			return false, err
 		}
-		candidates := afterBySignature[diffNodeSignature(before[beforeIndex])]
-		if len(candidates) != 1 || used[candidates[0]] {
-			continue
+		if !equal || !siblingOrderCompatible(before, after, beforeChildren[beforeStart], afterChildren[afterStart], matches) {
+			break
 		}
-		matches[beforeIndex] = candidates[0]
-		used[candidates[0]] = true
+		matches[beforeChildren[beforeStart]] = afterChildren[afterStart]
+		used[afterChildren[afterStart]] = true
+		changed = true
+		beforeStart++
+		afterStart++
+	}
+	beforeEnd, afterEnd := len(beforeChildren), len(afterChildren)
+	for beforeEnd > beforeStart && afterEnd > afterStart {
+		beforeIndex, afterIndex := beforeChildren[beforeEnd-1], afterChildren[afterEnd-1]
+		equal, err := diffSignaturesEqual(before[beforeIndex], after[afterIndex], budget)
+		if err != nil {
+			return false, err
+		}
+		if !equal || !siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches) {
+			break
+		}
+		beforeEnd--
+		afterEnd--
+		matches[beforeIndex] = afterIndex
+		used[afterIndex] = true
 		changed = true
 	}
-	return changed
+	beforeChildren = beforeChildren[beforeStart:beforeEnd]
+	afterChildren = afterChildren[afterStart:afterEnd]
+	if len(beforeChildren) == 0 || len(afterChildren) == 0 {
+		return changed, nil
+	}
+	if len(beforeChildren) > (maxDiffComparisons-budget.comparisons)/len(afterChildren) {
+		return false, errDiffLimit
+	}
+	width := len(afterChildren) + 1
+	cells := make([]uint16, (len(beforeChildren)+1)*width)
+	for beforePos := len(beforeChildren) - 1; beforePos >= 0; beforePos-- {
+		for afterPos := len(afterChildren) - 1; afterPos >= 0; afterPos-- {
+			beforeIndex, afterIndex := beforeChildren[beforePos], afterChildren[afterPos]
+			equal, err := diffSignaturesEqual(before[beforeIndex], after[afterIndex], budget)
+			if err != nil {
+				return false, err
+			}
+			cell := beforePos*width + afterPos
+			if equal && siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches) {
+				cells[cell] = cells[(beforePos+1)*width+afterPos+1] + 1
+			} else {
+				skipBefore := cells[(beforePos+1)*width+afterPos]
+				skipAfter := cells[beforePos*width+afterPos+1]
+				if skipBefore >= skipAfter {
+					cells[cell] = skipBefore
+				} else {
+					cells[cell] = skipAfter
+				}
+			}
+		}
+	}
+	for beforePos, afterPos := 0, 0; beforePos < len(beforeChildren) && afterPos < len(afterChildren); {
+		beforeIndex, afterIndex := beforeChildren[beforePos], afterChildren[afterPos]
+		if diffNodeSignature(before[beforeIndex]) == diffNodeSignature(after[afterIndex]) && siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches) && cells[beforePos*width+afterPos] == cells[(beforePos+1)*width+afterPos+1]+1 {
+			matches[beforeIndex] = afterIndex
+			used[afterIndex] = true
+			changed = true
+			beforePos++
+			afterPos++
+		} else if cells[(beforePos+1)*width+afterPos] >= cells[beforePos*width+afterPos+1] {
+			beforePos++
+		} else {
+			afterPos++
+		}
+	}
+	return changed, nil
+}
+
+func diffSignaturesEqual(before, after htmlDiffNode, budget *diffMatchBudget) (bool, error) {
+	beforeSignature, afterSignature := diffNodeSignature(before), diffNodeSignature(after)
+	if !budget.add(len(beforeSignature) + len(afterSignature)) {
+		return false, errDiffLimit
+	}
+	return beforeSignature == afterSignature, nil
+}
+
+func unmatchedDiffChildren(children []int, matches map[int]int, used map[int]bool) []int {
+	result := make([]int, 0, len(children))
+	for _, index := range children {
+		if matches != nil {
+			if _, ok := matches[index]; ok {
+				continue
+			}
+		}
+		if used != nil && used[index] {
+			continue
+		}
+		result = append(result, index)
+	}
+	return result
 }
 
 func parentsMatch(before, after htmlDiffNode, matches map[int]int) bool {
