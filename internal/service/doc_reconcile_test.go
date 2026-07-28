@@ -421,11 +421,12 @@ func TestReplaceElementPreservesAnchoredCommentAcrossTagChange(t *testing.T) {
 	}
 }
 
-// issue-21 P1(2): a safe replacement root may be a NON-stampable tag (a <div>).
-// The backend still injects the old aid and force-indexes the root, so the
-// rendered v2 carries the aid and the anchored comment stays element-anchored to
-// it (never lost) despite the tag not being in the stampable set.
-func TestReplaceElementPreservesAnchorForNonStampableRoot(t *testing.T) {
+// Honest contract: a BARE non-addressable replacement root (a <div>/<p> with no
+// opt-in) is rejected with a validation error. The stamper does not harvest such
+// a root, so pinning an aid onto it would silently vanish on the next publish and
+// lose the anchored comment. The caller must use a stampable tag or the existing
+// class "odoc-artifact" opt-in instead.
+func TestReplaceElementRejectsBareNonAddressableRoot(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()
 	comments := service.NewCommentService(store, locker)
@@ -433,11 +434,11 @@ func TestReplaceElementPreservesAnchorForNonStampableRoot(t *testing.T) {
 
 	ctx := context.Background()
 	if _, err := docs.Publish(ctx, service.PublishInput{
-		Slug: "divroot", HTML: "<html><body><section><p>old</p></section></body></html>",
+		Slug: "barediv", HTML: "<html><body><section><p>old</p></section></body></html>",
 	}); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	v1, err := docs.Render(ctx, "divroot", 1)
+	v1, err := docs.Render(ctx, "barediv", 1)
 	if err != nil || v1 == nil {
 		t.Fatalf("render v1: data=%v err=%v", v1, err)
 	}
@@ -445,41 +446,24 @@ func TestReplaceElementPreservesAnchorForNonStampableRoot(t *testing.T) {
 	end := strings.Index(v1.HTML[start:], `"`)
 	oldAID := v1.HTML[start : start+end]
 
-	if res, err := comments.Create(ctx, "divroot", &core.Author{Login: "u"}, "note",
-		&core.Anchor{Kind: "element", AID: oldAID}, 1); err != nil || res.Status != 200 {
-		t.Fatalf("create comment: status=%d err=%v", res.Status, err)
+	// Bare <div> and bare <p> are both rejected (not harvestable).
+	for _, bad := range []string{`<div>brand new</div>`, `<p>brand new</p>`} {
+		_, rerr := docs.ReplaceElement(ctx, "barediv", 1, oldAID, bad)
+		if rerr == nil {
+			t.Fatalf("replace with bare root %q: want validation error, got nil", bad)
+		}
 	}
-
-	// Replace the stampable <section> with a NON-stampable <div> root.
-	if _, err := docs.ReplaceElement(ctx, "divroot", 1, oldAID, "<div>brand new</div>"); err != nil {
-		t.Fatalf("replace: %v", err)
+	// A <div> that carries the existing class opt-in IS accepted (harvestable).
+	if _, err := docs.ReplaceElement(ctx, "barediv", 1, oldAID,
+		`<div class="odoc-artifact">brand new</div>`); err != nil {
+		t.Fatalf("replace with opt-in div: unexpected err %v", err)
 	}
-
-	v2, err := docs.Render(ctx, "divroot", 2)
+	v2, err := docs.Render(ctx, "barediv", 2)
 	if err != nil || v2 == nil {
 		t.Fatalf("render v2: data=%v err=%v", v2, err)
 	}
-	if !strings.Contains(v2.HTML, `<div data-odoc-aid="`+oldAID+`">`) {
-		t.Fatalf("non-stampable div root not indexed with preserved aid: %q", v2.HTML)
-	}
-
-	snaps, err := comments.List(ctx, "divroot", 2)
-	if err != nil {
-		t.Fatalf("list comments: %v", err)
-	}
-	if len(snaps) != 1 {
-		t.Fatalf("comment count = %d; want 1", len(snaps))
-	}
-	a := snaps[0].Anchor
-	if a == nil || a.Kind != "element" {
-		t.Fatalf("comment anchor = %+v; want element-anchored (not lost)", a)
-	}
-	got := a.AID
-	if got == "" && a.Selector != "" {
-		got = a.Selector
-	}
-	if !strings.Contains(got, oldAID) {
-		t.Fatalf("comment anchor lost the aid: kind=%q aid=%q selector=%q", a.Kind, a.AID, a.Selector)
+	if !strings.Contains(v2.HTML, `data-odoc-aid="`+oldAID+`"`) {
+		t.Fatalf("opt-in div root did not carry the preserved aid: %q", v2.HTML)
 	}
 }
 
@@ -545,5 +529,193 @@ func TestReplaceElementPreservesAnchorForSelfClosingRoot(t *testing.T) {
 	}
 	if !strings.Contains(got, oldAID) {
 		t.Fatalf("comment anchor lost the aid: kind=%q aid=%q selector=%q", a.Kind, a.AID, a.Selector)
+	}
+}
+
+func TestReplaceElementAcceptsSelfClosingForeignRoot(t *testing.T) {
+	for _, replacement := range []string{`<svg/>`, `<svg />`} {
+		t.Run(replacement, func(t *testing.T) {
+			store := memory.New()
+			locker := sluglock.NewMemory()
+			comments := service.NewCommentService(store, locker)
+			docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+			ctx := context.Background()
+
+			if _, err := docs.Publish(ctx, service.PublishInput{
+				Slug: "svgroot", HTML: "<html><body><section>old</section><aside>after</aside></body></html>",
+			}); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			oldAID := firstAID(t, docs, "svgroot", 1)
+			if _, err := docs.ReplaceElement(ctx, "svgroot", 1, oldAID, replacement); err != nil {
+				t.Fatalf("replace %q: %v", replacement, err)
+			}
+
+			view, err := docs.GetElement(ctx, "svgroot", 2, oldAID)
+			if err != nil || view == nil || view.Tag != "svg" || view.HTML != `<svg data-odoc-aid="`+oldAID+`"/>` {
+				t.Fatalf("GetElement v2 = view=%v err=%v", view, err)
+			}
+			v2, err := docs.Render(ctx, "svgroot", 2)
+			if err != nil || v2 == nil || !strings.Contains(v2.HTML, view.HTML+`<aside`) {
+				t.Fatalf("render v2 = data=%v err=%v", v2, err)
+			}
+
+			if _, err := docs.ReplaceElement(ctx, "svgroot", 2, oldAID, `<svg width="9"/>`); err != nil {
+				t.Fatalf("second replace: %v", err)
+			}
+			view, err = docs.GetElement(ctx, "svgroot", 3, oldAID)
+			if err != nil || view == nil || view.HTML != `<svg width="9" data-odoc-aid="`+oldAID+`"/>` {
+				t.Fatalf("GetElement v3 = view=%v err=%v", view, err)
+			}
+
+			v3, err := docs.Render(ctx, "svgroot", 3)
+			if err != nil || v3 == nil {
+				t.Fatalf("render v3: data=%v err=%v", v3, err)
+			}
+			if _, err := docs.Publish(ctx, service.PublishInput{Slug: "svgroot", HTML: v3.HTML}); err != nil {
+				t.Fatalf("plain restamp publish: %v", err)
+			}
+			v4, err := docs.Render(ctx, "svgroot", 4)
+			if err != nil || v4 == nil || !strings.Contains(v4.HTML, `<svg width="9" data-odoc-aid="`) || !strings.Contains(v4.HTML, `"/><aside`) {
+				t.Fatalf("render v4 = data=%v err=%v", v4, err)
+			}
+		})
+	}
+}
+
+// firstAID renders slug@version and returns the first stamped data-odoc-aid.
+func firstAID(t *testing.T, docs *service.DocService, slug string, version int) string {
+	t.Helper()
+	rd, err := docs.Render(context.Background(), slug, version)
+	if err != nil || rd == nil {
+		t.Fatalf("render %s v%d: data=%v err=%v", slug, version, rd, err)
+	}
+	const marker = `data-odoc-aid="`
+	start := strings.Index(rd.HTML, marker)
+	if start < 0 {
+		t.Fatalf("%s v%d has no aid: %q", slug, version, rd.HTML)
+	}
+	start += len(marker)
+	end := strings.Index(rd.HTML[start:], `"`)
+	if end < 0 {
+		t.Fatalf("%s v%d malformed aid", slug, version)
+	}
+	return rd.HTML[start : start+end]
+}
+
+// Honest contract continuity: on a SUPPORTED (naturally harvestable) root the
+// pinned aid survives a GetElement, a SECOND ReplaceElement, AND a later plain
+// Publish. We use a stampable <figure> root; because the stamper re-harvests it
+// on every plain re-stamp, no persistent marker is needed and the anchored
+// comment stays element-anchored through v4.
+func TestSupportedRootStaysAddressableAcrossPlainRestamp(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+	ctx := context.Background()
+
+	if _, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "keepfig", HTML: "<html><body><section><p>old</p></section></body></html>",
+	}); err != nil {
+		t.Fatalf("publish v1: %v", err)
+	}
+	oldAID := firstAID(t, docs, "keepfig", 1)
+
+	if res, err := comments.Create(ctx, "keepfig", &core.Author{Login: "u"}, "note",
+		&core.Anchor{Kind: "element", AID: oldAID}, 1); err != nil || res.Status != 200 {
+		t.Fatalf("create comment: status=%d err=%v", res.Status, err)
+	}
+
+	// v2: replace the <section> with a stampable <figure> root; the backend pins
+	// oldAID onto it (no marker needed — figure is re-harvested on every re-stamp).
+	if _, err := docs.ReplaceElement(ctx, "keepfig", 1, oldAID, "<figure>brand new</figure>"); err != nil {
+		t.Fatalf("replace to figure (v2): %v", err)
+	}
+	view, err := docs.GetElement(ctx, "keepfig", 2, oldAID)
+	if err != nil || view == nil || view.Tag != "figure" || !strings.Contains(view.HTML, "brand new") {
+		t.Fatalf("GetElement v2 = view=%v err=%v; want the pinned figure", view, err)
+	}
+
+	// Second ReplaceElement by the SAME old aid must edit the figure and carry the
+	// aid forward (v3).
+	if _, err := docs.ReplaceElement(ctx, "keepfig", 2, oldAID, "<figure>edited twice</figure>"); err != nil {
+		t.Fatalf("second replace (v3): %v", err)
+	}
+	v3, err := docs.Render(ctx, "keepfig", 3)
+	if err != nil || v3 == nil {
+		t.Fatalf("render v3: data=%v err=%v", v3, err)
+	}
+	if !strings.Contains(v3.HTML, "edited twice") || strings.Contains(v3.HTML, "brand new") {
+		t.Fatalf("second replace edited the wrong element: %q", v3.HTML)
+	}
+	if !strings.Contains(v3.HTML, `data-odoc-aid="`+oldAID+`"`) {
+		t.Fatalf("v3 dropped the preserved aid %q: %q", oldAID, v3.HTML)
+	}
+
+	// A subsequent PLAIN publish (v4) re-stamps the whole doc via StampAids. The
+	// figure is stampable, so it is re-harvested and content-addressed: its aid may
+	// change (content differs), but the anchored comment REBINDS to it by fingerprint
+	// (tag + nearest heading) rather than going lost — the honest continuity
+	// guarantee for a supported root.
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "keepfig", HTML: v3.HTML}); err != nil {
+		t.Fatalf("plain publish v4: %v", err)
+	}
+	figAIDv4 := firstAID(t, docs, "keepfig", 4)
+	if view, err := docs.GetElement(ctx, "keepfig", 4, figAIDv4); err != nil || view == nil || view.Tag != "figure" {
+		t.Fatalf("GetElement v4 = view=%v err=%v; want the figure still addressable", view, err)
+	}
+
+	snaps, err := comments.List(ctx, "keepfig", 4)
+	if err != nil {
+		t.Fatalf("list comments v4: %v", err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("comment count = %d; want 1", len(snaps))
+	}
+	a := snaps[0].Anchor
+	if a == nil || a.Kind != "element" {
+		t.Fatalf("comment anchor = %+v; want element-anchored (rebound, not lost) at v4", a)
+	}
+	// Rebound to the figure's current aid at v4 (the only figure in the doc).
+	got := a.AID
+	if got == "" && a.Selector != "" {
+		got = a.Selector
+	}
+	if !strings.Contains(got, figAIDv4) {
+		t.Fatalf("comment did not rebind to the figure at v4: kind=%q aid=%q selector=%q want %q",
+			a.Kind, a.AID, a.Selector, figAIDv4)
+	}
+}
+
+// Fix 3 (service): ReplaceElement must NOT reject a fragment merely because the
+// literal string "data-odoc-*" appears in a text node or an attribute VALUE; only
+// a real data-odoc-* attribute NAME is stamper-owned. A nested opt-in on a bare
+// root is still rejected (Fix 2, root-scope).
+func TestReplaceElementDataOdocLiteralInValueOrTextAccepted(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+	ctx := context.Background()
+
+	if _, err := docs.Publish(ctx, service.PublishInput{
+		Slug: "odoclit", HTML: "<html><body><section><p>old</p></section></body></html>",
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	oldAID := firstAID(t, docs, "odoclit", 1)
+
+	// Supported root; "data-odoc-*" appears ONLY in a title value and in text.
+	ok := `<section title="data-odoc-aid=fake"><p>see data-odoc-artifact text</p></section>`
+	if _, err := docs.ReplaceElement(ctx, "odoclit", 1, oldAID, ok); err != nil {
+		t.Fatalf("replace with data-odoc literal in value/text: unexpected err %v", err)
+	}
+
+	// A nested class opt-in does NOT make a bare <div> root harvestable (root-scope).
+	aid2 := firstAID(t, docs, "odoclit", 2)
+	nestedOptIn := `<div><span class="odoc-artifact">nested</span></div>`
+	if _, err := docs.ReplaceElement(ctx, "odoclit", 2, aid2, nestedOptIn); err == nil {
+		t.Fatal("nested opt-in on bare root: want validation error, got nil")
 	}
 }

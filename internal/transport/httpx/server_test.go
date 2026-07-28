@@ -138,8 +138,11 @@ func TestPublishResponseIncludesRegistrationState(t *testing.T) {
 	if envelope.Data["doc_id"] != "" || envelope.Data["share_url"] != "" {
 		t.Fatalf("unregistered identifiers must be empty: %#v", envelope.Data)
 	}
-	if envelope.Data["url"] != "" || envelope.Data["render_url"] != "/d/contract/v/1" {
-		t.Fatalf("unregistered response must expose only render_url: %#v", envelope.Data)
+	if envelope.Data["url"] != "" {
+		t.Fatalf("unregistered response must not expose a url: %#v", envelope.Data)
+	}
+	if _, ok := envelope.Data["render_url"]; ok {
+		t.Fatalf("render_url must not be present in the publish response: %#v", envelope.Data)
 	}
 }
 
@@ -678,5 +681,114 @@ func TestInvalidSlugRejected(t *testing.T) {
 	rec := do(t, h, http.MethodGet, "/v1/comments?slug=../etc", nil, "")
 	if rec.Code != 400 {
 		t.Fatalf("bad slug = %d; want 400", rec.Code)
+	}
+}
+
+// Finding 1: on a draft-only doc (zero PUBLISHED versions) a comment created
+// with version="latest" must resolve to a CONCRETE version 1 — never the latest
+// sentinel (core.VersionLatest / math.MaxInt) — so the event folds correctly and
+// stays draft-overlay (version 0) compatible. The same doc must accept a
+// re-anchor and a reaction at "latest", and the persisted text/anchor/reaction
+// must fold back at version 1.
+func TestDraftOnlyLatestResolvesToConcreteVersion(t *testing.T) {
+	h := newTestServer(t, nil)
+	// Draft-first requires the IsOwner (superAdmin) identity; no publish happens,
+	// so ListVersions returns zero versions for this slug.
+	auth := adminHdr()
+	if rec := do(t, h, http.MethodPut, "/v1/docs/draftonly/draft", auth,
+		`{"html":"<html><body><section><p>draft body</p></section></body></html>"}`); rec.Code != http.StatusOK {
+		t.Fatalf("draft save = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Create at "latest" with an element anchor. Zero published versions ⇒ must
+	// resolve to concrete v1, not math.MaxInt.
+	rec := do(t, h, http.MethodPost, "/v1/comments", auth,
+		`{"slug":"draftonly","text":"draft note","version":"latest","anchor":{"kind":"element","aid":"a0"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create at latest (draft-only) = %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID      string `json:"id"`
+			Version int    `json:"version"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v (%s)", err, rec.Body.String())
+	}
+	if created.Data.ID == "" {
+		t.Fatalf("no comment id: %s", rec.Body.String())
+	}
+	if created.Data.Version != 1 {
+		t.Fatalf("created version = %d; want concrete 1 (not the latest sentinel)", created.Data.Version)
+	}
+
+	// Re-anchor (PATCH) at "latest" — also draft-only, must resolve to v1.
+	rec = do(t, h, http.MethodPatch, "/v1/comments", auth,
+		`{"slug":"draftonly","id":"`+created.Data.ID+`","anchor":{"kind":"element","aid":"a1"},"version":"latest"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reanchor at latest (draft-only) = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// React at "latest" — same path.
+	rec = do(t, h, http.MethodPost, "/v1/reactions", auth,
+		`{"slug":"draftonly","comment_id":"`+created.Data.ID+`","emoji":"👍","version":"latest"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("react at latest (draft-only) = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Fold at the concrete version 1: the persisted text, the re-anchored aid, and
+	// the reaction must all be present — proving nothing landed on math.MaxInt.
+	list := do(t, h, http.MethodGet, "/v1/comments?slug=draftonly&version=1", adminHdrNoCT(), "").Body.String()
+	var folded struct {
+		Data []struct {
+			Text      string              `json:"text"`
+			Version   int                 `json:"version"`
+			Anchor    map[string]any      `json:"anchor"`
+			Reactions map[string][]string `json:"reactions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(list), &folded); err != nil {
+		t.Fatalf("decode fold v1: %v (%s)", err, list)
+	}
+	if len(folded.Data) != 1 {
+		t.Fatalf("fold count = %d; want 1: %s", len(folded.Data), list)
+	}
+	c := folded.Data[0]
+	if c.Text != "draft note" {
+		t.Errorf("folded text = %q; want draft note", c.Text)
+	}
+	if c.Version != 1 {
+		t.Errorf("folded version = %d; want 1", c.Version)
+	}
+	if c.Anchor["kind"] != "element" || c.Anchor["aid"] != "a1" {
+		t.Errorf("folded anchor = %#v; want the re-anchored element aid a1", c.Anchor)
+	}
+	if len(c.Reactions["👍"]) == 0 {
+		t.Errorf("folded reaction missing: %#v", c.Reactions)
+	}
+}
+
+// Finding 1 defense-in-depth: a numeric version equal to the latest sentinel
+// (core.VersionLatest / math.MaxInt) supplied directly, quoted, or v-prefixed
+// must be REJECTED at decode — only the literal string "latest" reaches the
+// sentinel — so it can never be persisted as a comment's at_version.
+func TestSentinelNumericVersionRejected(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	if rec := do(t, h, http.MethodPost, "/v1/docs", auth,
+		`{"slug":"sentinel","html":"<html><body><p>v1</p></body></html>"}`); rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+	const maxInt = "9223372036854775807" // math.MaxInt on the 64-bit test platform
+	for _, payload := range []string{
+		`{"slug":"sentinel","text":"x","version":` + maxInt + `}`,
+		`{"slug":"sentinel","text":"x","version":"` + maxInt + `"}`,
+		`{"slug":"sentinel","text":"x","version":"v` + maxInt + `"}`,
+	} {
+		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("sentinel numeric version %q = %d; want 400", payload, rec.Code)
+		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"unicode/utf16"
 )
 
@@ -21,18 +22,48 @@ var stampableTags = []string{
 	"section", "aside", "blockquote", "table", "details",
 }
 
+// isStampableTag reports whether tag is in the stampable set (tag is already
+// lowercased). Gates a replacement root to elements the stamper harvests.
+func isStampableTag(tag string) bool {
+	for _, t := range stampableTags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// isForeignRootTag reports whether tag is a foreign (SVG/MathML) root, for which
+// a trailing slash IS a genuine self-close (unlike HTML non-void tags), AND which
+// establishes a foreign-content subtree: every descendant is likewise foreign, so
+// a trailing slash self-closes there too. Only svg is currently stampable; math
+// is listed so an added stampable <math> root reconstructs correctly. tag is
+// already lowercased.
+func isForeignRootTag(tag string) bool {
+	return tag == "svg" || tag == "math"
+}
+
 var rawTextTags = []string{"script", "style", "textarea", "title"}
 
 var intrinsicAttrs = []string{"viewBox", "src", "alt", "aria-label", "title"}
 
 type stampElement struct {
-	openStart    int
-	openEnd      int
-	closeEnd     int
-	tag          string
-	attrs        string
-	innerHTML    string
-	isVoid       bool
+	openStart int
+	openEnd   int
+	closeEnd  int
+	// tag is the lowercased canonical name used for matching/index logic; origTag
+	// is the ORIGINAL open-tag name bytes, preserved for reconstruction so a
+	// case-sensitive foreign name (<linearGradient>) is emitted verbatim.
+	tag       string
+	origTag   string
+	attrs     string
+	innerHTML string
+	isVoid    bool
+	// inForeign is true when this element sits inside an SVG/MathML foreign-content
+	// subtree (or IS a foreign root). In foreign content a trailing slash is a
+	// genuine self-close on ANY element, so reconstruction keeps the slash terminal
+	// and inserts the aid before it. HTML (non-foreign) elements never do this.
+	inForeign    bool
 	cleanedAttrs string
 	aid          string
 }
@@ -41,6 +72,25 @@ type heading struct {
 	end  int
 	text string
 }
+
+type contentNamespace uint8
+
+const (
+	namespaceHTML contentNamespace = iota
+	namespaceSVG
+	namespaceMathML
+)
+
+type parsedOpenTag struct {
+	start, openEnd       int
+	closeStart, closeEnd int
+	tag, origTag         string
+	attrs                string
+	namespace            contentNamespace
+}
+
+var scanOpenTagsCalls atomic.Int64
+var scanOpenTagsStackOps atomic.Int64
 
 // StampResult is the stamped HTML plus the artifact index.
 type StampResult struct {
@@ -68,23 +118,44 @@ var (
 	htmlCommentRe   = regexp.MustCompile(`(?s)<!--.*?-->`)
 	whitespaceRunRe = regexp.MustCompile(wsClass + `+`)
 	tagStripRe      = regexp.MustCompile(`<[^>]+>`)
-	selfCloseEndRe  = regexp.MustCompile(`/` + wsClass + `*$`)
-	voidTagRe       = regexp.MustCompile(`(?i)^(img|iframe)$`)
+	// voidTagRe classifies TRUE HTML void elements only. iframe is NOT void: it
+	// is a normal element that may hold fallback content, so its boundary runs
+	// through the real </iframe> close (removed from the void set on purpose).
+	voidTagRe = regexp.MustCompile(`(?i)^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$`)
 	// rawAnyRe matches a raw-text open tag at ANY nesting depth (not just top
 	// level); used to reject injected <script>/<style>/... inside a fragment.
 	rawAnyRe = regexp.MustCompile(`(?i)<(` + strings.Join(rawTextTags, "|") + `)\b`)
-	// eventAttrRe matches an inline event handler attribute (on...=), e.g.
-	// onerror=, onclick=, onload=. wsClass allows JS whitespace around the '='.
-	eventAttrRe = regexp.MustCompile(`(?i)` + wsClass + `on[a-z]+` + wsClass + `*=`)
 	// jsURLRe matches a javascript: URL scheme anywhere in the fragment.
 	jsURLRe = regexp.MustCompile(`(?i)javascript:`)
-	// dataOdocAnyRe matches any data-odoc-* attribute; hand-written replacements
-	// must not carry stamper-owned attributes (would make DOM selectors ambiguous).
-	dataOdocAnyRe   = regexp.MustCompile(`(?i)data-odoc-[^` + jsSpace + `"'=<>/]*` + wsClass + `*=`)
-	optInArtifactRe = regexp.MustCompile(`(?i)\bdata-odoc-artifact\b`)
-	optInClassRe    = regexp.MustCompile(`(?i)class` + wsClass + `*=` + wsClass + `*"[^"]*\bodoc-artifact\b[^"]*"`)
-	probeTagRe      = regexp.MustCompile(`(?i)<([a-z][\w-]*)\b`)
+	// probeTagRe finds a candidate open-tag name; the trailing \b is deliberately
+	// loose (it treats ':' and other non-name chars as a boundary), so callers
+	// must go through probeOpenTagName, which re-validates that the name ends at an
+	// HTML-appropriate boundary (ASCII whitespace, '/', '>', or end of string).
+	probeTagRe = regexp.MustCompile(`(?i)<([a-z][\w-]*)`)
 )
+
+// probeOpenTagName reports whether s begins (at offset 0) with an HTML open tag
+// and, if so, returns the [nameStart, nameEnd) byte range of its tag name. HTML
+// tag-name tokenization: a leading ASCII letter, then name chars, and the name
+// must TERMINATE at an HTML-appropriate boundary — ASCII whitespace, '/', '>',
+// or end of string. A ':' or other non-boundary char right after the name (as in
+// <section:x>) means this is NOT a plain <section> open tag, so ok is false and
+// no phantom stamp/AID is minted. Hyphenated custom names (<my-element>) and
+// mixed case (<Section>) still parse. This tightens probeTagRe's loose \b.
+func probeOpenTagName(s string) (nameStart, nameEnd int, ok bool) {
+	loc := probeTagRe.FindStringSubmatchIndex(s)
+	if loc == nil || loc[0] != 0 {
+		return 0, 0, false
+	}
+	nameEnd = loc[3]
+	if nameEnd < len(s) {
+		c := s[nameEnd]
+		if !isASCIISpace(c) && c != '/' && c != '>' {
+			return 0, 0, false
+		}
+	}
+	return loc[2], nameEnd, true
+}
 
 // isJSSpace reports whether r is whitespace per JavaScript's String.prototype
 // .trim() (same set as jsSpace). It intentionally differs from unicode.IsSpace,
@@ -121,6 +192,24 @@ func aidFor(tag, innerHTML, openAttrs string) string {
 	return Cyrb53(tag+"|"+intrinsics+"|"+norm, 0)
 }
 
+// saltAwayFromPinned returns the content hash for the element, re-seeding Cyrb53
+// (deterministic increasing salt) only when it would collide with an active
+// pinnedAID so the immovable pinned identity wins and the collider moves.
+// pinnedAID=="" disables salting: non-colliding hashes stay byte-identical, so
+// identical artifacts share one aid. Salted output is still base36 (\w-safe).
+func saltAwayFromPinned(tag, innerHTML, openAttrs, pinnedAID string) string {
+	aid := aidFor(tag, innerHTML, openAttrs)
+	if pinnedAID == "" || aid != pinnedAID {
+		return aid
+	}
+	base := tag + "|" + openAttrs + "|" + innerHTML
+	for seed := uint32(1); ; seed++ {
+		if salted := Cyrb53(base, seed); salted != pinnedAID {
+			return salted
+		}
+	}
+}
+
 // attrAwareOpenTagEnd returns the index just past the > that closes the open tag
 // starting at lt, treating > inside quoted attribute values as ordinary text.
 // Returns -1 if unterminated.
@@ -144,17 +233,375 @@ func attrAwareOpenTagEnd(html string, lt int) int {
 	return -1
 }
 
-// skipRawTextBodyAt returns the index just past a raw-text element's closing tag.
-func skipRawTextBodyAt(html, openTag, attrs string, openEnd int) int {
-	if selfCloseEndRe.MatchString(attrs) {
-		return openEnd
+// terminalSelfCloseSlash returns the index of a genuine terminal self-closing
+// marker in attrs, or -1. A slash consumed by a quoted or unquoted value is data.
+func terminalSelfCloseSlash(attrs string) int {
+	const (
+		beforeAttr = iota
+		attrName
+		afterAttrName
+		beforeValue
+		quotedValue
+		unquotedValue
+		afterQuotedValue
+	)
+	state := beforeAttr
+	var quote byte
+	terminal := func(i int) bool { return i == len(attrs)-1 }
+	for i := 0; i < len(attrs); i++ {
+		ch := attrs[i]
+		switch state {
+		case beforeAttr:
+			switch {
+			case isASCIISpace(ch):
+			case ch == '/' && terminal(i):
+				return i
+			default:
+				state = attrName
+			}
+		case attrName:
+			switch {
+			case isASCIISpace(ch):
+				state = afterAttrName
+			case ch == '=':
+				state = beforeValue
+			case ch == '/' && terminal(i):
+				return i
+			}
+		case afterAttrName:
+			switch {
+			case isASCIISpace(ch):
+			case ch == '=':
+				state = beforeValue
+			case ch == '/' && terminal(i):
+				return i
+			default:
+				state = attrName
+			}
+		case beforeValue:
+			switch {
+			case isASCIISpace(ch):
+			case ch == '"' || ch == '\'':
+				quote = ch
+				state = quotedValue
+			default:
+				state = unquotedValue
+			}
+		case quotedValue:
+			if ch == quote {
+				state = afterQuotedValue
+			}
+		case unquotedValue:
+			if isASCIISpace(ch) {
+				state = beforeAttr
+			}
+		case afterQuotedValue:
+			switch {
+			case isASCIISpace(ch):
+				state = beforeAttr
+			case ch == '/' && terminal(i):
+				return i
+			default:
+				state = attrName
+			}
+		}
 	}
-	re := regexp.MustCompile(`(?i)</` + regexp.QuoteMeta(openTag) + `\s*>`)
-	loc := re.FindStringIndex(html[openEnd:])
-	if loc == nil {
-		return len(html)
+	return -1
+}
+
+func stripTerminalSelfClose(attrs string) string {
+	if slash := terminalSelfCloseSlash(attrs); slash >= 0 {
+		for slash > 0 && isASCIISpace(attrs[slash-1]) {
+			slash--
+		}
+		return attrs[:slash]
 	}
-	return openEnd + loc[1]
+	return attrs
+}
+
+func trimTrailingASCIISpace(s string) string {
+	for len(s) > 0 && isASCIISpace(s[len(s)-1]) {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// rootOpenTagAttrs returns the attribute slice of the fragment's single root open
+// tag: everything after the tag name up to (but excluding) the closing '>' or a
+// self-closing '/'. Quote-aware so a '>' inside a quoted value doesn't truncate
+// it. ok is false if there is no well-formed root open tag. It never inspects
+// child tags, text nodes, or attribute values as structure.
+func rootOpenTagAttrs(fragment string) (attrs string, ok bool) {
+	trimmed := trimJSSpace(fragment)
+	lt := strings.IndexByte(trimmed, '<')
+	if lt < 0 {
+		return "", false
+	}
+	_, ne, ok := probeOpenTagName(trimmed[lt:])
+	if !ok {
+		return "", false
+	}
+	openEnd := attrAwareOpenTagEnd(trimmed, lt)
+	if openEnd < 0 {
+		return "", false
+	}
+	// lt+ne is just past the tag name; openEnd-1 is the '>'. Trim a trailing
+	// self-closing slash so it is not read as an attribute-name char.
+	inner := trimmed[lt+ne : openEnd-1]
+	if i := terminalSelfCloseSlash(inner); i >= 0 {
+		inner = inner[:i]
+	}
+	return inner, true
+}
+
+// forEachAttrName walks an open-tag attribute slice quote-aware and calls fn with
+// each attribute NAME (lowercased). Values are skipped: a name is the run of
+// name chars starting after whitespace; an optional =value (quoted or bare) that
+// follows is consumed but never treated as a name. This is how we inspect real
+// attribute names without matching literal strings inside values.
+func forEachAttrName(attrs string, fn func(name string)) {
+	i := 0
+	n := len(attrs)
+	for i < n {
+		// Skip separators between attributes.
+		for i < n && (isASCIISpace(attrs[i]) || attrs[i] == '/') {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		// Read the attribute name (up to space, '=', '/', or end).
+		start := i
+		for i < n && !isASCIISpace(attrs[i]) && attrs[i] != '=' && attrs[i] != '/' {
+			i++
+		}
+		name := attrs[start:i]
+		if name != "" {
+			fn(strings.ToLower(name))
+		}
+		// Skip optional = and its value so value bytes are never read as names.
+		for i < n && isASCIISpace(attrs[i]) {
+			i++
+		}
+		if i < n && attrs[i] == '=' {
+			i++
+			for i < n && isASCIISpace(attrs[i]) {
+				i++
+			}
+			if i < n && (attrs[i] == '"' || attrs[i] == '\'') {
+				q := attrs[i]
+				i++
+				for i < n && attrs[i] != q {
+					i++
+				}
+				if i < n {
+					i++ // closing quote
+				}
+			} else {
+				for i < n && !isASCIISpace(attrs[i]) {
+					i++
+				}
+			}
+		}
+	}
+}
+
+func hasEventHandlerAttr(s string) bool {
+	for _, open := range scanOpenTags(s) {
+		found := false
+		forEachAttrName(open.attrs, func(name string) {
+			if len(name) <= 2 || name[0] != 'o' || name[1] != 'n' {
+				return
+			}
+			for i := 2; i < len(name); i++ {
+				if name[i] < 'a' || name[i] > 'z' {
+					return
+				}
+			}
+			found = true
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// isASCIISpace reports whether b is an HTML whitespace byte.
+func isASCIISpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f'
+}
+
+// isDataOdocName reports whether an attribute name is a real data-odoc-* name:
+// the literal prefix "data-odoc-" (case-insensitive) followed by zero or more
+// name chars. This covers the valueless form (data-odoc-artifact), mixed case,
+// suffixes (data-odoc-aid2), and underscores (data-odoc-_private). "data-odoc"
+// with no trailing hyphen (e.g. data-odoc / data-odocx) is NOT matched.
+func isDataOdocName(name string) bool {
+	return strings.HasPrefix(name, "data-odoc-")
+}
+
+// rootHasClassToken reports whether the fragment's single root open tag carries a
+// class attribute whose space-separated token set contains token. Only the ROOT
+// open tag is inspected (quote-aware), so a nested child's class never opts in.
+func rootHasClassToken(fragment, token string) bool {
+	attrs, ok := rootOpenTagAttrs(fragment)
+	if !ok {
+		return false
+	}
+	return classTokenMatch(attrs, token)
+}
+
+// classTokenMatch reports whether attrs contains a class="..." whose token list
+// includes token. attrs is a single open-tag attribute slice.
+func classTokenMatch(attrs, token string) bool {
+	found := false
+	// Re-scan quote-aware for a class value; forEachAttrName skips values, so pull
+	// the class value directly.
+	i := 0
+	n := len(attrs)
+	for i < n {
+		for i < n && (isASCIISpace(attrs[i]) || attrs[i] == '/') {
+			i++
+		}
+		start := i
+		for i < n && !isASCIISpace(attrs[i]) && attrs[i] != '=' && attrs[i] != '/' {
+			i++
+		}
+		name := strings.ToLower(attrs[start:i])
+		for i < n && isASCIISpace(attrs[i]) {
+			i++
+		}
+		var val string
+		if i < n && attrs[i] == '=' {
+			i++
+			for i < n && isASCIISpace(attrs[i]) {
+				i++
+			}
+			if i < n && (attrs[i] == '"' || attrs[i] == '\'') {
+				q := attrs[i]
+				i++
+				vs := i
+				for i < n && attrs[i] != q {
+					i++
+				}
+				val = attrs[vs:i]
+				if i < n {
+					i++
+				}
+			} else {
+				vs := i
+				for i < n && !isASCIISpace(attrs[i]) {
+					i++
+				}
+				val = attrs[vs:i]
+			}
+		}
+		if name == "class" {
+			for _, t := range strings.Fields(val) {
+				if t == token {
+					found = true
+				}
+			}
+		}
+	}
+	return found
+}
+
+func attrValue(attrs, target string) (string, bool) {
+	i := 0
+	for i < len(attrs) {
+		for i < len(attrs) && (isASCIISpace(attrs[i]) || attrs[i] == '/') {
+			i++
+		}
+		start := i
+		for i < len(attrs) && !isASCIISpace(attrs[i]) && attrs[i] != '=' && attrs[i] != '/' {
+			i++
+		}
+		name := strings.ToLower(attrs[start:i])
+		for i < len(attrs) && isASCIISpace(attrs[i]) {
+			i++
+		}
+		value := ""
+		if i < len(attrs) && attrs[i] == '=' {
+			i++
+			for i < len(attrs) && isASCIISpace(attrs[i]) {
+				i++
+			}
+			if i < len(attrs) && (attrs[i] == '"' || attrs[i] == '\'') {
+				quote := attrs[i]
+				i++
+				valueStart := i
+				for i < len(attrs) && attrs[i] != quote {
+					i++
+				}
+				value = attrs[valueStart:i]
+				if i < len(attrs) {
+					i++
+				}
+			} else {
+				valueStart := i
+				for i < len(attrs) && !isASCIISpace(attrs[i]) {
+					i++
+				}
+				value = attrs[valueStart:i]
+			}
+		}
+		if name == target {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+// isRawTextTag reports whether tag (lowercased) is a raw-text/RCDATA element
+// whose body must not be scanned for markup.
+func isRawTextTag(tag string) bool {
+	for _, rt := range rawTextTags {
+		if tag == rt {
+			return true
+		}
+	}
+	return false
+}
+
+// rawTextCloseEnd returns the index in html just past a raw-text/RCDATA close
+// tag for openTag at or after `from`, or -1 if none. Browser-aligned close
+// recognition: `</tag` must be followed by an ASCII whitespace, '/', or '>'
+// (so `</script>`, `</script >`, `</script/>`, `</script x>` all close), but
+// `</scriptx>` is NOT a close. The returned end is just past the '>' that
+// terminates the close tag (its attribute-like tail is consumed like the
+// browser's end-tag token). Quote-unaware by design: an end tag has no quoted
+// values in the tokenizer's RAWTEXT close path.
+func rawTextCloseBoundary(html, openTag string, from int) (int, int) {
+	lowerTag := strings.ToLower(openTag)
+	tagLen := len(lowerTag)
+	for i := from; i < len(html); i++ {
+		if html[i] != '<' || i+1 >= len(html) || html[i+1] != '/' {
+			continue
+		}
+		nameStart := i + 2
+		nameEnd := nameStart + tagLen
+		if nameEnd > len(html) || strings.ToLower(html[nameStart:nameEnd]) != lowerTag {
+			continue
+		}
+		// The char after the tag name must end the name: whitespace, '/', or '>'.
+		// Anything else (e.g. 'x' in </scriptx>) is not this close tag.
+		if nameEnd == len(html) {
+			continue // "</script" with no terminator: not a complete close
+		}
+		c := html[nameEnd]
+		if !isASCIISpace(c) && c != '/' && c != '>' {
+			continue
+		}
+		// Consume the end tag's tail up to and including the next '>'.
+		gt := strings.IndexByte(html[nameEnd:], '>')
+		if gt < 0 {
+			return i, len(html)
+		}
+		return i, nameEnd + gt + 1
+	}
+	return -1, -1
 }
 
 // collectHeadings finds <hN> headings with their end offsets. The TS original
@@ -205,171 +652,178 @@ func indexFoldClose(s, prefix string) int {
 	return strings.Index(lower, strings.ToLower(prefix))
 }
 
-// findCloseEnd finds the closing-tag end offset for a non-void element.
-func findCloseEnd(html, tag string, openEnd int) int {
-	closeRe := regexp.MustCompile(`(?i)</` + regexp.QuoteMeta(tag) + `\s*>`)
-	openRe := regexp.MustCompile(`(?i)<` + regexp.QuoteMeta(tag) + `\b`)
-	rawRe := regexp.MustCompile(`(?i)<(` + strings.Join(rawTextTags, "|") + `)\b`)
-	depth := 1
-	scan := openEnd
-	for scan < len(html) {
-		close := relMatch(closeRe, html, scan)
-		open := relMatch(openRe, html, scan)
-		raw := relMatch(rawRe, html, scan)
-		next, kind := earliest(close, open, raw)
-		if next == nil {
-			break
-		}
-		switch kind {
-		case "raw":
-			rEnd := attrAwareOpenTagEnd(html, next[0])
-			if rEnd < 0 {
-				return openEnd
-			}
-			rawTag := strings.ToLower(html[next[2]:next[3]])
-			scan = skipRawTextBodyAt(html, rawTag, html[next[0]:rEnd], rEnd)
-		case "close":
-			depth--
-			if depth == 0 {
-				return next[1]
-			}
-			scan = next[1]
-		case "open":
-			depth++
-			oEnd := attrAwareOpenTagEnd(html, next[0])
-			if oEnd < 0 {
-				scan = next[1]
-			} else {
-				scan = oEnd
-			}
-		}
+// endTagBoundary reports whether s[i:] begins a browser-aligned end tag for tag
+// (already lowercased) and, if so, returns the index just past the '>' that
+// terminates it. Browser end-tag recognition: after `</tag` the next
+// char must END the name — ASCII whitespace, '/', or '>' — so `</section>`,
+// `</section >`, `</section/>`, `</section x>` (attribute-like tail) all close, but
+// `</sectionx>` does NOT. The tail up to and including the next '>' is consumed
+// like the browser's end-tag token; an unterminated tail runs to EOF. Quote-
+// unaware by design: an end tag carries no quoted values in the tokenizer.
+func endTagBoundary(s string, i int, tag string) (end int, ok bool) {
+	if s[i] != '<' || i+1 >= len(s) || s[i+1] != '/' {
+		return 0, false
 	}
-	return openEnd
+	nameStart := i + 2
+	nameEnd := nameStart + len(tag)
+	if nameEnd > len(s) || !strings.EqualFold(s[nameStart:nameEnd], tag) {
+		return 0, false
+	}
+	if nameEnd == len(s) {
+		return 0, false // "</tag" with no terminator is not a complete close
+	}
+	c := s[nameEnd]
+	if !isASCIISpace(c) && c != '/' && c != '>' {
+		return 0, false // e.g. the 'x' in </sectionx>
+	}
+	gt := strings.IndexByte(s[nameEnd:], '>')
+	if gt < 0 {
+		return len(s), true // unterminated tail: consume the rest
+	}
+	return nameEnd + gt + 1, true
 }
 
-// relMatch runs re against html[from:] and returns absolute submatch indices
-// ([start,end, group1start,group1end...]) or nil.
-func relMatch(re *regexp.Regexp, html string, from int) []int {
-	loc := re.FindStringSubmatchIndex(html[from:])
-	if loc == nil {
-		return nil
+func endTagName(s string, i int) (string, bool) {
+	if i+2 >= len(s) || s[i] != '<' || s[i+1] != '/' {
+		return "", false
 	}
-	out := make([]int, len(loc))
-	for i, v := range loc {
-		if v < 0 {
-			out[i] = v
-		} else {
-			out[i] = v + from
-		}
+	nameStart := i + 2
+	if !isASCIILetter(s[nameStart]) {
+		return "", false
 	}
-	return out
+	nameEnd := nameStart + 1
+	for nameEnd < len(s) && isTagNameByte(s[nameEnd]) {
+		nameEnd++
+	}
+	if nameEnd == len(s) {
+		return "", false
+	}
+	c := s[nameEnd]
+	if !isASCIISpace(c) && c != '/' && c != '>' {
+		return "", false
+	}
+	return strings.ToLower(s[nameStart:nameEnd]), true
 }
 
-// earliest returns the match with the smallest start index and its kind.
-func earliest(close, open, raw []int) ([]int, string) {
-	var best []int
-	var kind string
-	consider := func(m []int, k string) {
-		if m == nil {
-			return
-		}
-		if best == nil || m[0] < best[0] {
-			best, kind = m, k
-		}
-	}
-	// Order matters only for ties; TS sorts by index with stable order
-	// close,open,raw — but ties at the same index can't happen for distinct
-	// patterns starting with '<' + different next char, so any order is fine.
-	consider(close, "close")
-	consider(open, "open")
-	consider(raw, "raw")
-	return best, kind
+func isASCIILetter(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
-func harvest(html string, openStart, openEnd int, tag, attrs string, seen map[int]bool, elements *[]stampElement) {
+func isTagNameByte(c byte) bool {
+	return isASCIILetter(c) || c >= '0' && c <= '9' || c == '_' || c == '-'
+}
+
+// findCloseEnd finds the matching close tag for a non-void element opened at
+// openEnd and returns (closeStart, closeEnd): the '<' of the close tag and the
+// index just past its '>'. It is context-aware exactly like forEachOpenTag —
+// comments and raw-text/RCDATA bodies are skipped as text so a same-name open or
+// close that appears only inside `<!-- ... -->` or a script/style/textarea/title
+// body never affects nesting — and it counts nested same-name elements to find
+// the matching close. Close recognition is browser-aligned (endTagBoundary), so
+// `</tag/>`, `</tag x>`, and mixed case/whitespace tails all close. Returns
+// (openEnd, openEnd) when no matching close is found so callers treat innerHTML
+// as empty and the outer boundary as the open tag alone.
+func findCloseEndIn(opens []parsedOpenTag, tag string, openEnd int) (closeStart, closeEnd int) {
+	for _, open := range opens {
+		if open.openEnd == openEnd && open.tag == tag {
+			return open.closeStart, open.closeEnd
+		}
+	}
+	return openEnd, openEnd
+}
+
+func findCloseEnd(html, tag string, openEnd int) (closeStart, closeEnd int) {
+	return findCloseEndIn(scanOpenTags(html), tag, openEnd)
+}
+
+func harvest(html string, open parsedOpenTag, seen map[int]bool, elements *[]stampElement) {
+	openStart := open.start
 	if seen[openStart] {
 		return
 	}
-	isVoid := voidTagRe.MatchString(tag) || selfCloseEndRe.MatchString(attrs)
-	closeEnd := openEnd
+	// Only TRUE HTML void elements are void for boundary purposes. A trailing
+	// slash on a non-void HTML tag (<section/>) is NOT a self-close: the browser
+	// keeps the element open and swallows following siblings, so the boundary must
+	// run through the element's real close tag. This mirrors SingleTopLevelTag,
+	// which also classifies voidness by tag name alone. Inside foreign content
+	// (SVG/MathML) a trailing slash IS a self-close, but that is handled by
+	// findCloseEnd returning no close (closeEnd==openEnd) plus inForeign at
+	// reconstruction — we do NOT mark it isVoid (it is not an HTML void element).
+	inForeign := open.namespace != namespaceHTML
+	isVoid := !inForeign && voidTagRe.MatchString(open.tag)
+	closeEnd := open.openEnd
 	innerHTML := ""
-	if !isVoid {
-		closeEnd = findCloseEnd(html, tag, openEnd)
-		end := closeEnd - len("</"+tag+">")
-		if end >= openEnd && end <= len(html) {
-			innerHTML = html[openEnd:end]
+	foreignSelfClose := inForeign && terminalSelfCloseSlash(open.attrs) >= 0
+	if !isVoid && !foreignSelfClose {
+		// findCloseEnd returns the close tag's actual '<' (closeStart) and its end.
+		// innerHTML is [openEnd, closeStart): computing it from closeStart (never by
+		// subtracting len("</"+tag+">")) stays correct for browser-aligned close tails
+		// like </section/>, </section x>, and mixed case/whitespace forms.
+		closeEnd = open.closeEnd
+		if open.closeStart >= open.openEnd && open.closeStart <= len(html) {
+			innerHTML = html[open.openEnd:open.closeStart]
 		}
 	}
 	seen[openStart] = true
 	*elements = append(*elements, stampElement{
-		openStart: openStart, openEnd: openEnd, closeEnd: closeEnd,
-		tag: tag, attrs: attrs, innerHTML: innerHTML, isVoid: isVoid,
+		openStart: openStart, openEnd: open.openEnd, closeEnd: closeEnd,
+		tag: open.tag, origTag: open.origTag, inForeign: inForeign,
+		attrs: open.attrs, innerHTML: innerHTML, isVoid: isVoid,
 	})
 }
 
 // harvestAt force-harvests the element whose open tag begins at start, whatever
-// its tag. StampAidsPinned uses it so a safe but non-stampable replacement root
-// (div/p/...) is still indexed and can carry the pinned aid. No-op if start is
-// out of range, not a '<', or the open tag is unterminated.
-func harvestAt(html string, start int, seen map[int]bool, elements *[]stampElement) {
-	if start < 0 || start >= len(html) || html[start] != '<' {
-		return
-	}
-	loc := probeTagRe.FindStringSubmatchIndex(html[start:])
-	if loc == nil || loc[0] != 0 {
-		return
-	}
-	tag := strings.ToLower(html[start+loc[2] : start+loc[3]])
-	end := attrAwareOpenTagEnd(html, start)
-	if end < 0 {
-		return
-	}
-	attrs := html[start+1+len(tag) : end-1]
-	harvest(html, start, end, tag, attrs, seen, elements)
-}
-
-func harvestStampableTags(html string, seen map[int]bool, elements *[]stampElement) {
-	for _, tag := range stampableTags {
-		openRe := regexp.MustCompile(`(?i)<` + regexp.QuoteMeta(tag) + `\b`)
-		idx := 0
-		for {
-			loc := openRe.FindStringIndex(html[idx:])
-			if loc == nil {
-				break
-			}
-			start := idx + loc[0]
-			end := attrAwareOpenTagEnd(html, start)
-			if end < 0 {
-				idx = start + 1
-				continue
-			}
-			attrs := html[start+1+len(tag) : end-1]
-			harvest(html, start, end, tag, attrs, seen, elements)
-			idx = start + 1
+// its tag. StampAidsPinned uses it so the pinned replacement root is indexed at a
+// known offset even before the tag/opt-in harvesters reach it. No-op if start is
+// out of range, not a '<', or the open tag is unterminated. inForeign is derived
+// from foreignContextAt so a pinned foreign root/descendant reconstructs with a
+// genuine self-close.
+func harvestAt(html string, opens []parsedOpenTag, start int, seen map[int]bool, elements *[]stampElement) {
+	for _, open := range opens {
+		if open.start == start {
+			harvest(html, open, seen, elements)
+			return
 		}
 	}
 }
 
-func harvestOptInMarkers(html string, seen map[int]bool, elements *[]stampElement) {
-	idx := 0
-	for {
-		loc := probeTagRe.FindStringSubmatchIndex(html[idx:])
-		if loc == nil {
-			break
+// harvestStampableTags harvests every stampable-tag element via the shared
+// structural walker, so comment and raw-text/RCDATA context is honored: a
+// <section>/<img>/... that appears only inside a comment or a script/style/
+// textarea/title body (or after a malformed terminator) is text, not an element,
+// and is neither indexed nor mutated. Retains document offsets, tag, and attrs.
+func harvestStampableTags(html string, opens []parsedOpenTag, seen map[int]bool, elements *[]stampElement) {
+	for _, open := range opens {
+		if isStampableTag(open.tag) {
+			harvest(html, open, seen, elements)
 		}
-		start := idx + loc[0]
-		tag := strings.ToLower(html[idx+loc[2] : idx+loc[3]])
-		end := attrAwareOpenTagEnd(html, start)
-		if end < 0 {
-			idx = start + 1
-			continue
-		}
-		attrs := html[start+1+len(tag) : end-1]
-		if optInArtifactRe.MatchString(attrs) || optInClassRe.MatchString(attrs) {
-			harvest(html, start, end, tag, attrs, seen, elements)
-		}
-		idx = start + 1
 	}
+}
+
+func harvestOptInMarkers(html string, opens []parsedOpenTag, seen map[int]bool, elements *[]stampElement) {
+	for _, open := range opens {
+		if hasOptInMarker(open.attrs) {
+			harvest(html, open, seen, elements)
+		}
+	}
+}
+
+// hasOptInMarker reports whether an open tag's attribute slice carries a valid
+// opt-in marker: the valueless data-odoc-artifact attribute OR a class token
+// "odoc-artifact". Both are inspected quote-aware on real attribute names/values,
+// so persistent harvesting matches what IsHarvestableReplacementRoot accepts at
+// pin time across every quote style (double, single, unquoted).
+func hasOptInMarker(attrs string) bool {
+	if classTokenMatch(attrs, "odoc-artifact") {
+		return true
+	}
+	found := false
+	forEachAttrName(attrs, func(name string) {
+		if name == "data-odoc-artifact" {
+			found = true
+		}
+	})
+	return found
 }
 
 // aidValueRe extracts the value of a data-odoc-aid attribute from an open tag's
@@ -387,10 +841,16 @@ func ElementByAID(html, aid string) (outer, tag string, ok bool) {
 	if aid == "" {
 		return "", "", false
 	}
+	opens := scanOpenTags(html)
 	seen := map[int]bool{}
 	var harvested []stampElement
-	harvestStampableTags(html, seen, &harvested)
-	harvestOptInMarkers(html, seen, &harvested)
+	harvestStampableTags(html, opens, seen, &harvested)
+	harvestOptInMarkers(html, opens, seen, &harvested)
+	// Document order: match the FIRST element carrying aid, as the browser's
+	// querySelector would, so server lookup and the DOM agree on the target.
+	sort.SliceStable(harvested, func(i, j int) bool {
+		return harvested[i].openStart < harvested[j].openStart
+	})
 	for _, e := range harvested {
 		m := aidValueRe.FindStringSubmatch(e.attrs)
 		if m != nil && m[1] == aid {
@@ -417,10 +877,16 @@ func ReplaceElementByAID(html, aid, replacement string) (result string, ok bool)
 // StampAidsPinned so stamping pins exactly that root — not every previously-
 // stamped element — to the injected aid. boundary is -1 when ok is false.
 func ReplaceElementByAIDAt(html, aid, replacement string) (result string, boundary int, ok bool) {
+	opens := scanOpenTags(html)
 	seen := map[int]bool{}
 	var harvested []stampElement
-	harvestStampableTags(html, seen, &harvested)
-	harvestOptInMarkers(html, seen, &harvested)
+	harvestStampableTags(html, opens, seen, &harvested)
+	harvestOptInMarkers(html, opens, seen, &harvested)
+	// Document order: replace the FIRST element carrying aid, matching the browser
+	// (and ElementByAID) so server-side replace and the DOM target the same node.
+	sort.SliceStable(harvested, func(i, j int) bool {
+		return harvested[i].openStart < harvested[j].openStart
+	})
 	for _, e := range harvested {
 		m := aidValueRe.FindStringSubmatch(e.attrs)
 		if m != nil && m[1] == aid {
@@ -440,11 +906,11 @@ func SingleTopLevelTag(s string) (tag string, ok bool) {
 	if trimmed == "" || trimmed[0] != '<' {
 		return "", false
 	}
-	loc := probeTagRe.FindStringSubmatchIndex(trimmed)
-	if loc == nil || loc[0] != 0 {
+	ns, ne, ok := probeOpenTagName(trimmed)
+	if !ok {
 		return "", false
 	}
-	tag = strings.ToLower(trimmed[loc[2]:loc[3]])
+	tag = strings.ToLower(trimmed[ns:ne])
 	// Reject raw-text/script-like tags outright: they must never be injected via
 	// an aid replace (script injection / boundary confusion).
 	for _, rt := range rawTextTags {
@@ -452,7 +918,7 @@ func SingleTopLevelTag(s string) (tag string, ok bool) {
 			return "", false
 		}
 	}
-	openEnd := attrAwareOpenTagEnd(trimmed, loc[0])
+	openEnd := attrAwareOpenTagEnd(trimmed, 0)
 	if openEnd < 0 {
 		return "", false
 	}
@@ -464,8 +930,12 @@ func SingleTopLevelTag(s string) (tag string, ok bool) {
 		// Exactly one void element and nothing after it.
 		return tag, trimJSSpace(trimmed[openEnd:]) == ""
 	}
-	closeEnd := findCloseEnd(trimmed, tag, openEnd)
-	if closeEnd <= openEnd {
+	attrs := trimmed[ne : openEnd-1]
+	if isForeignRootTag(tag) && terminalSelfCloseSlash(attrs) >= 0 {
+		return tag, trimJSSpace(trimmed[openEnd:]) == ""
+	}
+	closeStart, closeEnd := findCloseEnd(trimmed, tag, openEnd)
+	if closeEnd <= openEnd || closeStart < openEnd {
 		return "", false
 	}
 	// Nothing but whitespace may follow the single element's close tag.
@@ -486,17 +956,259 @@ func SafeReplacementFragment(s string) (tag string, ok bool) {
 	// 1) raw-text tags (script/style/textarea/title) at any depth.
 	// 2) inline event handlers (on...=).
 	// 3) javascript: URLs.
-	if rawAnyRe.MatchString(s) || eventAttrRe.MatchString(s) || jsURLRe.MatchString(s) {
+	if rawAnyRe.MatchString(s) || hasEventHandlerAttr(s) || jsURLRe.MatchString(s) {
 		return "", false
 	}
 	return tag, true
 }
 
-// HasDataOdocAttr reports whether s carries any data-odoc-* attribute. Callers
-// reject hand-written replacements that carry stamper-owned attributes, which
-// would create ambiguous DOM selectors after Publish re-stamps.
+// HasDataOdocAttr reports whether s carries any real data-odoc-* attribute on an
+// HTML open tag. It inspects actual open-tag attribute NAMES (quote-aware),
+// never raw text or attribute values: a text node or a value that merely
+// contains the literal string "data-odoc-..." is NOT a match, while the valueless
+// form (data-odoc-artifact), mixed case, suffixes (data-odoc-aid2), and
+// underscores (data-odoc-_private) all are. Callers reject hand-written
+// replacements that carry stamper-owned attributes (ambiguous DOM selectors after
+// a re-stamp).
 func HasDataOdocAttr(s string) bool {
-	return dataOdocAnyRe.MatchString(s)
+	found := false
+	forEachOpenTag(s, func(_, _ int, _, _ string, _ bool, attrs string) {
+		forEachAttrName(attrs, func(name string) {
+			if isDataOdocName(name) {
+				found = true
+			}
+		})
+	})
+	return found
+}
+
+// commentEnd returns the index just past an HTML comment that opens at lt (where
+// s[lt]=='<'), or -1 if s[lt:] does not open a comment. Browser-aligned enough
+// for the malformed terminators real documents hit: after "<!--" the tokenizer's
+// comment-start / comment-start-dash states treat "<!-->" and "<!--->" as ABRUPT
+// closings (empty comment) rather than requiring a full "-->"; otherwise the
+// comment content runs to the first valid terminator — either "-->" (comment-end
+// state) or "--!>" (comment-end-bang state) — choosing whichever appears EARLIER,
+// or EOF if neither is present. Recognizing "--!>" keeps a following real tag
+// visible instead of being swallowed by an over-scanned comment.
+func commentEnd(s string, lt int) int {
+	n := len(s)
+	if lt+3 >= n || s[lt+1] != '!' || s[lt+2] != '-' || s[lt+3] != '-' {
+		return -1
+	}
+	p := lt + 4
+	// Abrupt closings: "<!-->" (comment-start '>') and "<!--->" (comment-start-dash
+	// '>') produce an empty comment that ends right there.
+	if p < n && s[p] == '>' {
+		return p + 1
+	}
+	if p+1 < n && s[p] == '-' && s[p+1] == '>' {
+		return p + 2
+	}
+	// Normal content: end at the EARLIEST valid terminator, "-->" or "--!>". Both
+	// close the comment; the browser reaches whichever comes first in the source, so
+	// a comment written with "--!>" does not over-scan past a following real element.
+	// Unterminated ⇒ consume the rest.
+	dash := strings.Index(s[p:], "-->")
+	bang := strings.Index(s[p:], "--!>")
+	switch {
+	case dash < 0 && bang < 0:
+		return n
+	case bang < 0 || (dash >= 0 && dash <= bang):
+		return p + dash + len("-->")
+	default:
+		return p + bang + len("--!>")
+	}
+}
+
+// namespaceForChild applies the foreign-content integration-point rules.
+func namespaceForChild(parent parsedOpenTag, childTag string) contentNamespace {
+	base := parent.namespace
+	switch parent.namespace {
+	case namespaceSVG:
+		if parent.tag == "foreignobject" || parent.tag == "desc" || parent.tag == "title" {
+			base = namespaceHTML
+		}
+	case namespaceMathML:
+		switch parent.tag {
+		case "mi", "mo", "mn", "ms", "mtext":
+			if childTag != "mglyph" && childTag != "malignmark" {
+				base = namespaceHTML
+			}
+		case "annotation-xml":
+			if childTag == "svg" {
+				return namespaceSVG
+			}
+			if encoding, ok := attrValue(parent.attrs, "encoding"); ok {
+				encoding = strings.ToLower(strings.TrimSpace(encoding))
+				if encoding == "text/html" || encoding == "application/xhtml+xml" {
+					base = namespaceHTML
+				}
+			}
+		}
+	}
+	if base == namespaceHTML {
+		switch childTag {
+		case "svg":
+			return namespaceSVG
+		case "math":
+			return namespaceMathML
+		}
+	}
+	return base
+}
+
+func scanOpenTags(s string) []parsedOpenTag {
+	scanOpenTagsCalls.Add(1)
+	var opens []parsedOpenTag
+	var stack []int
+	var stackTagPrev []int
+	stackTopByTag := make(map[string]int)
+	var stackOps int64
+	defer func() { scanOpenTagsStackOps.Add(stackOps) }()
+	popStack := func(newLen int) {
+		for len(stack) > newLen {
+			pos := len(stack) - 1
+			idx := stack[pos]
+			stackTopByTag[opens[idx].tag] = stackTagPrev[pos]
+			stack = stack[:pos]
+			stackTagPrev = stackTagPrev[:pos]
+			stackOps++
+		}
+	}
+	for i := 0; i < len(s); {
+		lt := strings.IndexByte(s[i:], '<')
+		if lt < 0 {
+			break
+		}
+		lt += i
+		if ce := commentEnd(s, lt); ce >= 0 {
+			i = ce
+			continue
+		}
+		if lt+1 < len(s) && s[lt+1] == '/' {
+			if len(stack) > 0 {
+				pos := len(stack) - 1
+				idx := stack[pos]
+				if closeEnd, ok := endTagBoundary(s, lt, opens[idx].tag); ok {
+					opens[idx].closeStart = lt
+					opens[idx].closeEnd = closeEnd
+					popStack(pos)
+					i = closeEnd
+					continue
+				}
+			}
+			closeTag, ok := endTagName(s, lt)
+			if !ok {
+				i = lt + 1
+				continue
+			}
+			pos, active := stackTopByTag[closeTag]
+			if !active || pos < 0 {
+				i = lt + 1
+				continue
+			}
+			closeEnd, ok := endTagBoundary(s, lt, closeTag)
+			if !ok {
+				i = lt + 1
+				continue
+			}
+			idx := stack[pos]
+			opens[idx].closeStart = lt
+			opens[idx].closeEnd = closeEnd
+			popStack(pos)
+			i = closeEnd
+			continue
+		}
+		if lt+1 < len(s) && (s[lt+1] == '!' || s[lt+1] == '?') {
+			i = lt + 1
+			continue
+		}
+		_, ne, ok := probeOpenTagName(s[lt:])
+		if !ok {
+			i = lt + 1
+			continue
+		}
+		openEnd := attrAwareOpenTagEnd(s, lt)
+		if openEnd < 0 {
+			break
+		}
+		origTag := s[lt+1 : lt+ne]
+		tag := strings.ToLower(origTag)
+		attrs := s[lt+ne : openEnd-1]
+		ns := namespaceHTML
+		if len(stack) > 0 {
+			ns = namespaceForChild(opens[stack[len(stack)-1]], tag)
+		} else if tag == "svg" {
+			ns = namespaceSVG
+		} else if tag == "math" {
+			ns = namespaceMathML
+		}
+		opens = append(opens, parsedOpenTag{
+			start: lt, openEnd: openEnd, closeStart: openEnd, closeEnd: openEnd,
+			tag: tag, origTag: origTag, attrs: attrs, namespace: ns,
+		})
+		idx := len(opens) - 1
+		selfClosed := ns != namespaceHTML && terminalSelfCloseSlash(attrs) >= 0
+		if !selfClosed && (ns != namespaceHTML || !voidTagRe.MatchString(tag)) {
+			previous, ok := stackTopByTag[tag]
+			if !ok {
+				previous = -1
+			}
+			stack = append(stack, idx)
+			stackTagPrev = append(stackTagPrev, previous)
+			stackTopByTag[tag] = len(stack) - 1
+			stackOps++
+		}
+		if ns == namespaceHTML && isRawTextTag(tag) {
+			closeStart, closeEnd := rawTextCloseBoundary(s, tag, openEnd)
+			if closeEnd < 0 {
+				closeEnd = len(s)
+			} else {
+				opens[idx].closeStart = closeStart
+				opens[idx].closeEnd = closeEnd
+			}
+			if len(stack) > 0 && stack[len(stack)-1] == idx {
+				popStack(len(stack) - 1)
+			}
+			i = closeEnd
+			continue
+		}
+		i = openEnd
+	}
+	return opens
+}
+
+// forEachOpenTag walks real open tags with namespace-aware foreign tracking.
+func forEachOpenTag(s string, fn func(start, openEnd int, tag, origTag string, inForeign bool, attrs string)) {
+	for _, open := range scanOpenTags(s) {
+		fn(open.start, open.openEnd, open.tag, open.origTag, open.namespace != namespaceHTML, open.attrs)
+	}
+}
+
+// IsHarvestableReplacementRoot reports whether the root element of fragment is
+// one the stamper actually harvests, so a pinned aid on it survives every later
+// plain re-stamp. True only when the SINGLE ROOT open tag is a stampable tag OR
+// carries the caller-writable opt-in (class token "odoc-artifact") ON THE ROOT
+// ITSELF. The opt-in is checked quote-aware on the root open tag only: a nested
+// child carrying class="odoc-artifact" (or the token buried in a text node or
+// another attribute's value) does NOT opt the root in. A bare non-addressable
+// root (div/p/... with no root opt-in) is NOT harvestable: pinning it would work
+// once but the aid would vanish on the next publish, silently losing an anchored
+// comment, so callers reject it with a 400. fragment must already be
+// SafeReplacementFragment-valid.
+func IsHarvestableReplacementRoot(fragment string) bool {
+	tag, ok := SingleTopLevelTag(fragment)
+	if !ok {
+		return false
+	}
+	if isStampableTag(tag) {
+		return true
+	}
+	// Only the class opt-in is caller-writable (data-odoc-artifact is rejected by
+	// HasDataOdocAttr) and only when it sits on the ROOT open tag, matching what
+	// harvestOptInMarkers re-harvests on every re-stamp.
+	return rootHasClassToken(fragment, "odoc-artifact")
 }
 
 // InjectRootAID stamps data-odoc-aid="aid" onto the root open tag of fragment.
@@ -518,20 +1230,28 @@ func InjectRootAID(fragment, aid string) string {
 // element is stamped. Returns (fragment, -1) if it has no well-formed open tag.
 func InjectRootAIDAt(fragment, aid string) (out string, localRootOffset int) {
 	lt := strings.IndexByte(fragment, '<')
-	if aid == "" || lt < 0 {
-		return fragment, lt
+	// Empty aid is a no-op with NO usable injection point: report -1 so a caller
+	// that adds localRootOffset to a boundary cannot accidentally shift by lt.
+	if aid == "" {
+		return fragment, -1
+	}
+	if lt < 0 {
+		return fragment, -1
 	}
 	openEnd := attrAwareOpenTagEnd(fragment, lt)
 	if openEnd < 0 {
-		return fragment, lt
+		return fragment, -1
 	}
 	// openEnd is just past '>'; the tag's last char is at openEnd-1. A void tag may
 	// self-terminate ("... />"): insert the aid before that trailing slash so the
-	// tag stays well-formed.
+	// tag stays well-formed. Attribute-state parsing keeps slashes in quoted and
+	// unquoted values as data.
 	insertAt := openEnd - 1
-	if selfCloseEndRe.MatchString(fragment[lt+1 : insertAt]) {
-		if slash := strings.LastIndexByte(fragment[:insertAt], '/'); slash > lt {
-			insertAt = slash
+	_, nameEnd, ok := probeOpenTagName(fragment[lt:])
+	if ok {
+		attrsStart := lt + nameEnd
+		if slash := terminalSelfCloseSlash(fragment[attrsStart:insertAt]); slash >= 0 {
+			insertAt = attrsStart + slash
 		}
 	}
 	return fragment[:insertAt] + ` data-odoc-aid="` + aid + `"` + fragment[insertAt:], lt
@@ -554,29 +1274,28 @@ func StampAids(rawHTML string) StampResult {
 	return stampAids(rawHTML, "", -1)
 }
 
-// StampAidsPinned is StampAids with exactly ONE element pinned: the element whose
-// open tag begins at pinnedOffset keeps pinnedAID verbatim instead of getting a
-// content hash, and is force-indexed even when its tag is not normally stampable
-// (e.g. a safe <div>/<p> replacement root). Every OTHER element — including a
-// stampable ancestor of the pinned root — follows normal content-addressed
-// stamping, so an ancestor whose content changed rehashes rather than keeping a
-// stale aid.
+// StampAidsPinned is StampAids with exactly ONE element pinned: the element at
+// pinnedOffset keeps pinnedAID verbatim; every other element is content-addressed
+// as usual (so a stampable ancestor whose content changed rehashes, not keeping a
+// stale aid). An ordinary hash that collides with the pin is salted away (pinned
+// identity wins); non-colliding hashes are unchanged.
 //
-// The element/replace path uses this: after validation the backend injects the
-// target's OLD aid onto the replacement root (InjectRootAID) at a known offset,
-// so the swapped element keeps its identity and any comment anchored to it
-// survives reconciliation even when the replacement's tag or content changed.
-// pinnedOffset < 0 (or an offset that resolves to no element) degrades to plain
-// StampAids.
+// Used by element/replace: the backend injects the target's OLD aid onto the
+// replacement root at a known offset so the swapped element keeps its identity
+// and its anchored comment survives reconciliation. The caller restricts the root
+// to a harvestable element (IsHarvestableReplacementRoot) so the pin still
+// resolves on later plain re-stamps. An invalid/missing offset degrades to plain
+// StampAids (no pin, no salting).
 func StampAidsPinned(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 	return stampAids(rawHTML, pinnedAID, pinnedOffset)
 }
 
 // stampAids implements StampAids / StampAidsPinned. When pinnedOffset >= 0 the
-// element whose open tag starts there is force-harvested (even if non-stampable)
-// and keeps pinnedAID instead of a content hash.
+// element whose open tag starts there is force-harvested and keeps pinnedAID
+// instead of a content hash.
 func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 	headings := collectHeadings(rawHTML)
+	opens := scanOpenTags(rawHTML)
 	nearestHeadingAt := func(idx int) *string {
 		var best *string
 		for i := range headings {
@@ -592,14 +1311,36 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 
 	seen := map[int]bool{}
 	var harvested []stampElement
-	// Force-harvest the pinned root FIRST so seen[] blocks a duplicate if its tag
-	// also happens to be stampable; this guarantees the pinned root is indexed even
-	// when its tag (div/p/...) is not in stampableTags.
+	// Force-harvest the pinned root FIRST so seen[] blocks a duplicate if the tag
+	// harvesters also reach it; this fixes the pinned root at its known offset.
 	if pinnedOffset >= 0 && pinnedAID != "" {
-		harvestAt(rawHTML, pinnedOffset, seen, &harvested)
+		harvestAt(rawHTML, opens, pinnedOffset, seen, &harvested)
 	}
-	harvestStampableTags(rawHTML, seen, &harvested)
-	harvestOptInMarkers(rawHTML, seen, &harvested)
+	harvestStampableTags(rawHTML, opens, seen, &harvested)
+	harvestOptInMarkers(rawHTML, opens, seen, &harvested)
+	// Iterate/index in DOCUMENT ORDER (ascending openStart). Harvesting groups by
+	// tag, but the browser resolves [data-odoc-aid="x"] to the FIRST such element in
+	// document order; ordering here keeps the aid index and ElementByAID consistent
+	// with what the browser picks.
+	sort.SliceStable(harvested, func(i, j int) bool {
+		return harvested[i].openStart < harvested[j].openStart
+	})
+
+	// The pin is ACTIVE only when pinnedAID is set AND some harvested element sits
+	// at pinnedOffset. An invalid/missing offset (< 0, or one that resolves to no
+	// element) must degrade to plain StampAids: no element keeps pinnedAID, so there
+	// is no immovable identity to protect and we must NOT salt ordinary colliders
+	// (that would perturb content hashes for no reason). effectivePinned is "" in
+	// that case, disabling saltAwayFromPinned entirely.
+	effectivePinned := ""
+	if pinnedAID != "" {
+		for _, e := range harvested {
+			if e.openStart == pinnedOffset {
+				effectivePinned = pinnedAID
+				break
+			}
+		}
+	}
 
 	aids := []StampedArtifact{}
 	elements := make([]stampElement, 0, len(harvested))
@@ -607,10 +1348,13 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 		cleanedAttrs := dataOdocAidRe.ReplaceAllString(e.attrs, "")
 		cleanedInner := dataOdocAidRe2.ReplaceAllString(e.innerHTML, "")
 		var aid string
-		if pinnedAID != "" && e.openStart == pinnedOffset {
-			aid = pinnedAID // pin exactly the replacement root
+		if effectivePinned != "" && e.openStart == pinnedOffset {
+			aid = pinnedAID // pin exactly the replacement root; its identity never moves
 		} else {
-			aid = aidFor(e.tag, cleanedInner, cleanedAttrs)
+			// Ordinary content-addressed hash. Salted away ONLY when an active pin's aid
+			// collides; otherwise byte-identical to before, so two genuinely identical
+			// artifacts still share one aid (content-addressing).
+			aid = saltAwayFromPinned(e.tag, cleanedInner, cleanedAttrs, effectivePinned)
 		}
 		aids = append(aids, StampedArtifact{
 			AID:     aid,
@@ -623,27 +1367,43 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 		elements = append(elements, e)
 	}
 
-	// Apply stamps in reverse offset order so earlier offsets stay valid.
-	sort.SliceStable(elements, func(i, j int) bool {
-		return elements[i].openStart > elements[j].openStart
-	})
-	out := rawHTML
+	var out strings.Builder
+	out.Grow(len(rawHTML) + len(elements)*32)
+	cursor := 0
 	for _, e := range elements {
+		out.WriteString(rawHTML[cursor:e.openStart])
+		// name is the ORIGINAL open-tag name bytes: emitting origTag (not the
+		// lowercased e.tag) preserves case-sensitive foreign names such as
+		// <linearGradient>. Matching/index logic keeps using e.tag (lowercase).
+		name := e.origTag
 		var stampedOpen string
 		if e.isVoid {
 			// Strip any trailing self-close slash from cleanedAttrs so we don't emit a
 			// stray '/' before data-odoc-aid, then re-add exactly one closing slash for
 			// a self-terminated void tag: <img ... data-odoc-aid="x"/>.
-			attrs := selfCloseEndRe.ReplaceAllString(e.cleanedAttrs, "")
+			attrs := trimTrailingASCIISpace(dataOdocAidRe.ReplaceAllString(stripTerminalSelfClose(e.attrs), ""))
 			selfClose := ""
-			if selfCloseEndRe.MatchString(e.attrs) {
+			if terminalSelfCloseSlash(e.attrs) >= 0 {
 				selfClose = "/"
 			}
-			stampedOpen = "<" + e.tag + attrs + ` data-odoc-aid="` + e.aid + `"` + selfClose + ">"
+			stampedOpen = "<" + name + attrs + ` data-odoc-aid="` + e.aid + `"` + selfClose + ">"
+		} else if e.inForeign && e.closeEnd == e.openEnd && terminalSelfCloseSlash(e.attrs) >= 0 {
+			// Genuinely self-closing foreign element: it sits in SVG/MathML foreign
+			// content (inForeign) with no real close tag (closeEnd == openEnd, empty
+			// inner) and a terminal unquoted slash. This covers foreign roots (<svg/>),
+			// nested foreign roots (inner <svg/> in <svg><svg/></svg>), and opt-in
+			// descendants (<path class="odoc-artifact"/>). The aid goes BEFORE the slash
+			// so self-closing semantics survive: <path ... data-odoc-aid="x"/>. HTML
+			// non-void <section/> never reaches here — not in foreign content and it
+			// spans to a real close (closeEnd > openEnd) — so it stays non-self-closing.
+			attrs := trimTrailingASCIISpace(dataOdocAidRe.ReplaceAllString(stripTerminalSelfClose(e.attrs), ""))
+			stampedOpen = "<" + name + attrs + ` data-odoc-aid="` + e.aid + `"/>`
 		} else {
-			stampedOpen = "<" + e.tag + e.cleanedAttrs + ` data-odoc-aid="` + e.aid + `">`
+			stampedOpen = "<" + name + trimTrailingASCIISpace(e.cleanedAttrs) + ` data-odoc-aid="` + e.aid + `">`
 		}
-		out = out[:e.openStart] + stampedOpen + out[e.openEnd:]
+		out.WriteString(stampedOpen)
+		cursor = e.openEnd
 	}
-	return StampResult{HTML: out, AIDs: aids}
+	out.WriteString(rawHTML[cursor:])
+	return StampResult{HTML: out.String(), AIDs: aids}
 }

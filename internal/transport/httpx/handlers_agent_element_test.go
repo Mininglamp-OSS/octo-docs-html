@@ -165,6 +165,8 @@ func TestAgentElementReplaceRejectsOutOfBounds(t *testing.T) {
 		{"multi_element", `<section></section><section></section>`},
 		{"script_fragment", `<script>alert(1)</script>`},
 		{"plain_text", `just text`},
+		{"bare_div_root", `<div>not addressable</div>`},
+		{"bare_p_root", `<p>not addressable</p>`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -217,6 +219,41 @@ func TestAgentElementReplaceRejectsInjection(t *testing.T) {
 	rec := do(t, h, http.MethodGet, "/v1/docs/elinj/versions", auth, "")
 	if strings.Contains(rec.Body.String(), `"n":2`) {
 		t.Errorf("injection replace leaked a new version: %s", rec.Body.String())
+	}
+}
+
+// Fix 3 at the API boundary: the literal string "data-odoc-*" inside a TEXT node
+// or an attribute VALUE must NOT be mistaken for a stamper-owned attribute. Such
+// a replacement (with a supported root) is accepted; a REAL data-odoc-* attribute
+// name is still rejected.
+func TestAgentElementReplaceDataOdocOnlyInValueOrTextAccepted(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	aid := publishAndFirstAID(t, h, auth,
+		"elodoc", `<html><body><section><p>x</p></section></body></html>`)
+
+	// Literal only in a text node and in a title value — not real attributes.
+	ok := `<section title="data-odoc-aid=fake"><p>mentions data-odoc-artifact in text</p></section>`
+	rec := do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
+		`{"slug":"elodoc","aid":"`+aid+`","new_html":`+jsonString(ok)+`}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("literal-in-value/text replace = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	// A REAL data-odoc-* attribute name is still rejected.
+	v2 := do(t, h, http.MethodGet, "/d/elodoc/v/2", auth, "").Body.String()
+	const marker = `data-odoc-aid="`
+	i := strings.Index(v2, marker)
+	if i < 0 {
+		t.Fatalf("no stamped aid in v2: %s", v2)
+	}
+	rest := v2[i+len(marker):]
+	aid2 := rest[:strings.IndexByte(rest, '"')]
+	bad := `<section data-odoc-aid="forged"><p>y</p></section>`
+	rec = do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
+		`{"slug":"elodoc","aid":"`+aid2+`","new_html":`+jsonString(bad)+`}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("real data-odoc attr replace = %d; want 400: %s", rec.Code, rec.Body.String())
 	}
 }
 

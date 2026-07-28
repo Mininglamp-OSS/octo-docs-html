@@ -19,6 +19,11 @@ type mutationLike service.MutationResult
 
 type mutationVersion int
 
+// mutationVersionSentinel is core.VersionLatest as a mutationVersion. It is the
+// ONLY value meaning "latest", reachable ONLY via the literal string "latest";
+// resolveMutationVersion turns it into a concrete version before storage.
+const mutationVersionSentinel = mutationVersion(core.VersionLatest)
+
 func (v *mutationVersion) UnmarshalJSON(data []byte) error {
 	raw := strings.TrimSpace(string(data))
 	if raw == "null" {
@@ -32,24 +37,35 @@ func (v *mutationVersion) UnmarshalJSON(data []byte) error {
 		}
 		switch text {
 		case "latest":
-			*v = mutationVersion(core.VersionLatest)
+			*v = mutationVersionSentinel
 			return nil
 		default:
 			text = strings.TrimPrefix(text, "v")
-			n, err := strconv.Atoi(text)
-			if err != nil || n < 0 {
-				return strconv.ErrSyntax
+			n, err := parseConcreteVersion(text)
+			if err != nil {
+				return err
 			}
 			*v = mutationVersion(n)
 			return nil
 		}
 	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 {
-		return strconv.ErrSyntax
+	n, err := parseConcreteVersion(raw)
+	if err != nil {
+		return err
 	}
 	*v = mutationVersion(n)
 	return nil
+}
+
+// parseConcreteVersion parses a non-negative decimal version that is NOT the
+// latest sentinel. A numeric input equal to core.VersionLatest (bare, quoted, or
+// v-prefixed) is rejected so only the literal "latest" can reach the sentinel.
+func parseConcreteVersion(text string) (int, error) {
+	n, err := strconv.Atoi(text)
+	if err != nil || n < 0 || n == core.VersionLatest {
+		return 0, strconv.ErrSyntax
+	}
+	return n, nil
 }
 
 func decodeCommentMutation(w http.ResponseWriter, r *http.Request, body any) error {
@@ -68,8 +84,13 @@ func decodeCommentMutation(w http.ResponseWriter, r *http.Request, body any) err
 	return nil
 }
 
+// resolveMutationVersion turns the request's version selector into a CONCRETE
+// version to stamp on the mutation; it never returns the latest sentinel
+// (folding at MaxInt would misorder events and break draft-overlay v0). For
+// "latest" it picks the newest published version, or concrete v1 when nothing is
+// published yet (draft-only) — the same floor v0/omitted/null resolve to.
 func (s *Server) resolveMutationVersion(r *http.Request, slug string, version mutationVersion) (int, error) {
-	if version == mutationVersion(core.VersionLatest) {
+	if version == mutationVersionSentinel {
 		versions, err := s.docs.ListVersions(r.Context(), slug)
 		if err != nil {
 			return 0, err
@@ -77,6 +98,8 @@ func (s *Server) resolveMutationVersion(r *http.Request, slug string, version mu
 		if versions != nil && len(versions.Versions) > 0 {
 			return versions.Versions[len(versions.Versions)-1].N, nil
 		}
+		// Zero published versions (draft-only): concrete floor, never the sentinel.
+		return 1, nil
 	}
 	if version <= 0 {
 		return 1, nil

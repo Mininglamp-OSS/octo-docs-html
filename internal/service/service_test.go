@@ -190,9 +190,6 @@ func TestPublishRegistersGroupMountedDoc(t *testing.T) {
 	if result.URL != result.ShareURL {
 		t.Fatalf("url = %q, share_url = %q; want canonical URLs to match", result.URL, result.ShareURL)
 	}
-	if result.RenderURL != "/d/group-doc/v/1" {
-		t.Fatalf("render_url = %q, want immutable render URL", result.RenderURL)
-	}
 
 	req := waitDocsBackendRequest(t, reqs)
 	if req.Method != http.MethodPost || req.Path != "/v1/bot/docs" {
@@ -349,8 +346,8 @@ func TestPublishSkipsRegistrationWhenNoMountType(t *testing.T) {
 	if result.Registered || result.Status != "published_unregistered" {
 		t.Fatalf("result = %+v", result)
 	}
-	if result.URL != "" || result.ShareURL != "" || result.RenderURL != "/d/unmounted-doc/v/1" {
-		t.Fatalf("unregistered result exposes a non-canonical url: %+v", result)
+	if result.URL != "" || result.ShareURL != "" {
+		t.Fatalf("unregistered result exposes a url: %+v", result)
 	}
 	assertNoDocsBackendRequest(t, reqs)
 }

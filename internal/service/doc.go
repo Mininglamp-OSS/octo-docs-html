@@ -133,7 +133,6 @@ type PublishResult struct {
 	Slug           string `json:"slug"`
 	Version        int    `json:"version"`
 	URL            string `json:"url"`
-	RenderURL      string `json:"render_url"`
 	DocID          string `json:"doc_id"`
 	ShareURL       string `json:"share_url"`
 	Registered     bool   `json:"registered"`
@@ -251,7 +250,6 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 	return &PublishResult{
 		Slug:              in.Slug,
 		Version:           version,
-		RenderURL:         fmt.Sprintf("%s/d/%s/v/%d", s.baseURL, in.Slug, version),
 		Status:            publishStatusPublished,
 		Size:              size,
 		AIDs:              len(stamped.AIDs),
@@ -358,6 +356,14 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 	if core.HasDataOdocAttr(newHTML) {
 		return nil, apperr.Validation("new_html must not carry data-odoc-* attributes", "new_html_has_odoc_attr")
 	}
+	// Root must be harvestable so the pinned aid survives later plain re-stamps; a
+	// bare non-opt-in root (div/p/...) would keep the aid one version then lose it,
+	// silently dropping the anchored comment.
+	if !core.IsHarvestableReplacementRoot(newHTML) {
+		return nil, apperr.Validation(
+			"new_html root must be a stampable element or carry class \"odoc-artifact\"",
+			"new_html_root_not_addressable")
+	}
 
 	var result *PublishResult
 	err := s.lock.With(ctx, slug, func() error {
@@ -384,14 +390,11 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 			return apperr.PayloadTooLarge(fmt.Sprintf("document exceeds %d bytes", s.maxBytes), "html_too_large")
 		}
 		// Stamp here (publishLocked expects a stamped result) and publish without
-		// re-acquiring the lock — Publish would deadlock via a nested lock.With.
-		// Pin ONLY the replacement root to the injected old aid so the artifact keeps
-		// its identity and its comment anchor survives reconciliation — even when the
-		// replacement's tag/content changed, and even when the root is a safe
-		// non-stampable tag (div/p). The root '<' sits at boundary+localRoot in the
-		// result (localRoot accounts for any leading whitespace in the fragment).
-		// Every other element, including a stampable ancestor whose content shifted,
-		// still rehashes normally.
+		// re-acquiring the lock (Publish would deadlock via nested lock.With). Pin ONLY
+		// the replacement root to the injected old aid so it keeps its identity and its
+		// comment anchor survives reconciliation across the tag/content change. The root
+		// '<' sits at boundary+localRoot (localRoot accounts for leading whitespace);
+		// every other element rehashes normally.
 		stamped := core.StampAidsPinned(replaced, aid, boundary+localRoot)
 		in, ierr := s.existingPublishInput(ctx, slug, replaced, "")
 		if ierr != nil {
