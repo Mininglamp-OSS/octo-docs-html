@@ -43,6 +43,77 @@ func TestBuildVersionDiffRejectsExcessiveNormalizedLines(t *testing.T) {
 	}
 }
 
+func TestBuildVersionDiffRejectsExcessiveDepth(t *testing.T) {
+	var source strings.Builder
+	for range maxDiffDepth + 1 {
+		source.WriteString("<div>")
+	}
+	for range maxDiffDepth + 1 {
+		source.WriteString("</div>")
+	}
+	if _, err := buildVersionDiff(1, 2, source.String(), source.String()); err != errDiffLimit {
+		t.Fatalf("error = %v; want diff limit", err)
+	}
+}
+
+func TestMatchDiffNodesRejectsCumulativeComparisonBytes(t *testing.T) {
+	before := []htmlDiffNode{{tag: "main", parent: -1, children: []int{1}}}
+	before = append(before, htmlDiffNode{tag: "p", parent: 0, path: "/before", compareText: strings.Repeat("a", maxDiffCompareText)})
+	after := []htmlDiffNode{{tag: "main", parent: -1}}
+	for index := 0; index < maxDiffNodes-1; index++ {
+		after = append(after, htmlDiffNode{
+			tag:         "p",
+			parent:      0,
+			path:        "/after/" + string(rune(index+1)),
+			compareText: strings.Repeat("b", maxDiffCompareText-8) + string(rune(index+1)),
+		})
+		after[0].children = append(after[0].children, index+1)
+	}
+	if _, err := matchDiffNodes(before, after); err != errDiffLimit {
+		t.Fatalf("error = %v; want diff limit", err)
+	}
+}
+
+func TestBuildVersionDiffBoundsLargeModifiedContainerSnippet(t *testing.T) {
+	body := strings.Repeat("content", 30_000)
+	before := `<html><body><main class="before">` + body + `</main></body></html>`
+	after := `<html><body><main class="after">` + body + `</main></body></html>`
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified != 1 {
+		t.Fatalf("summary = %+v", result.Summary)
+	}
+	change := result.Changes[0]
+	if len(change.BeforeHTML) > maxDiffSnippetBytes || len(change.AfterHTML) > maxDiffSnippetBytes {
+		t.Fatalf("snippet sizes = %d, %d", len(change.BeforeHTML), len(change.AfterHTML))
+	}
+	if strings.Contains(change.BeforeHTML, body[:10_000]) || strings.Contains(change.AfterHTML, body[:10_000]) {
+		t.Fatal("large container body leaked into snippet")
+	}
+	if !strings.Contains(change.BeforeHTML, "omitted") || !strings.Contains(change.AfterHTML, "omitted") {
+		t.Fatalf("snippets = %q / %q", change.BeforeHTML, change.AfterHTML)
+	}
+}
+
+func TestBuildVersionDiffListHeadInsertionDoesNotCascade(t *testing.T) {
+	before := `<html><body><ul><li>alpha</li><li>beta</li><li>gamma</li></ul></body></html>`
+	after := `<html><body><ul><li>new</li><li>alpha</li><li>beta</li><li>gamma</li></ul></body></html>`
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Added != 1 || result.Summary.Modified != 0 || result.Summary.Removed != 0 {
+		t.Fatalf("summary = %+v; changes = %+v", result.Summary, result.Changes)
+	}
+	if len(result.Changes) != 1 || result.Changes[0].AfterHTML != "<li>new</li>" {
+		t.Fatalf("changes = %+v", result.Changes)
+	}
+}
+
 func TestReplaceElementPersistsCompatibleVersionChangeMetadata(t *testing.T) {
 	ctx := context.Background()
 	store := memory.New()
@@ -78,6 +149,85 @@ func TestReplaceElementPersistsCompatibleVersionChangeMetadata(t *testing.T) {
 	entry, ok := changes["2"].(map[string]any)
 	if !ok || entry["change_source"] != "element_replace" || entry["base_version"] != float64(1) || entry["new_version"] != float64(2) || entry["target_aid"] != aid {
 		t.Fatalf("version 2 metadata = %#v", changes["2"])
+	}
+}
+
+func TestReplaceElementPreservesConflictingOpenMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := NewCommentService(store, locker)
+	docs := NewDocService(store, store, comments, locker, "", 5<<20)
+
+	published, err := docs.Publish(ctx, PublishInput{Slug: "metadata-conflict", HTML: `<html><body><section><p>before</p></section></body></html>`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.GetMeta(ctx, "metadata-conflict")
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta.Extra = map[string]any{storage.LegacyVersionChangesExtraKey: "caller-owned"}
+	if err := store.PutMeta(ctx, meta.Slug, *meta); err != nil {
+		t.Fatal(err)
+	}
+	view, err := docs.Render(ctx, meta.Slug, published.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := docs.ReplaceElement(ctx, meta.Slug, 1, firstAID(t, view.HTML), `<section><p>after</p></section>`); err != nil {
+		t.Fatal(err)
+	}
+	meta, err = store.GetMeta(ctx, meta.Slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Extra[storage.LegacyVersionChangesExtraKey] != "caller-owned" {
+		t.Fatalf("legacy metadata overwritten: %#v", meta.Extra)
+	}
+	changes, ok := meta.Extra[storage.VersionChangesExtraKey].(map[string]any)
+	if !ok || changes["2"] == nil {
+		t.Fatalf("namespaced changes = %#v", meta.Extra[storage.VersionChangesExtraKey])
+	}
+}
+
+func TestReplaceElementMigratesCompatibleLegacyVersionChanges(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := NewCommentService(store, locker)
+	docs := NewDocService(store, store, comments, locker, "", 5<<20)
+
+	published, err := docs.Publish(ctx, PublishInput{Slug: "metadata-legacy", HTML: `<html><body><section><p>before</p></section></body></html>`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.GetMeta(ctx, "metadata-legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := map[string]any{"1": map[string]any{"change_source": "legacy"}}
+	meta.Extra = map[string]any{storage.LegacyVersionChangesExtraKey: legacy}
+	if err := store.PutMeta(ctx, meta.Slug, *meta); err != nil {
+		t.Fatal(err)
+	}
+	view, err := docs.Render(ctx, meta.Slug, published.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := docs.ReplaceElement(ctx, meta.Slug, 1, firstAID(t, view.HTML), `<section><p>after</p></section>`); err != nil {
+		t.Fatal(err)
+	}
+	meta, err = store.GetMeta(ctx, meta.Slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, ok := meta.Extra[storage.VersionChangesExtraKey].(map[string]any)
+	if !ok || changes["1"] == nil || changes["2"] == nil {
+		t.Fatalf("migrated changes = %#v", meta.Extra[storage.VersionChangesExtraKey])
+	}
+	if _, ok := meta.Extra[storage.LegacyVersionChangesExtraKey].(map[string]any); !ok {
+		t.Fatalf("legacy map not preserved: %#v", meta.Extra)
 	}
 }
 

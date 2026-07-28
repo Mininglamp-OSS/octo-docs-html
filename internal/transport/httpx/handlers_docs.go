@@ -334,10 +334,10 @@ func (s *Server) handleVersionSource(w http.ResponseWriter, r *http.Request) err
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if immutable {
 		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
-		if matchETag(r.Header.Get("If-None-Match"), etag) {
-			w.WriteHeader(http.StatusNotModified)
-			return nil
-		}
+	}
+	if matchETag(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return nil
 	}
 	_, _ = io.WriteString(w, source)
 	return nil

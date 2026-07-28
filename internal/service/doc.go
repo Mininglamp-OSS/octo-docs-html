@@ -1055,7 +1055,10 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
 	}
 	if in.ChangeSource != "" {
-		changes, _ := extra[storage.VersionChangesExtraKey].(map[string]any)
+		changes, ok := extra[storage.VersionChangesExtraKey].(map[string]any)
+		if !ok {
+			changes, _ = extra[storage.LegacyVersionChangesExtraKey].(map[string]any)
+		}
 		copyChanges := map[string]any{}
 		maps.Copy(copyChanges, changes)
 		copyChanges[strconv.Itoa(version)] = map[string]any{

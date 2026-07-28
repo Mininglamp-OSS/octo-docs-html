@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -12,13 +13,18 @@ import (
 var errDiffLimit = errors.New("diff complexity limit exceeded")
 
 const (
-	maxDiffNodes       = 4000
-	maxDiffComparisons = 200000
-	maxDiffChanges     = 1000
-	maxDiffInputLines  = 12000
-	maxDiffHunkLines   = 2000
-	maxDiffOutputBytes = 512 << 10
-	diffContextLines   = 3
+	maxDiffNodes        = 4000
+	maxDiffDepth        = 256
+	maxDiffComparisons  = 200000
+	maxDiffCompareBytes = 16 << 20
+	maxDiffCompareText  = 4096
+	maxDiffChanges      = 1000
+	maxDiffInputLines   = 12000
+	maxDiffHunkLines    = 2000
+	maxDiffSnippetBytes = 8 << 10
+	maxDiffOpeningBytes = 1024
+	maxDiffOutputBytes  = 512 << 10
+	diffContextLines    = 3
 )
 
 // VersionDiff is a bounded structural and source-level comparison of two HTML versions.
@@ -59,15 +65,17 @@ type CodeHunk struct {
 }
 
 type htmlDiffNode struct {
-	tag      string
-	aid      string
-	attrs    map[string]string
-	text     string
-	path     string
-	outer    string
-	parent   int
-	children []int
-	order    int
+	tag         string
+	aid         string
+	attrs       map[string]string
+	text        string
+	compareText string
+	signature   string
+	path        string
+	outer       string
+	parent      int
+	children    []int
+	order       int
 }
 
 type diffOpenNode struct {
@@ -99,7 +107,7 @@ func buildVersionDiff(fromVersion, toVersion int, before, after string) (*Versio
 		changes = append(changes, ElementChange{
 			Kind: "modified", BeforeAID: beforeNode.aid, AfterAID: afterNode.aid,
 			DOMPath: afterNode.path, BeforePath: beforeNode.path, AfterPath: afterNode.path,
-			BeforeHTML: beforeNode.outer, AfterHTML: afterNode.outer,
+			BeforeHTML: diffNodeSnippet(beforeNode), AfterHTML: diffNodeSnippet(afterNode),
 		})
 	}
 	for index, node := range beforeNodes {
@@ -112,7 +120,7 @@ func buildVersionDiff(fromVersion, toVersion int, before, after string) (*Versio
 					continue
 				}
 			}
-			changes = append(changes, ElementChange{Kind: "removed", BeforeAID: node.aid, DOMPath: node.path, BeforePath: node.path, BeforeHTML: node.outer})
+			changes = append(changes, ElementChange{Kind: "removed", BeforeAID: node.aid, DOMPath: node.path, BeforePath: node.path, BeforeHTML: diffNodeSnippet(node)})
 		}
 	}
 	for index, node := range afterNodes {
@@ -125,7 +133,7 @@ func buildVersionDiff(fromVersion, toVersion int, before, after string) (*Versio
 					continue
 				}
 			}
-			changes = append(changes, ElementChange{Kind: "added", AfterAID: node.aid, DOMPath: node.path, AfterPath: node.path, AfterHTML: node.outer})
+			changes = append(changes, ElementChange{Kind: "added", AfterAID: node.aid, DOMPath: node.path, AfterPath: node.path, AfterHTML: diffNodeSnippet(node)})
 		}
 	}
 	if len(changes) > maxDiffChanges {
@@ -209,6 +217,9 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			cursor = end + 1
 			continue
 		}
+		if len(nodes) >= maxDiffNodes || len(stack) >= maxDiffDepth {
+			return nil, errDiffLimit
+		}
 		parent := -1
 		counts := rootCounts
 		if len(stack) > 0 {
@@ -259,8 +270,9 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 	for _, entry := range stack {
 		nodes[entry.index].outer = source[entry.start:]
 	}
-	if len(nodes) > maxDiffNodes {
-		return nil, errDiffLimit
+	for index := range nodes {
+		nodes[index].compareText = normalizeCompareText(nodes[index].text)
+		nodes[index].signature = computeDiffNodeSignature(nodes[index])
 	}
 	return nodes, nil
 }
@@ -384,46 +396,42 @@ func isDiffWrapper(tag string) bool {
 func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 	matches := map[int]int{}
 	used := map[int]bool{}
-	afterAID := map[string][]int{}
-	for index, node := range after {
-		if node.aid != "" {
-			afterAID[node.aid] = append(afterAID[node.aid], index)
+	budget := diffMatchBudget{}
+	matchRootNodes(before, after, matches, used)
+	for changed := true; changed; {
+		changed = false
+		for beforeParent, afterParent := range matches {
+			if matchAIDChildren(before, after, beforeParent, afterParent, matches, used) {
+				changed = true
+			}
+			if matchExactChildren(before, after, beforeParent, afterParent, matches, used) {
+				changed = true
+			}
 		}
 	}
-	for index, node := range before {
-		candidates := afterAID[node.aid]
-		if node.aid != "" && len(candidates) == 1 && !used[candidates[0]] {
-			matches[index] = candidates[0]
-			used[candidates[0]] = true
-		}
-	}
-	afterPath := map[string]int{}
-	for index, node := range after {
-		if !used[index] {
-			afterPath[node.path] = index
-		}
-	}
-	for index, node := range before {
-		if _, ok := matches[index]; ok {
+	for beforeIndex, beforeNode := range before {
+		if _, ok := matches[beforeIndex]; ok {
 			continue
 		}
-		if candidate, ok := afterPath[node.path]; ok && !used[candidate] && node.tag == after[candidate].tag {
-			matches[index] = candidate
-			used[candidate] = true
+		for afterIndex, afterNode := range after {
+			if used[afterIndex] || beforeNode.path != afterNode.path || beforeNode.tag != afterNode.tag || !parentsMatch(beforeNode, afterNode, matches) {
+				continue
+			}
+			matches[beforeIndex] = afterIndex
+			used[afterIndex] = true
+			break
 		}
 	}
-	comparisons := 0
 	for beforeIndex, beforeNode := range before {
 		if _, ok := matches[beforeIndex]; ok {
 			continue
 		}
 		bestIndex, bestScore := -1, 0.0
 		for afterIndex, afterNode := range after {
-			if used[afterIndex] || beforeNode.tag != afterNode.tag {
+			if used[afterIndex] || beforeNode.tag != afterNode.tag || !parentsMatch(beforeNode, afterNode, matches) || !siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches) {
 				continue
 			}
-			comparisons++
-			if comparisons > maxDiffComparisons {
+			if !budget.add(len(beforeNode.compareText) + len(afterNode.compareText)) {
 				return nil, errDiffLimit
 			}
 			score := diffNodeSimilarity(beforeNode, afterNode)
@@ -439,6 +447,99 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 	return matches, nil
 }
 
+func matchAIDChildren(before, after []htmlDiffNode, beforeParent, afterParent int, matches map[int]int, used map[int]bool) bool {
+	afterByAID := map[string][]int{}
+	for _, afterIndex := range after[afterParent].children {
+		if !used[afterIndex] && after[afterIndex].aid != "" {
+			afterByAID[after[afterIndex].aid] = append(afterByAID[after[afterIndex].aid], afterIndex)
+		}
+	}
+	changed := false
+	for _, beforeIndex := range before[beforeParent].children {
+		if _, ok := matches[beforeIndex]; ok || before[beforeIndex].aid == "" {
+			continue
+		}
+		candidates := afterByAID[before[beforeIndex].aid]
+		if len(candidates) != 1 || used[candidates[0]] || before[beforeIndex].tag != after[candidates[0]].tag {
+			continue
+		}
+		matches[beforeIndex] = candidates[0]
+		used[candidates[0]] = true
+		changed = true
+	}
+	return changed
+}
+
+type diffMatchBudget struct {
+	comparisons int
+	bytes       int
+}
+
+func (budget *diffMatchBudget) add(bytes int) bool {
+	budget.comparisons++
+	budget.bytes += bytes
+	return budget.comparisons <= maxDiffComparisons && budget.bytes <= maxDiffCompareBytes
+}
+
+func matchRootNodes(before, after []htmlDiffNode, matches map[int]int, used map[int]bool) {
+	for beforeIndex, beforeNode := range before {
+		if beforeNode.parent >= 0 {
+			continue
+		}
+		for afterIndex, afterNode := range after {
+			if !used[afterIndex] && afterNode.parent < 0 && beforeNode.tag == afterNode.tag {
+				matches[beforeIndex] = afterIndex
+				used[afterIndex] = true
+				break
+			}
+		}
+	}
+}
+
+func matchExactChildren(before, after []htmlDiffNode, beforeParent, afterParent int, matches map[int]int, used map[int]bool) bool {
+	afterBySignature := map[string][]int{}
+	for _, afterIndex := range after[afterParent].children {
+		if !used[afterIndex] {
+			signature := diffNodeSignature(after[afterIndex])
+			afterBySignature[signature] = append(afterBySignature[signature], afterIndex)
+		}
+	}
+	changed := false
+	for _, beforeIndex := range before[beforeParent].children {
+		if _, ok := matches[beforeIndex]; ok {
+			continue
+		}
+		candidates := afterBySignature[diffNodeSignature(before[beforeIndex])]
+		if len(candidates) != 1 || used[candidates[0]] {
+			continue
+		}
+		matches[beforeIndex] = candidates[0]
+		used[candidates[0]] = true
+		changed = true
+	}
+	return changed
+}
+
+func parentsMatch(before, after htmlDiffNode, matches map[int]int) bool {
+	if before.parent < 0 || after.parent < 0 {
+		return before.parent == after.parent
+	}
+	matchedParent, ok := matches[before.parent]
+	return ok && matchedParent == after.parent
+}
+
+func siblingOrderCompatible(before, after []htmlDiffNode, beforeIndex, afterIndex int, matches map[int]int) bool {
+	for matchedBefore, matchedAfter := range matches {
+		if before[matchedBefore].parent != before[beforeIndex].parent || after[matchedAfter].parent != after[afterIndex].parent {
+			continue
+		}
+		if matchedBefore < beforeIndex && matchedAfter > afterIndex || matchedBefore > beforeIndex && matchedAfter < afterIndex {
+			return false
+		}
+	}
+	return true
+}
+
 func diffNodeSimilarity(before, after htmlDiffNode) float64 {
 	score := 0.25
 	if before.parent >= 0 && after.parent >= 0 {
@@ -451,7 +552,7 @@ func diffNodeSimilarity(before, after htmlDiffNode) float64 {
 	if before.order == after.order {
 		score += 0.1
 	}
-	score += 0.25 * stringSimilarity(before.text, after.text)
+	score += 0.25 * stringSimilarity(before.compareText, after.compareText)
 	score += 0.15 * attrSimilarity(before.attrs, after.attrs)
 	return score
 }
@@ -460,7 +561,6 @@ func stringSimilarity(a, b string) float64 {
 	if a == b {
 		return 1
 	}
-	a, b = strings.ToLower(a), strings.ToLower(b)
 	if a == "" || b == "" {
 		return 0
 	}
@@ -509,6 +609,13 @@ func attrSimilarity(a, b map[string]string) float64 {
 }
 
 func diffNodeSignature(node htmlDiffNode) string {
+	if node.signature != "" {
+		return node.signature
+	}
+	return computeDiffNodeSignature(node)
+}
+
+func computeDiffNodeSignature(node htmlDiffNode) string {
 	keys := make([]string, 0, len(node.attrs))
 	for key := range node.attrs {
 		if key != "data-odoc-aid" {
@@ -525,8 +632,30 @@ func diffNodeSignature(node htmlDiffNode) string {
 		builder.WriteString(node.attrs[key])
 	}
 	builder.WriteByte('|')
-	builder.WriteString(strings.Join(strings.Fields(node.text), " "))
+	builder.WriteString(node.compareText)
 	return builder.String()
+}
+
+func normalizeCompareText(value string) string {
+	if len(value) > maxDiffCompareText {
+		value = value[:maxDiffCompareText]
+	}
+	return strings.ToLower(strings.Join(strings.Fields(value), " "))
+}
+
+func diffNodeSnippet(node htmlDiffNode) string {
+	if len(node.outer) <= maxDiffSnippetBytes {
+		return node.outer
+	}
+	openingEnd := strings.IndexByte(node.outer, '>')
+	opening := "<" + node.tag + ">"
+	if openingEnd >= 0 && openingEnd < maxDiffOpeningBytes {
+		opening = node.outer[:openingEnd+1]
+	}
+	if isDiffVoidTag(node.tag) {
+		return opening
+	}
+	return opening + "<!-- omitted " + strconv.Itoa(len(node.outer)) + " bytes -->" + "</" + node.tag + ">"
 }
 
 func normalizeDiffHTML(value string) string {

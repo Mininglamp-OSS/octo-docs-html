@@ -900,6 +900,16 @@ func TestVersionSourceReturnsStoredHTMLAndImmutableETag(t *testing.T) {
 	if latest.Code != http.StatusOK || latest.Header().Get("Cache-Control") != "private, no-cache" {
 		t.Fatalf("latest source = %d cache=%q", latest.Code, latest.Header().Get("Cache-Control"))
 	}
+	latestReq := httptest.NewRequest(http.MethodGet, "/v1/docs/source/versions/latest/source", nil)
+	for key, value := range authorHdrNoCT() {
+		latestReq.Header.Set(key, value)
+	}
+	latestReq.Header.Set("If-None-Match", latest.Header().Get("ETag"))
+	latestNotModified := httptest.NewRecorder()
+	h.ServeHTTP(latestNotModified, latestReq)
+	if latestNotModified.Code != http.StatusNotModified || latestNotModified.Body.Len() != 0 {
+		t.Fatalf("conditional latest = %d body=%q", latestNotModified.Code, latestNotModified.Body.String())
+	}
 }
 
 func TestVersionSourceAndDiffAreDefaultDeny(t *testing.T) {
