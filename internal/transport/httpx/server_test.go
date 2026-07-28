@@ -3,6 +3,7 @@ package httpx_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -142,21 +143,25 @@ func TestPublishResponseIncludesRegistrationState(t *testing.T) {
 	}
 }
 
-func TestPublishGroupFailsClosedWithoutRegistrar(t *testing.T) {
-	h := newTestServer(t, nil)
-	rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
-		`{"slug":"contract-group","html":"<html><body>x</body></html>","mount_type":"group"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
-	}
-	var envelope struct {
-		Data map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
-		t.Fatal(err)
-	}
-	if envelope.Data["registered"] != false || envelope.Data["status"] != "registration_failed" {
-		t.Fatalf("publish data = %#v", envelope.Data)
+func TestPublishMountedFailsClosedWithoutRegistrar(t *testing.T) {
+	for _, mountType := range []string{"group", "thread"} {
+		t.Run(mountType, func(t *testing.T) {
+			h := newTestServer(t, nil)
+			body := fmt.Sprintf(`{"slug":"contract-%s","html":"<html><body>x</body></html>","mount_type":%q}`, mountType, mountType)
+			rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+			}
+			var envelope struct {
+				Data map[string]any `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Data["registered"] != false || envelope.Data["status"] != "registration_failed" {
+				t.Fatalf("publish data = %#v", envelope.Data)
+			}
+		})
 	}
 }
 

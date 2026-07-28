@@ -53,18 +53,21 @@ curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
 Body: `{slug, html, title?, version?, comments?, mount_type?, group_no?, thread_id?}`. `slug` is kebab-case
 (`^[a-zA-Z0-9_-]{1,64}$`). HTML is capped at `MAX_HTML_BYTES` (413 over limit).
 
-For a registerable `group` or `space` mount, the service writes the immutable
-HTML version exactly once, then retries only docs-backend registration for a
-short bounded window. Registration success includes the canonical `doc_id` and
-`share_url`; both a new row (`created:true`) and an existing idempotent row
-(`created:false`) return `registered:true,status:"published"`. If registration
-still fails, the publish response is `registered:false,status:"registration_failed"`:
-the HTML version already exists and callers must not report ordinary publish
-success or retry by publishing the HTML again.
-Group and space mounts use the same fail-closed status when registration is
-disabled. Thread or unmounted publishes return
+For a registerable `group`, `space`, or `thread` mount, the service writes the
+immutable HTML version exactly once, then retries only docs-backend registration
+for a short bounded window. Registration success includes the canonical
+`doc_id` and `share_url`; both a new row (`created:true`) and an existing
+idempotent row (`created:false`) return `registered:true,status:"published"`.
+If registration still fails or the registrar is unavailable, the publish
+response is `registered:false,status:"registration_failed"`: the HTML version
+already exists and callers must not report ordinary publish success or retry by
+publishing the HTML again. Only unmounted publishes return
 `registered:false,status:"published_unregistered"` because registration does
 not apply to them.
+
+**Rollout prerequisite:** Mininglamp-OSS/octo-docs-backend#129 must be merged
+and deployed before HTML PR #24 is deployed, because thread registration
+depends on that backend contract.
 
 ### `PUT /v1/docs/{slug}/draft` — save the mutable draft (author)
 Overwrites the single draft slot without minting a version. Body: `{html, title?}`.
