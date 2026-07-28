@@ -111,12 +111,19 @@ func TestAgentElementReplaceMakesNewVersion(t *testing.T) {
 	}
 	var pub struct {
 		Data struct {
-			Version int
+			Version      int    `json:"version"`
+			ChangeSource string `json:"change_source"`
+			BaseVersion  int    `json:"base_version"`
+			NewVersion   int    `json:"new_version"`
+			TargetAID    string `json:"target_aid"`
 		}
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &pub)
 	if pub.Data.Version != 2 {
 		t.Fatalf("replace version = %d; want 2 (new version)", pub.Data.Version)
+	}
+	if pub.Data.ChangeSource != "element_replace" || pub.Data.BaseVersion != 1 || pub.Data.NewVersion != 2 || pub.Data.TargetAID != aid {
+		t.Fatalf("replace metadata = %+v", pub.Data)
 	}
 
 	// v2 HTML reflects the change; the old content is gone.

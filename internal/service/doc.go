@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -125,6 +127,10 @@ type PublishInput struct {
 	// Empty ⇒ the registrar falls back to its process-configured token.
 	PublisherToken string
 
+	ChangeSource string
+	BaseVersion  int
+	TargetAID    string
+
 	mountContextKnown bool
 	pinnedAID         string
 	pinnedTag         string
@@ -143,6 +149,10 @@ type PublishResult struct {
 	Size           int64  `json:"size"`
 	AIDs           int    `json:"aids"`
 	MergedComments int    `json:"merged_comments"`
+	ChangeSource   string `json:"change_source,omitempty"`
+	BaseVersion    int    `json:"base_version,omitempty"`
+	NewVersion     int    `json:"new_version,omitempty"`
+	TargetAID      string `json:"target_aid,omitempty"`
 
 	title        string
 	hadMeta      bool
@@ -250,20 +260,27 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		}
 	}
 
-	return &PublishResult{
+	result := &PublishResult{
 		Slug:              in.Slug,
 		Version:           version,
 		Status:            publishStatusPublished,
 		Size:              size,
 		AIDs:              len(stamped.AIDs),
 		MergedComments:    merged,
+		ChangeSource:      in.ChangeSource,
+		BaseVersion:       in.BaseVersion,
+		TargetAID:         in.TargetAID,
 		title:             metaResult.title,
 		hadMeta:           metaResult.hadMeta,
 		titleChanged:      metaResult.titleChanged,
 		mountType:         in.MountType,
 		mountContextKnown: in.mountContextKnown,
 		publisherToken:    in.PublisherToken,
-	}, nil
+	}
+	if in.ChangeSource != "" {
+		result.NewVersion = version
+	}
+	return result, nil
 }
 
 func (s *DocService) restoreMountContext(ctx context.Context, in *PublishInput) error {
@@ -417,6 +434,9 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 		in.pinnedAID = aid
 		in.pinnedTag, _ = core.SingleTopLevelTag(newHTML)
 		in.anchorMigrations = map[string]string{aid: canonicalAID}
+		in.ChangeSource = "element_replace"
+		in.BaseVersion = v
+		in.TargetAID = aid
 		r, perr := s.publishLocked(ctx, in, stamped)
 		if perr != nil {
 			return perr
@@ -473,6 +493,47 @@ func (s *DocService) Render(ctx context.Context, slug string, version int) (*Ren
 		title = meta.Title
 	}
 	return &RenderData{HTML: html, Versions: versions, Title: title}, nil
+}
+
+// Source returns the immutable published HTML exactly as stored, before render
+// handlers sign assets or inject the overlay. Version 0 resolves to latest.
+func (s *DocService) Source(ctx context.Context, slug string, version int) (string, int, bool, error) {
+	resolved, err := s.resolveReadVersion(ctx, slug, version)
+	if err != nil {
+		return "", 0, false, err
+	}
+	html, ok, err := s.blobs.GetDoc(ctx, slug, resolved)
+	if err != nil {
+		return "", 0, false, err
+	}
+	return html, resolved, ok, nil
+}
+
+// Diff compares two concrete published versions under fixed parser, matching,
+// and output limits. It never returns either complete document as a field.
+func (s *DocService) Diff(ctx context.Context, slug string, from, to int) (*VersionDiff, error) {
+	before, fromVersion, ok, err := s.Source(ctx, slug, from)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, apperr.NotFound("")
+	}
+	after, toVersion, ok, err := s.Source(ctx, slug, to)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, apperr.NotFound("")
+	}
+	if int64(len(before)) > s.maxBytes || int64(len(after)) > s.maxBytes {
+		return nil, apperr.PayloadTooLarge("document exceeds diff input limit", "diff_input_too_large")
+	}
+	result, err := buildVersionDiff(fromVersion, toVersion, before, after)
+	if errors.Is(err, errDiffLimit) {
+		return nil, apperr.PayloadTooLarge("diff complexity limit exceeded", "diff_too_complex")
+	}
+	return result, err
 }
 
 // VersionList is the response of ListVersions.
@@ -983,7 +1044,7 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	// Stamp creator_uid on first create only: ownership is set once and a later
 	// republish (possibly by a different caller) must never reassign it.
 	extra := prev.Extra
-	if in.mountContextKnown || (in.CreatorUID != "" && prev.CreatorUID() == "") {
+	if in.mountContextKnown || (in.CreatorUID != "" && prev.CreatorUID() == "") || in.ChangeSource != "" {
 		extra = map[string]any{}
 		maps.Copy(extra, prev.Extra)
 	}
@@ -992,6 +1053,18 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
+	}
+	if in.ChangeSource != "" {
+		changes, _ := extra[storage.VersionChangesExtraKey].(map[string]any)
+		copyChanges := map[string]any{}
+		maps.Copy(copyChanges, changes)
+		copyChanges[strconv.Itoa(version)] = map[string]any{
+			"change_source": in.ChangeSource,
+			"base_version":  in.BaseVersion,
+			"new_version":   version,
+			"target_aid":    in.TargetAID,
+		}
+		extra[storage.VersionChangesExtraKey] = copyChanges
 	}
 	if err := s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{
 		Slug:     in.Slug,

@@ -29,6 +29,11 @@ const CreatorUIDExtraKey = "creator_uid"
 // MountTypeExtraKey is the DocMeta.Extra key holding the publish mount context.
 const MountTypeExtraKey = "mount_type"
 
+// VersionChangesExtraKey stores optional bot-originated change metadata keyed
+// by the decimal published version. It lives in the open metadata object so
+// existing stores require no schema migration.
+const VersionChangesExtraKey = "version_changes"
+
 // CreatorUID returns the creating uid stored under Extra, or "" when absent
 // (legacy docs / no creator recorded ⇒ nobody is author by ownership).
 func (m *DocMeta) CreatorUID() string {
