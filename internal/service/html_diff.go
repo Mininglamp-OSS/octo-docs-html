@@ -256,7 +256,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				return nil, errDiffLimit
 			}
 			if closeStart < 0 {
-				appendDiffNodeText(&nodes[index], source[end+1:])
+				appendDiffNodeText(&nodes[index], source[end+1:], isDiffLiteralRawTextTag(tag))
 				nodes[index].outer = source[lt:]
 				cursor = len(source)
 				continue
@@ -265,7 +265,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			if closeEnd < 0 {
 				closeEnd = len(source) - 1
 			}
-			appendDiffNodeText(&nodes[index], source[end+1:closeStart])
+			appendDiffNodeText(&nodes[index], source[end+1:closeStart], isDiffLiteralRawTextTag(tag))
 			nodes[index].outer = source[lt : closeEnd+1]
 			cursor = closeEnd + 1
 			continue
@@ -295,7 +295,7 @@ func indexDiffRawClose(source string, start int, tag string) (int, int) {
 		candidate := cursor + relative
 		nameStart := candidate + 2
 		nameEnd := nameStart + len(tag)
-		if candidate+1 < len(source) && source[candidate+1] == '/' && nameEnd <= len(source) && strings.EqualFold(source[nameStart:nameEnd], tag) && (nameEnd == len(source) || unicode.IsSpace(rune(source[nameEnd])) || source[nameEnd] == '>') {
+		if candidate+1 < len(source) && source[candidate+1] == '/' && nameEnd <= len(source) && strings.EqualFold(source[nameStart:nameEnd], tag) && (nameEnd == len(source) || unicode.IsSpace(rune(source[nameEnd])) || source[nameEnd] == '>' || source[nameEnd] == '/') {
 			return candidate, candidate - start + 1
 		}
 		cursor = candidate + 1
@@ -391,10 +391,10 @@ func appendDiffText(nodes []htmlDiffNode, stack []diffOpenNode, text string) {
 		return
 	}
 	index := stack[len(stack)-1].index
-	appendDiffNodeText(&nodes[index], text)
+	appendDiffNodeText(&nodes[index], text, false)
 }
 
-func appendDiffNodeText(node *htmlDiffNode, text string) {
+func appendDiffNodeText(node *htmlDiffNode, text string, literalRawText bool) {
 	remaining := maxDiffCompareText - node.textBytes
 	separatorBytes := 0
 	if len(node.textParts) > 0 {
@@ -408,7 +408,10 @@ func appendDiffNodeText(node *htmlDiffNode, text string) {
 	if len(text) > limit {
 		text = text[:limit]
 	}
-	normalized := strings.Join(strings.Fields(html.UnescapeString(text)), " ")
+	if !literalRawText {
+		text = html.UnescapeString(text)
+	}
+	normalized := strings.Join(strings.Fields(text), " ")
 	if normalized == "" {
 		return
 	}
@@ -435,6 +438,10 @@ func isDiffRawTextTag(tag string) bool {
 	default:
 		return false
 	}
+}
+
+func isDiffLiteralRawTextTag(tag string) bool {
+	return tag == "script" || tag == "style"
 }
 
 func isDiffWrapper(tag string) bool {

@@ -130,6 +130,22 @@ func TestBuildVersionDiffDuplicateListHeadInsertionDoesNotCascade(t *testing.T) 
 	}
 }
 
+func TestBuildVersionDiffPreservesScriptEntityLiterals(t *testing.T) {
+	before := `<html><head><script>const marker = "&lt;";</script></head><body></body></html>`
+	after := `<html><head><script>const marker = "<";</script></head><body></body></html>`
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified != 1 || result.Summary.Added != 0 || result.Summary.Removed != 0 {
+		t.Fatalf("summary = %+v; changes = %+v", result.Summary, result.Changes)
+	}
+	if len(result.Changes) != 1 || result.Changes[0].DOMPath != "/html[1]/head[1]/script[1]" {
+		t.Fatalf("changes = %+v", result.Changes)
+	}
+}
+
 func TestParseDiffHTMLBoundsCommentSeparatedTextStorage(t *testing.T) {
 	var source strings.Builder
 	source.Grow(5 << 20)
@@ -178,6 +194,22 @@ func TestParseDiffHTMLBoundsMultipleRawTextElements(t *testing.T) {
 	}
 	if nodes[len(nodes)-1].tag != "p" || nodes[len(nodes)-1].text != "after raw text" {
 		t.Fatalf("last node = %+v", nodes[len(nodes)-1])
+	}
+}
+
+func TestBuildVersionDiffParsesAfterRawTextCloseSlash(t *testing.T) {
+	before := `<html><body><script>const value = 1;</script/><p>before</p></body></html>`
+	after := `<html><body><script>const value = 1;</script/><p>after</p></body></html>`
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified != 1 || result.Summary.Added != 0 || result.Summary.Removed != 0 {
+		t.Fatalf("summary = %+v; changes = %+v", result.Summary, result.Changes)
+	}
+	if len(result.Changes) != 1 || result.Changes[0].DOMPath != "/html[1]/body[1]/p[1]" {
+		t.Fatalf("changes = %+v", result.Changes)
 	}
 }
 
