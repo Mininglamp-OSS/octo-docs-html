@@ -156,8 +156,9 @@ type CommentSnapshot struct {
 
 // StampedArtifact is a commentable artifact discovered and stamped by StampAids.
 type StampedArtifact struct {
-	AID     string  `json:"aid"`
-	Tag     string  `json:"tag"`
-	Head    string  `json:"head"`
-	Heading *string `json:"heading"`
+	AID        string   `json:"aid"`
+	Tag        string   `json:"tag"`
+	Head       string   `json:"head"`
+	Heading    *string  `json:"heading"`
+	LegacyAIDs []string `json:"-"`
 }

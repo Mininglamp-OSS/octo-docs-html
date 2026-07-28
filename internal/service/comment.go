@@ -171,9 +171,10 @@ func wipeOp() core.CommentOp { return core.CommentOp{Kind: "wipe", At: nowISO()}
 // reconcile for a caller that ALREADY holds the per-slug lock (DocService.Publish
 // serializes the whole publish sequence under one lock). It must not re-acquire
 // the lock — sluglock.Memory is not reentrant, so doing so would self-deadlock.
-func (s *CommentService) PublishMergeLocked(ctx context.Context, slug string, local []core.Comment, aids []core.StampedArtifact, version int) (MutationResult, error) {
+func (s *CommentService) PublishMergeLocked(ctx context.Context, slug string, local []core.Comment, aids []core.StampedArtifact, version int, pinnedAID, pinnedTag string) (MutationResult, error) {
 	return s.applyOp(ctx, slug, core.CommentOp{
 		Kind: "publish_merge", LocalComments: local, AIDs: aids, Version: version, At: nowISO(),
+		PinnedAID: pinnedAID, PinnedTag: pinnedTag,
 	})
 }
 

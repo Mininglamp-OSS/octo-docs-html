@@ -632,6 +632,11 @@ func TestSupportedRootStaysAddressableAcrossPlainRestamp(t *testing.T) {
 	if _, err := docs.ReplaceElement(ctx, "keepfig", 1, oldAID, "<figure>brand new</figure>"); err != nil {
 		t.Fatalf("replace to figure (v2): %v", err)
 	}
+	v2snaps, err := comments.List(ctx, "keepfig", 2)
+	if err != nil || len(v2snaps) != 1 || v2snaps[0].Anchor == nil ||
+		v2snaps[0].Anchor.Fingerprint == nil || v2snaps[0].Anchor.Fingerprint.Tag != "figure" {
+		t.Fatalf("v2 anchor fingerprint was not refreshed to figure: snaps=%+v err=%v", v2snaps, err)
+	}
 	view, err := docs.GetElement(ctx, "keepfig", 2, oldAID)
 	if err != nil || view == nil || view.Tag != "figure" || !strings.Contains(view.HTML, "brand new") {
 		t.Fatalf("GetElement v2 = view=%v err=%v; want the pinned figure", view, err)
@@ -685,6 +690,96 @@ func TestSupportedRootStaysAddressableAcrossPlainRestamp(t *testing.T) {
 	if !strings.Contains(got, figAIDv4) {
 		t.Fatalf("comment did not rebind to the figure at v4: kind=%q aid=%q selector=%q want %q",
 			a.Kind, a.AID, a.Selector, figAIDv4)
+	}
+}
+
+func TestMalformedOpenDoesNotPublishPhantomArtifacts(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+	ctx := context.Background()
+
+	html := `<html><body><div title="BEFORE><h2>Other</h2><figure>decoy</figure><h2>Target</h2><figure>old</figure><table><tr><td>AFTER</td></tr></table></body></html>`
+	result, err := docs.Publish(ctx, service.PublishInput{Slug: "malformed-publish", HTML: html})
+	if err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if result.AIDs != 0 {
+		t.Fatalf("published phantom artifact count = %d, want 0", result.AIDs)
+	}
+	rd, err := docs.Render(ctx, "malformed-publish", 1)
+	if err != nil || rd == nil {
+		t.Fatalf("render: data=%v err=%v", rd, err)
+	}
+	if rd.HTML != html || strings.Contains(rd.HTML, `data-odoc-aid`) {
+		t.Fatalf("render injected an anchor into a non-DOM tail: %q", rd.HTML)
+	}
+	if artifacts := core.StampAids(rd.HTML).AIDs; len(artifacts) != 0 {
+		t.Fatalf("rendered phantom artifacts = %#v, want none", artifacts)
+	}
+}
+
+func TestUniqueIframeLegacyAliasMigratesOnRepublish(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+	ctx := context.Background()
+	html := `<html><body><iframe src="one">fallback one</iframe><iframe src="two">fallback two</iframe></body></html>`
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "iframe-legacy", HTML: html}); err != nil {
+		t.Fatalf("publish v1: %v", err)
+	}
+	rd, err := docs.Render(ctx, "iframe-legacy", 1)
+	if err != nil || rd == nil {
+		t.Fatalf("render v1: data=%v err=%v", rd, err)
+	}
+	artifacts := core.StampAids(rd.HTML).AIDs
+	if len(artifacts) != 2 || len(artifacts[1].LegacyAIDs) != 1 {
+		t.Fatalf("iframe artifacts = %#v", artifacts)
+	}
+	legacySecond := artifacts[1].LegacyAIDs[0]
+	canonicalSecond := artifacts[1].AID
+	anchor := &core.Anchor{Kind: "element", AID: legacySecond, Selector: `[data-odoc-aid="` + legacySecond + `"]`, Label: "iframe",
+		Fingerprint: &core.AnchorFingerprint{Tag: "iframe"}}
+	if res, createErr := comments.Create(ctx, "iframe-legacy", &core.Author{Login: "u"}, "note", anchor, 1); createErr != nil || res.Status != 200 {
+		t.Fatalf("create comment: status=%d err=%v", res.Status, createErr)
+	}
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "iframe-legacy", HTML: html}); err != nil {
+		t.Fatalf("publish v2: %v", err)
+	}
+	snaps, err := comments.List(ctx, "iframe-legacy", 2)
+	if err != nil || len(snaps) != 1 || snaps[0].Anchor == nil || snaps[0].Anchor.AID != canonicalSecond {
+		t.Fatalf("iframe legacy alias did not migrate uniquely: snaps=%+v err=%v", snaps, err)
+	}
+}
+
+func TestAmbiguousIframeLegacyAliasBecomesLost(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+	ctx := context.Background()
+	html := `<html><body><iframe src="same">one</iframe><iframe src="same">two</iframe></body></html>`
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "iframe-ambiguous", HTML: html}); err != nil {
+		t.Fatalf("publish v1: %v", err)
+	}
+	artifacts := core.StampAids(html).AIDs
+	if len(artifacts) != 2 || len(artifacts[0].LegacyAIDs) != 1 || artifacts[0].LegacyAIDs[0] != artifacts[1].LegacyAIDs[0] {
+		t.Fatalf("iframe legacy aliases = %#v", artifacts)
+	}
+	legacyAID := artifacts[0].LegacyAIDs[0]
+	anchor := &core.Anchor{Kind: "element", AID: legacyAID, Selector: `[data-odoc-aid="` + legacyAID + `"]`, Label: "iframe",
+		Fingerprint: &core.AnchorFingerprint{Tag: "iframe"}}
+	if res, createErr := comments.Create(ctx, "iframe-ambiguous", &core.Author{Login: "u"}, "note", anchor, 1); createErr != nil || res.Status != 200 {
+		t.Fatalf("create comment: status=%d err=%v", res.Status, createErr)
+	}
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "iframe-ambiguous", HTML: html}); err != nil {
+		t.Fatalf("publish v2: %v", err)
+	}
+	snaps, err := comments.List(ctx, "iframe-ambiguous", 2)
+	if err != nil || len(snaps) != 1 || snaps[0].Anchor == nil || snaps[0].Anchor.Kind != "lost" || snaps[0].Anchor.Reason != "ambiguous_aid" {
+		t.Fatalf("ambiguous iframe legacy alias = %+v err=%v", snaps, err)
 	}
 }
 

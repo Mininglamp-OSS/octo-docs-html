@@ -46,6 +46,8 @@ type CommentOp struct {
 	// publish_merge
 	LocalComments []Comment
 	AIDs          []StampedArtifact
+	PinnedAID     string
+	PinnedTag     string
 
 	// shared
 	Version int
@@ -246,7 +248,7 @@ func opPublishMerge(list []Comment, op CommentOp) ([]Comment, OpResult) {
 		}
 	}
 	if len(list) > 0 {
-		ReconcileAnchors(list, op.AIDs, op.Version)
+		reconcileAnchors(list, op.AIDs, op.Version, op.PinnedAID, op.PinnedTag)
 		CompactComments(list)
 	}
 	return list, OpResult{Status: 200, Body: map[string]any{"mergedComments": merged}}

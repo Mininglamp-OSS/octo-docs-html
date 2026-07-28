@@ -4,7 +4,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync/atomic"
 	"unicode/utf16"
 )
 
@@ -87,10 +86,13 @@ type parsedOpenTag struct {
 	tag, origTag         string
 	attrs                string
 	namespace            contentNamespace
+	annotationHTML       bool
 }
 
-var scanOpenTagsCalls atomic.Int64
-var scanOpenTagsStackOps atomic.Int64
+type scanStats struct {
+	stackOps             int
+	annotationAttrParses int
+}
 
 // StampResult is the stamped HTML plus the artifact index.
 type StampResult struct {
@@ -203,11 +205,16 @@ func saltAwayFromPinned(tag, innerHTML, openAttrs, pinnedAID string) string {
 		return aid
 	}
 	base := tag + "|" + openAttrs + "|" + innerHTML
-	for seed := uint32(1); ; seed++ {
-		if salted := Cyrb53(base, seed); salted != pinnedAID {
+	return saltAwayFromPinnedWithHasher(base, pinnedAID, 1<<16, Cyrb53)
+}
+
+func saltAwayFromPinnedWithHasher(base, pinnedAID string, maxAttempts uint32, hash func(string, uint32) string) string {
+	for seed := uint32(1); seed <= maxAttempts; seed++ {
+		if salted := hash(base, seed); salted != pinnedAID {
 			return salted
 		}
 	}
+	return pinnedAID + "0"
 }
 
 // attrAwareOpenTagEnd returns the index just past the > that closes the open tag
@@ -1039,11 +1046,8 @@ func namespaceForChild(parent parsedOpenTag, childTag string) contentNamespace {
 			if childTag == "svg" {
 				return namespaceSVG
 			}
-			if encoding, ok := attrValue(parent.attrs, "encoding"); ok {
-				encoding = strings.ToLower(strings.TrimSpace(encoding))
-				if encoding == "text/html" || encoding == "application/xhtml+xml" {
-					base = namespaceHTML
-				}
+			if parent.annotationHTML {
+				base = namespaceHTML
 			}
 		}
 	}
@@ -1059,13 +1063,14 @@ func namespaceForChild(parent parsedOpenTag, childTag string) contentNamespace {
 }
 
 func scanOpenTags(s string) []parsedOpenTag {
-	scanOpenTagsCalls.Add(1)
+	return scanOpenTagsWithStats(s, nil)
+}
+
+func scanOpenTagsWithStats(s string, stats *scanStats) []parsedOpenTag {
 	var opens []parsedOpenTag
 	var stack []int
 	var stackTagPrev []int
 	stackTopByTag := make(map[string]int)
-	var stackOps int64
-	defer func() { scanOpenTagsStackOps.Add(stackOps) }()
 	popStack := func(newLen int) {
 		for len(stack) > newLen {
 			pos := len(stack) - 1
@@ -1073,7 +1078,9 @@ func scanOpenTags(s string) []parsedOpenTag {
 			stackTopByTag[opens[idx].tag] = stackTagPrev[pos]
 			stack = stack[:pos]
 			stackTagPrev = stackTagPrev[:pos]
-			stackOps++
+			if stats != nil {
+				stats.stackOps++
+			}
 		}
 	}
 	for i := 0; i < len(s); {
@@ -1144,9 +1151,20 @@ func scanOpenTags(s string) []parsedOpenTag {
 		} else if tag == "math" {
 			ns = namespaceMathML
 		}
+		annotationHTML := false
+		if ns == namespaceMathML && tag == "annotation-xml" {
+			if stats != nil {
+				stats.annotationAttrParses++
+			}
+			if encoding, found := attrValue(attrs, "encoding"); found {
+				encoding = strings.ToLower(strings.TrimSpace(encoding))
+				annotationHTML = encoding == "text/html" || encoding == "application/xhtml+xml"
+			}
+		}
 		opens = append(opens, parsedOpenTag{
 			start: lt, openEnd: openEnd, closeStart: openEnd, closeEnd: openEnd,
 			tag: tag, origTag: origTag, attrs: attrs, namespace: ns,
+			annotationHTML: annotationHTML,
 		})
 		idx := len(opens) - 1
 		selfClosed := ns != namespaceHTML && terminalSelfCloseSlash(attrs) >= 0
@@ -1158,7 +1176,9 @@ func scanOpenTags(s string) []parsedOpenTag {
 			stack = append(stack, idx)
 			stackTagPrev = append(stackTagPrev, previous)
 			stackTopByTag[tag] = len(stack) - 1
-			stackOps++
+			if stats != nil {
+				stats.stackOps++
+			}
 		}
 		if ns == namespaceHTML && isRawTextTag(tag) {
 			closeStart, closeEnd := rawTextCloseBoundary(s, tag, openEnd)
@@ -1281,11 +1301,11 @@ func StampAids(rawHTML string) StampResult {
 // identity wins); non-colliding hashes are unchanged.
 //
 // Used by element/replace: the backend injects the target's OLD aid onto the
-// replacement root at a known offset so the swapped element keeps its identity
-// and its anchored comment survives reconciliation. The caller restricts the root
-// to a harvestable element (IsHarvestableReplacementRoot) so the pin still
-// resolves on later plain re-stamps. An invalid/missing offset degrades to plain
-// StampAids (no pin, no salting).
+// replacement root at a known offset so the immediate replacement version can
+// reconcile the anchor and fingerprint atomically. The caller restricts the root
+// to a harvestable element (IsHarvestableReplacementRoot) so later plain stamps
+// keep it addressable under normal content-derived identity. An invalid/missing
+// offset degrades to plain StampAids (no pin, no salting).
 func StampAidsPinned(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 	return stampAids(rawHTML, pinnedAID, pinnedOffset)
 }
@@ -1349,19 +1369,29 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 		cleanedInner := dataOdocAidRe2.ReplaceAllString(e.innerHTML, "")
 		var aid string
 		if effectivePinned != "" && e.openStart == pinnedOffset {
-			aid = pinnedAID // pin exactly the replacement root; its identity never moves
+			aid = pinnedAID // pin exactly the replacement root for this stamp
 		} else {
 			// Ordinary content-addressed hash. Salted away ONLY when an active pin's aid
 			// collides; otherwise byte-identical to before, so two genuinely identical
 			// artifacts still share one aid (content-addressing).
 			aid = saltAwayFromPinned(e.tag, cleanedInner, cleanedAttrs, effectivePinned)
 		}
-		aids = append(aids, StampedArtifact{
+		artifact := StampedArtifact{
 			AID:     aid,
 			Tag:     e.tag,
 			Head:    utf16Slice(e.innerHTML, 80),
 			Heading: nearestHeadingAt(e.openStart),
-		})
+		}
+		// Older releases hashed iframe attributes but excluded fallback content.
+		// Preserve that value only as reconciliation metadata: it is never emitted
+		// into HTML and never defines replacement boundaries.
+		if e.tag == "iframe" {
+			legacyAID := aidFor("iframe", "", cleanedAttrs)
+			if legacyAID != aid {
+				artifact.LegacyAIDs = []string{legacyAID}
+			}
+		}
+		aids = append(aids, artifact)
 		e.cleanedAttrs = cleanedAttrs
 		e.aid = aid
 		elements = append(elements, e)

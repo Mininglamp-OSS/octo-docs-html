@@ -688,6 +688,17 @@ func TestStampAidsPinnedResolvesAidCollision(t *testing.T) {
 	}
 }
 
+func TestSaltAwayFromPinnedRetryIsBounded(t *testing.T) {
+	calls := 0
+	got := saltAwayFromPinnedWithHasher("base", "pinned", 3, func(string, uint32) string {
+		calls++
+		return "pinned"
+	})
+	if calls != 3 || got != "pinned0" {
+		t.Fatalf("bounded salt retry: calls=%d aid=%q, want 3 and pinned0", calls, got)
+	}
+}
+
 // assertUniqueAIDs fails the test if any two stamped artifacts share an aid.
 func assertUniqueAIDs(t *testing.T, res StampResult) {
 	t.Helper()
@@ -875,8 +886,8 @@ func TestStampAidsPinnedInvalidOffsetDegradesToPlain(t *testing.T) {
 
 // Fix (opt-in harvest consistency): a class="odoc-artifact" opt-in root accepted
 // by IsHarvestableReplacementRoot must ALSO be harvested by the plain re-stamp
-// path in every valid quote form (double, single, unquoted), so the element keeps
-// a stable addressable aid across every publish and its anchor survives.
+// path in every valid quote form (double, single, unquoted), so the element stays
+// addressable even though later identity is content-derived rather than pinned.
 func TestOptInClassRootPersistsAcrossPlainRestamp(t *testing.T) {
 	forms := []struct {
 		name string
@@ -1990,17 +2001,74 @@ func TestStampAidsScansStructureOnce(t *testing.T) {
 	}
 	doc.WriteString(`</body>`)
 
-	scanOpenTagsCalls.Store(0)
-	scanOpenTagsStackOps.Store(0)
-	res := StampAids(doc.String())
-	if len(res.AIDs) != 8000 {
-		t.Fatalf("aids = %d, want 8000", len(res.AIDs))
+	stats := &scanStats{}
+	opens := scanOpenTagsWithStats(doc.String(), stats)
+	if len(opens) != 8001 {
+		t.Fatalf("open tags = %d, want 8001", len(opens))
 	}
-	if calls := scanOpenTagsCalls.Load(); calls != 1 {
-		t.Fatalf("scanOpenTags calls = %d, want 1", calls)
+	if stats.stackOps > 20000 {
+		t.Fatalf("scanOpenTags stack operations = %d, want <= 20000", stats.stackOps)
 	}
-	if ops := scanOpenTagsStackOps.Load(); ops > 20000 {
-		t.Fatalf("scanOpenTags stack operations = %d, want <= 20000", ops)
+}
+
+func TestScanOpenTagsStopsAtUnbalancedAttributeQuote(t *testing.T) {
+	in := `<body><div title="BEFORE><figure>AFTER</figure><table><tr><td>AFTER</td></tr></table></body>`
+	res := StampAids(in)
+	if len(res.AIDs) != 0 {
+		t.Fatalf("phantom artifacts = %#v, want none", res.AIDs)
+	}
+	if res.HTML != in {
+		t.Fatalf("unterminated attribute tail was mutated:\n got %q\nwant %q", res.HTML, in)
+	}
+	if strings.Contains(res.HTML, `data-odoc-aid`) {
+		t.Fatalf("aid injected inside browser attribute value: %q", res.HTML)
+	}
+}
+
+func TestAnnotationXMLParsesEncodingOnce(t *testing.T) {
+	var doc strings.Builder
+	doc.Grow(480 << 10)
+	doc.WriteString(`<math><annotation-xml data-padding="`)
+	doc.WriteString(strings.Repeat("x", 440<<10))
+	doc.WriteString(`" encoding="text/html">`)
+	for i := 0; i < 2500; i++ {
+		doc.WriteString(`<section><span>x</span></section>`)
+	}
+	doc.WriteString(`</annotation-xml></math>`)
+
+	stats := &scanStats{}
+	opens := scanOpenTagsWithStats(doc.String(), stats)
+	if stats.annotationAttrParses != 1 {
+		t.Fatalf("annotation encoding parses = %d, want 1", stats.annotationAttrParses)
+	}
+	if len(opens) != 5002 {
+		t.Fatalf("open tags = %d, want 5002", len(opens))
+	}
+}
+
+func TestIframeLegacyAIDIsReconciliationOnly(t *testing.T) {
+	cases := []struct {
+		html      string
+		legacyAID string
+	}{
+		{`<body><iframe src="x"><p>fallback</p></iframe></body>`, "1xf1ckmazcw"},
+		{`<body><iframe src="x"></iframe></body>`, "1xf1ckmazcw"},
+		{`<body><iframe title="a" src="x">legacy fallback</iframe></body>`, "1pib9z82p75"},
+	}
+	for _, tc := range cases {
+		res := StampAids(tc.html)
+		canonicalAID := aidOf(res, "iframe")
+		artifact := res.AIDs[0]
+		if canonicalAID != tc.legacyAID && (len(artifact.LegacyAIDs) != 1 || artifact.LegacyAIDs[0] != tc.legacyAID) {
+			t.Errorf("iframe metadata = %+v, want legacy alias %q for %q", artifact, tc.legacyAID, tc.html)
+		}
+		if canonicalAID != tc.legacyAID && strings.Contains(res.HTML, `data-odoc-aid="`+tc.legacyAID+`"`) {
+			t.Errorf("legacy alias was emitted into HTML: %q", res.HTML)
+		}
+		outer, _, ok := ElementByAID(res.HTML, canonicalAID)
+		if !ok || !strings.HasSuffix(outer, `</iframe>`) {
+			t.Errorf("iframe boundary = %q ok=%v", outer, ok)
+		}
 	}
 }
 
@@ -2011,6 +2079,26 @@ func BenchmarkStampAids4000Sections(b *testing.B) {
 		doc.WriteString(`<section><p>text</p></section>`)
 	}
 	doc.WriteString(`</body>`)
+	html := doc.String()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(html)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		StampAids(html)
+	}
+}
+
+func BenchmarkStampAidsAnnotationXMLAdversarial(b *testing.B) {
+	var doc strings.Builder
+	doc.Grow(480 << 10)
+	doc.WriteString(`<math><annotation-xml data-padding="`)
+	doc.WriteString(strings.Repeat("x", 440<<10))
+	doc.WriteString(`" encoding="text/html">`)
+	for i := 0; i < 2500; i++ {
+		doc.WriteString(`<section><span>x</span></section>`)
+	}
+	doc.WriteString(`</annotation-xml></math>`)
 	html := doc.String()
 
 	b.ReportAllocs()

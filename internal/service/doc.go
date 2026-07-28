@@ -126,6 +126,8 @@ type PublishInput struct {
 	PublisherToken string
 
 	mountContextKnown bool
+	pinnedAID         string
+	pinnedTag         string
 }
 
 // PublishResult is the result of a successful publish.
@@ -236,7 +238,7 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		return nil, err
 	}
 
-	merge, err := s.comments.PublishMergeLocked(ctx, in.Slug, in.LocalComments, stamped.AIDs, version)
+	merge, err := s.comments.PublishMergeLocked(ctx, in.Slug, in.LocalComments, stamped.AIDs, version, in.pinnedAID, in.pinnedTag)
 	if err != nil {
 		return nil, err
 	}
@@ -331,9 +333,9 @@ func (s *DocService) GetElement(ctx context.Context, slug string, version int, a
 // newHTML must be a single top-level element (no multiple elements, no
 // script/style, no inline event handlers, no javascript: URLs, no data-odoc-*).
 // After validation the backend injects the target's existing aid onto the
-// replacement root so the swapped element keeps its identity across the re-stamp
-// and any comment anchored to it persists (reconcile keeps it, even if the
-// replacement's tag or content changed).
+// replacement root for this publish only. Reconciliation validates that the aid
+// is unique and refreshes the anchor fingerprint atomically when the tag changes;
+// later plain publishes compute normal content-derived identity again.
 func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersion int, aid, newHTML string) (*PublishResult, error) {
 	if aid == "" {
 		return nil, apperr.Validation("aid required", "aid_required")
@@ -356,9 +358,8 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 	if core.HasDataOdocAttr(newHTML) {
 		return nil, apperr.Validation("new_html must not carry data-odoc-* attributes", "new_html_has_odoc_attr")
 	}
-	// Root must be harvestable so the pinned aid survives later plain re-stamps; a
-	// bare non-opt-in root (div/p/...) would keep the aid one version then lose it,
-	// silently dropping the anchored comment.
+	// Root must remain addressable in the replacement version. The pin is only an
+	// immediate publish exception; it is not a durable identity promise.
 	if !core.IsHarvestableReplacementRoot(newHTML) {
 		return nil, apperr.Validation(
 			"new_html root must be a stampable element or carry class \"odoc-artifact\"",
@@ -392,7 +393,7 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 		// Stamp here (publishLocked expects a stamped result) and publish without
 		// re-acquiring the lock (Publish would deadlock via nested lock.With). Pin ONLY
 		// the replacement root to the injected old aid so it keeps its identity and its
-		// comment anchor survives reconciliation across the tag/content change. The root
+		// comment anchor is refreshed atomically across this tag/content change. The root
 		// '<' sits at boundary+localRoot (localRoot accounts for leading whitespace);
 		// every other element rehashes normally.
 		stamped := core.StampAidsPinned(replaced, aid, boundary+localRoot)
@@ -400,6 +401,8 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 		if ierr != nil {
 			return ierr
 		}
+		in.pinnedAID = aid
+		in.pinnedTag, _ = core.SingleTopLevelTag(newHTML)
 		r, perr := s.publishLocked(ctx, in, stamped)
 		if perr != nil {
 			return perr
