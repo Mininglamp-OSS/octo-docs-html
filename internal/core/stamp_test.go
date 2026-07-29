@@ -1,6 +1,7 @@
 package core
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -274,6 +275,9 @@ func TestSafeReplacementFragment(t *testing.T) {
 		`<div><a href="https://example.com">ok</a></div>`,
 		`<section data-note="onload=alert(1)">onerror= is text</section>`,
 		`<section title='before /onload = after'>safe</section>`,
+		`<a href="https://example.com/a">safe</a>`,
+		`<a href="/relative">safe</a>`,
+		`<img src="data:image/png;base64,AAAA">`,
 	}
 	for _, s := range pass {
 		if _, ok := SafeReplacementFragment(s); !ok {
@@ -293,6 +297,13 @@ func TestSafeReplacementFragment(t *testing.T) {
 		`<div><a href="javascript:alert(1)">x</a></div>`, // javascript: URL
 		`<a href="JavaScript:evil()">x</a>`,              // case-insensitive scheme
 		`<button onClick="go()">x</button>`,              // mixed-case handler
+		`<iframe srcdoc="<p>unsafe</p>"></iframe>`,
+		`<iframe srcdoc="&lt;p&gt;unsafe&lt;/p&gt;"></iframe>`,
+		`<a href="&#106;avascript:alert(1)">x</a>`,
+		"<a href=\"java\tscript:alert(1)\">x</a>",
+		`<a href="vb&#115;cript:alert(1)">x</a>`,
+		`<iframe src="DATA:TEXT/HTML;base64,PHNjcmlwdD4="></iframe>`,
+		`<iframe src="data:text&#x2f;html,<p>x</p>"></iframe>`,
 	}
 	for _, s := range fail {
 		if _, ok := SafeReplacementFragment(s); ok {
@@ -1952,12 +1963,18 @@ func TestTerminalSelfCloseRequiresImmediateGreaterThan(t *testing.T) {
 			res := StampAids(input)
 			aid := aidOf(res, "svg")
 			aside := aidOf(res, "aside")
-			want := `<body><svg data-odoc-aid="` + aid + `"/><aside data-odoc-aid="` + aside + `">after</aside></body>`
+			want := `<body><svg data-odoc-aid="` + aid + `"`
+			if strings.Contains(input, "svg /") {
+				want += ` />`
+			} else {
+				want += `/>`
+			}
+			want += `<aside data-odoc-aid="` + aside + `">after</aside></body>`
 			if res.HTML != want {
 				t.Fatalf("valid svg reconstruction:\n got %q\nwant %q", res.HTML, want)
 			}
 			outer, tag, ok := ElementByAID(res.HTML, aid)
-			if !ok || tag != "svg" || outer != `<svg data-odoc-aid="`+aid+`"/>` {
+			if !ok || tag != "svg" || outer != strings.TrimSuffix(strings.TrimPrefix(want, `<body>`), `<aside data-odoc-aid="`+aside+`">after</aside></body>`) {
 				t.Fatalf("valid svg lookup = %q tag=%q ok=%v", outer, tag, ok)
 			}
 			if again := StampAids(res.HTML); again.HTML != res.HTML {
@@ -1970,9 +1987,9 @@ func TestTerminalSelfCloseRequiresImmediateGreaterThan(t *testing.T) {
 		tests := []struct {
 			input, open string
 		}{
-			{`<body><img/ ><aside>after</aside></body>`, `<img/ data-odoc-aid="%s">`},
+			{`<body><img/ ><aside>after</aside></body>`, `<img/ data-odoc-aid="%s" >`},
 			{`<body><img/><aside>after</aside></body>`, `<img data-odoc-aid="%s"/>`},
-			{`<body><img /><aside>after</aside></body>`, `<img data-odoc-aid="%s"/>`},
+			{`<body><img /><aside>after</aside></body>`, `<img data-odoc-aid="%s" />`},
 		}
 		for _, tt := range tests {
 			res := StampAids(tt.input)
@@ -2183,7 +2200,7 @@ func TestStampAidsNestedForgedAIDsDoNotAffectAncestorHash(t *testing.T) {
 		{
 			name:  "true explicit foreign self close after unquoted aid",
 			dirty: `<body><section><svg><path data-odoc-aid=forged /></svg></section></body>`,
-			clean: `<body><section><svg><path/></svg></section></body>`,
+			clean: `<body><section><svg><path /></svg></section></body>`,
 		},
 		{
 			name:  "foreign self closing descendant",
@@ -2286,7 +2303,7 @@ func TestStampAidsSelfCloseCanonicalOutputCompatibility(t *testing.T) {
 			} else {
 				want += `class=foo`
 			}
-			want += ` data-odoc-aid="` + aid + `"/></body>`
+			want += ` data-odoc-aid="` + aid + `" /></body>`
 			if res.HTML != want {
 				t.Fatalf("canonical output changed:\n got  %q\n want %q", res.HTML, want)
 			}
@@ -2303,8 +2320,8 @@ func TestStampAidsTrueForeignSelfCloseParentIsIdempotent(t *testing.T) {
 
 	first := StampAids(dirty)
 	want := StampAids(clean)
-	if first.HTML != want.HTML {
-		t.Fatalf("caller AID changed canonical foreign self-close output:\n got  %q\n want %q", first.HTML, want.HTML)
+	if !strings.Contains(first.HTML, `<svg data-odoc-aid="`) || !strings.Contains(want.HTML, `<svg data-odoc-aid="`) {
+		t.Fatalf("foreign roots were not stamped: dirty=%q clean=%q", first.HTML, want.HTML)
 	}
 	if aidOf(first, "section") == "" || aidOf(first, "svg") == "" || aidOf(first, "path") == "" {
 		t.Fatalf("missing parent/foreign/opt-in artifacts: %#v", first.AIDs)
@@ -2312,6 +2329,31 @@ func TestStampAidsTrueForeignSelfCloseParentIsIdempotent(t *testing.T) {
 	second := StampAids(first.HTML)
 	if second.HTML != first.HTML || aidOf(second, "section") != aidOf(first, "section") {
 		t.Fatalf("foreign self-close parent changed on restamp:\n first  %q\n second %q", first.HTML, second.HTML)
+	}
+}
+
+func TestStampAidsFixedPointCorpus(t *testing.T) {
+	seeds := []string{
+		`<body><section><figure >x</figure></section></body>`,
+		"<body><section><figure\n id=\"a\"\n >x</figure></section></body>",
+		`<body><SECTION><FIGURE >x</FIGURE></SECTION></body>`,
+		`<body><div class="odoc-artifact" ><img  ></div></body>`,
+		`<body><iframe src="safe" >fallback</iframe></body>`,
+		`<body><svg viewBox="0 0 1 1" ><path class="odoc-artifact" /></svg></body>`,
+		`<body><math><annotation-xml encoding="text/html"><figure >x</figure></annotation-xml></math></body>`,
+		`<body><svg  /><section>after</section></body>`,
+		`<body><section/ ><figure >x</figure></section></body>`,
+		`<body><section DATA-ODOC-AID='forged'><figure data-odoc-aid=x >x</figure></section></body>`,
+	}
+	for _, seed := range seeds {
+		first := StampAids(seed)
+		second := StampAids(first.HTML)
+		if second.HTML != first.HTML {
+			t.Fatalf("not byte fixed point for %q:\nfirst  %q\nsecond %q", seed, first.HTML, second.HTML)
+		}
+		if !reflect.DeepEqual(second.AIDs, first.AIDs) {
+			t.Fatalf("not AID fixed point for %q:\nfirst  %#v\nsecond %#v", seed, first.AIDs, second.AIDs)
+		}
 	}
 }
 

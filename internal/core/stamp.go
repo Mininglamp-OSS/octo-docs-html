@@ -1,6 +1,7 @@
 package core
 
 import (
+	"html"
 	"regexp"
 	"sort"
 	"strings"
@@ -125,8 +126,6 @@ var (
 	// rawAnyRe matches a raw-text open tag at ANY nesting depth (not just top
 	// level); used to reject injected <script>/<style>/... inside a fragment.
 	rawAnyRe = regexp.MustCompile(`(?i)<(` + strings.Join(rawTextTags, "|") + `)\b`)
-	// jsURLRe matches a javascript: URL scheme anywhere in the fragment.
-	jsURLRe = regexp.MustCompile(`(?i)javascript:`)
 	// probeTagRe finds a candidate open-tag name; the trailing \b is deliberately
 	// loose (it treats ':' and other non-name chars as a boundary), so callers
 	// must go through probeOpenTagName, which re-validates that the name ends at an
@@ -397,21 +396,29 @@ func terminalSelfCloseSlash(attrs string) int {
 	return -1
 }
 
-func stripTerminalSelfClose(attrs string) string {
-	if slash := terminalSelfCloseSlash(attrs); slash >= 0 {
-		for slash > 0 && isASCIISpace(attrs[slash-1]) {
-			slash--
-		}
-		return attrs[:slash]
-	}
-	return attrs
-}
-
 func trimTrailingASCIISpace(s string) string {
 	for len(s) > 0 && isASCIISpace(s[len(s)-1]) {
 		s = s[:len(s)-1]
 	}
 	return s
+}
+
+// stampedOpenTag preserves caller attribute bytes and inserts the canonical AID
+// before trailing attribute whitespace and, when real, the self-close slash.
+// Stripping the inserted attribute therefore reconstructs the original opening
+// tag byte-for-byte for the next hash pass.
+func stampedOpenTag(name, attrs, aid string, trueSelfClose bool) string {
+	insertAt := len(attrs)
+	if trueSelfClose {
+		insertAt = terminalSelfCloseSlash(attrs)
+		if insertAt < 0 {
+			insertAt = len(attrs)
+		}
+	}
+	for insertAt > 0 && isASCIISpace(attrs[insertAt-1]) {
+		insertAt--
+	}
+	return "<" + name + attrs[:insertAt] + ` data-odoc-aid="` + aid + `"` + attrs[insertAt:] + ">"
 }
 
 // rootOpenTagAttrs returns the attribute slice of the fragment's single root open
@@ -546,7 +553,9 @@ func stripAIDAttribute(attrs string) string {
 		}
 		if strings.EqualFold(attrs[nameStart:nameEnd], "data-odoc-aid") {
 			removeStart := nameStart
-			for removeStart > cursor && isASCIISpace(attrs[removeStart-1]) {
+			// Emission adds exactly one separating space. Remove only that byte so
+			// caller-owned formatting before the attribute survives a restamp.
+			if removeStart > cursor && attrs[removeStart-1] == ' ' {
 				removeStart--
 			}
 			out.WriteString(attrs[cursor:removeStart])
@@ -555,71 +564,6 @@ func stripAIDAttribute(attrs string) string {
 	}
 	out.WriteString(attrs[cursor:])
 	return out.String()
-}
-
-// endsInUnquotedAttrValue reports whether attrs ends while the HTML tokenizer is
-// in an unquoted attribute value. Appending '/' directly in that state would
-// make the slash value data, not a self-close marker.
-func endsInUnquotedAttrValue(attrs string) bool {
-	const (
-		beforeName = iota
-		name
-		afterName
-		beforeValue
-		quotedValue
-		unquotedValue
-		afterQuotedValue
-	)
-	state := beforeName
-	var quote byte
-	for i := 0; i < len(attrs); i++ {
-		ch := attrs[i]
-		switch state {
-		case beforeName:
-			if !isASCIISpace(ch) && ch != '/' {
-				state = name
-			}
-		case name:
-			switch {
-			case isASCIISpace(ch):
-				state = afterName
-			case ch == '=':
-				state = beforeValue
-			}
-		case afterName:
-			switch {
-			case isASCIISpace(ch):
-			case ch == '=':
-				state = beforeValue
-			default:
-				state = name
-			}
-		case beforeValue:
-			switch {
-			case isASCIISpace(ch):
-			case ch == '"' || ch == '\'':
-				quote = ch
-				state = quotedValue
-			default:
-				state = unquotedValue
-			}
-		case quotedValue:
-			if ch == quote {
-				state = afterQuotedValue
-			}
-		case unquotedValue:
-			if isASCIISpace(ch) {
-				state = beforeName
-			}
-		case afterQuotedValue:
-			if isASCIISpace(ch) {
-				state = beforeName
-			} else {
-				state = name
-			}
-		}
-	}
-	return state == unquotedValue
 }
 
 // stripAllAIDs removes caller-supplied AIDs from every real opening tag in one
@@ -636,23 +580,11 @@ func stripAllAIDs(html string) string {
 	cursor := 0
 	for _, open := range opens {
 		attrs := open.attrs
-		terminalSlash := terminalSelfCloseSlash(attrs)
-		base := attrs
-		if terminalSlash >= 0 {
-			base = attrs[:terminalSlash]
-		}
-		cleaned := stripAIDAttribute(base)
-		if cleaned == base {
+		cleaned := stripAIDAttribute(attrs)
+		if cleaned == attrs {
 			continue // never normalize a caller tag unless an AID was removed
 		}
-		if terminalSlash >= 0 {
-			cleaned = trimTrailingASCIISpace(cleaned)
-			if endsInUnquotedAttrValue(cleaned) || strings.HasSuffix(cleaned, "/") {
-				cleaned += " /"
-			} else {
-				cleaned += "/"
-			}
-		} else if terminalSelfCloseSlash(cleaned) >= 0 &&
+		if terminalSelfCloseSlash(attrs) < 0 && terminalSelfCloseSlash(cleaned) >= 0 &&
 			(open.namespace != namespaceHTML || voidTagRe.MatchString(open.tag)) {
 			// Canonical output places an AID after a malformed slash on void/foreign
 			// tags. Removing that AID must not turn the slash into a real self-close.
@@ -686,6 +618,102 @@ func hasEventHandlerAttr(s string) bool {
 			found = true
 		})
 		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// forEachAttr walks real attributes and reports their lowercased names and raw
+// values. It is deliberately structural: text that only resembles an attribute
+// inside another value is never reported.
+func forEachAttr(attrs string, fn func(name, value string)) {
+	i := 0
+	for i < len(attrs) {
+		for i < len(attrs) && (isASCIISpace(attrs[i]) || attrs[i] == '/') {
+			i++
+		}
+		start := i
+		for i < len(attrs) && !isASCIISpace(attrs[i]) && attrs[i] != '=' && attrs[i] != '/' {
+			i++
+		}
+		if start == i {
+			i++
+			continue
+		}
+		name := strings.ToLower(attrs[start:i])
+		for i < len(attrs) && isASCIISpace(attrs[i]) {
+			i++
+		}
+		value := ""
+		if i < len(attrs) && attrs[i] == '=' {
+			i++
+			for i < len(attrs) && isASCIISpace(attrs[i]) {
+				i++
+			}
+			if i < len(attrs) && (attrs[i] == '"' || attrs[i] == '\'') {
+				quote := attrs[i]
+				i++
+				valueStart := i
+				for i < len(attrs) && attrs[i] != quote {
+					i++
+				}
+				value = attrs[valueStart:i]
+				if i < len(attrs) {
+					i++
+				}
+			} else {
+				valueStart := i
+				for i < len(attrs) && !isASCIISpace(attrs[i]) {
+					i++
+				}
+				value = attrs[valueStart:i]
+			}
+		}
+		fn(name, value)
+	}
+}
+
+func unsafeReplacementAttrs(s string) bool {
+	unsafe := false
+	for _, open := range scanOpenTags(s) {
+		forEachAttr(open.attrs, func(name, value string) {
+			if unsafe || name == "srcdoc" {
+				unsafe = true
+				return
+			}
+			switch name {
+			case "href", "src", "xlink:href", "action", "formaction":
+			default:
+				return
+			}
+			decoded := html.UnescapeString(value)
+			var normalized strings.Builder
+			for _, r := range decoded {
+				if r <= 0x20 || r == 0x7f {
+					continue
+				}
+				normalized.WriteRune(r)
+			}
+			url := strings.ToLower(normalized.String())
+			if strings.HasPrefix(url, "javascript:") || strings.HasPrefix(url, "vbscript:") {
+				unsafe = true
+				return
+			}
+			if strings.HasPrefix(url, "data:") {
+				media := strings.TrimPrefix(url, "data:")
+				if comma := strings.IndexByte(media, ','); comma >= 0 {
+					media = media[:comma]
+				}
+				if semi := strings.IndexByte(media, ';'); semi >= 0 {
+					media = media[:semi]
+				}
+				if media == "text/html" || media == "application/xhtml+xml" {
+					unsafe = true
+				}
+			}
+		})
+		if unsafe {
 			return true
 		}
 	}
@@ -1207,21 +1235,15 @@ func SingleTopLevelTag(s string) (tag string, ok bool) {
 	return tag, trimJSSpace(trimmed[closeEnd:]) == ""
 }
 
-// SafeReplacementFragment gates an aid-replace fragment: it must be exactly one
-// top-level element (SingleTopLevelTag) AND free of injection vectors anywhere in
-// the string. SingleTopLevelTag stays a pure structural check (its own tests keep
-// passing); the three content scans below run on the WHOLE fragment because the
-// dangerous payloads (<div><script>…</script></div>, <img onerror=…>, href=
-// javascript:…) hide at inner depth where a top-level-only check never looks.
+// SafeReplacementFragment is a defense-in-depth guardrail for automated
+// replacement, not a complete HTML sanitizer. It rejects dangerous structures,
+// real event attributes, srcdoc, and executable URL schemes at any depth.
 func SafeReplacementFragment(s string) (tag string, ok bool) {
 	tag, ok = SingleTopLevelTag(s)
 	if !ok {
 		return "", false
 	}
-	// 1) raw-text tags (script/style/textarea/title) at any depth.
-	// 2) inline event handlers (on...=).
-	// 3) javascript: URLs.
-	if rawAnyRe.MatchString(s) || hasEventHandlerAttr(s) || jsURLRe.MatchString(s) {
+	if rawAnyRe.MatchString(s) || hasEventHandlerAttr(s) || unsafeReplacementAttrs(s) {
 		return "", false
 	}
 	return tag, true
@@ -1682,15 +1704,7 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 		name := e.origTag
 		var stampedOpen string
 		if e.isVoid {
-			// Strip any trailing self-close slash from cleanedAttrs so we don't emit a
-			// stray '/' before data-odoc-aid, then re-add exactly one closing slash for
-			// a self-terminated void tag: <img ... data-odoc-aid="x"/>.
-			attrs := trimTrailingASCIISpace(stripAIDAttribute(stripTerminalSelfClose(e.attrs)))
-			selfClose := ""
-			if terminalSelfCloseSlash(e.attrs) >= 0 {
-				selfClose = "/"
-			}
-			stampedOpen = "<" + name + attrs + ` data-odoc-aid="` + e.aid + `"` + selfClose + ">"
+			stampedOpen = stampedOpenTag(name, e.cleanedAttrs, e.aid, terminalSelfCloseSlash(e.cleanedAttrs) >= 0)
 		} else if e.inForeign && e.closeEnd == e.openEnd && terminalSelfCloseSlash(e.attrs) >= 0 {
 			// Genuinely self-closing foreign element: it sits in SVG/MathML foreign
 			// content (inForeign) with no real close tag (closeEnd == openEnd, empty
@@ -1700,10 +1714,13 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 			// so self-closing semantics survive: <path ... data-odoc-aid="x"/>. HTML
 			// non-void <section/> never reaches here — not in foreign content and it
 			// spans to a real close (closeEnd > openEnd) — so it stays non-self-closing.
-			attrs := trimTrailingASCIISpace(stripAIDAttribute(stripTerminalSelfClose(e.attrs)))
-			stampedOpen = "<" + name + attrs + ` data-odoc-aid="` + e.aid + `"/>`
+			stampedOpen = stampedOpenTag(name, e.cleanedAttrs, e.aid, true)
 		} else {
-			stampedOpen = "<" + name + trimTrailingASCIISpace(e.cleanedAttrs) + ` data-odoc-aid="` + e.aid + `">`
+			attrs := e.cleanedAttrs
+			if strings.Contains(attrs, "/") {
+				attrs = trimTrailingASCIISpace(attrs)
+			}
+			stampedOpen = stampedOpenTag(name, attrs, e.aid, false)
 		}
 		out.WriteString(stampedOpen)
 		cursor = e.openEnd
