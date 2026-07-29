@@ -286,6 +286,49 @@ func TestCommentRequiresCapability(t *testing.T) {
 	}
 }
 
+func TestCommentMutationsHideVersionsBeforeAuthorization(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	for _, html := range []string{
+		`{"slug":"private-mutations","html":"<html><body><p>v1</p></body></html>"}`,
+		`{"slug":"private-mutations","html":"<html><body><p>v2</p></body></html>"}`,
+	} {
+		if rec := do(t, h, http.MethodPost, "/v1/docs", auth, html); rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := do(t, h, http.MethodPost, "/v1/comments", auth,
+		`{"slug":"private-mutations","text":"seed","version":2}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed comment = %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil || created.Data.ID == "" {
+		t.Fatalf("seed comment response = %s: %v", rec.Body.String(), err)
+	}
+
+	for _, tc := range []struct {
+		name, method, target, payload string
+	}{
+		{"patch in range", http.MethodPatch, "/v1/comments", `{"slug":"private-mutations","id":"` + created.Data.ID + `","anchor":{"kind":"element","aid":"a"},"version":2}`},
+		{"patch out of range", http.MethodPatch, "/v1/comments", `{"slug":"private-mutations","id":"` + created.Data.ID + `","anchor":{"kind":"element","aid":"a"},"version":999999}`},
+		{"react in range", http.MethodPost, "/v1/reactions", `{"slug":"private-mutations","comment_id":"` + created.Data.ID + `","emoji":"x","version":2}`},
+		{"react out of range", http.MethodPost, "/v1/reactions", `{"slug":"private-mutations","comment_id":"` + created.Data.ID + `","emoji":"x","version":999999}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, tc.method, tc.target, map[string]string{"Content-Type": "application/json"}, tc.payload)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestPublishRenderLifecycle(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()

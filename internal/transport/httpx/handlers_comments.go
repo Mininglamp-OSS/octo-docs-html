@@ -287,14 +287,14 @@ func (s *Server) handlePatchComment(w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
+	if err := s.requireDocCap(r, slug); err != nil {
+		return err
+	}
 	if body.ID == "" || body.Anchor == nil {
 		return apperr.Validation("slug, id, anchor required", "anchor_required")
 	}
 	version, err := s.resolveMutationVersion(r, slug, body.Version)
 	if err != nil {
-		return err
-	}
-	if err := s.requireDocCap(r, slug); err != nil {
 		return err
 	}
 	if err := s.authorizeMutation(r, slug, body.ID, session); err != nil {
@@ -361,6 +361,9 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if err := s.requireDocCap(r, slug); err != nil {
+		return err
+	}
 	if body.CommentID == "" || body.Emoji == "" {
 		return apperr.Validation("slug, comment_id, emoji required", "reaction_fields_required")
 	}
@@ -369,9 +372,6 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) error {
 	}
 	version, err := s.resolveMutationVersion(r, slug, body.Version)
 	if err != nil {
-		return err
-	}
-	if err := s.requireDocCap(r, slug); err != nil {
 		return err
 	}
 	by := "anon"
