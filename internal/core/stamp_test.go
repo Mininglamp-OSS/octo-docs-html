@@ -279,7 +279,10 @@ func TestSafeReplacementFragment(t *testing.T) {
 		`<a href="/relative">safe</a>`,
 		`<img src="data:image/png;base64,AAAA">`,
 		`<object data="/relative"></object>`,
-		`<object data="data:image/svg+xml,<svg/>"></object>`,
+		`<img src="data:image/png;base64,PHN2Zz4=">`,
+		`<svg><animate attributeName="opacity" values="javascript:prose;1"/></svg>`,
+		`<svg><set attributeName="fill" to="data:image/svg+xml,prose"/></svg>`,
+		`<svg><animate values="javascript:prose"/></svg>`,
 	}
 	for _, s := range pass {
 		if _, ok := SafeReplacementFragment(s); !ok {
@@ -310,6 +313,14 @@ func TestSafeReplacementFragment(t *testing.T) {
 		`<object data="&#106;avascript:alert(1)"></object>`,
 		"<object data=\"java\tscript:alert(1)\"></object>",
 		`<object data="data:text/html,<script>x</script>"></object>`,
+		`<svg><a><animate attributeName="href" values="https://safe; javascript:alert(1)"/></a></svg>`,
+		`<svg><a><animate attributeName="xlink:href" from="&#106;avascript:alert(1)"/></a></svg>`,
+		"<svg><a><set attributeName=\"href\" to=\"java\tscript:alert(1)\"/></a></svg>",
+		`<svg><a><set attributeName="HREF" to="VBScript:alert(1)"/></a></svg>`,
+		`<iframe src="data:text/xml,<svg/>"></iframe>`,
+		`<iframe src="DATA:APPLICATION/XML;charset=utf-8;base64,PHN2Zz4="></iframe>`,
+		`<object data="data:image/svg+xml;base64,PHN2Zz4="></object>`,
+		`<a href="data:application&#x2f;xhtml+xml,<p>x</p>">x</a>`,
 	}
 	for _, s := range fail {
 		if _, ok := SafeReplacementFragment(s); ok {

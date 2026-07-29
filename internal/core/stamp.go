@@ -683,51 +683,84 @@ func forEachAttr(attrs string, fn func(name, value string)) {
 	}
 }
 
+func normalizedURLValue(value string) string {
+	decoded := html.UnescapeString(value)
+	var normalized strings.Builder
+	for _, r := range decoded {
+		if r <= 0x20 || r == 0x7f {
+			continue
+		}
+		normalized.WriteRune(r)
+	}
+	return strings.ToLower(normalized.String())
+}
+
+func unsafeReplacementURL(value string) bool {
+	url := normalizedURLValue(value)
+	if strings.HasPrefix(url, "javascript:") || strings.HasPrefix(url, "vbscript:") {
+		return true
+	}
+	if !strings.HasPrefix(url, "data:") {
+		return false
+	}
+	media := strings.TrimPrefix(url, "data:")
+	if comma := strings.IndexByte(media, ','); comma >= 0 {
+		media = media[:comma]
+	}
+	if semi := strings.IndexByte(media, ';'); semi >= 0 {
+		media = media[:semi]
+	}
+	switch media {
+	case "text/html", "application/xhtml+xml", "text/xml", "application/xml", "image/svg+xml":
+		return true
+	default:
+		return false
+	}
+}
+
 func unsafeReplacementAttrs(s string) bool {
-	unsafe := false
 	for _, open := range scanOpenTags(s) {
+		attrs := make(map[string][]string)
+		unsafe := false
 		forEachAttr(open.attrs, func(name, value string) {
-			if unsafe || name == "srcdoc" {
+			attrs[name] = append(attrs[name], value)
+			if name == "srcdoc" {
 				unsafe = true
 				return
 			}
 			switch name {
 			case "href", "src", "xlink:href", "action", "formaction":
+				unsafe = unsafe || unsafeReplacementURL(value)
 			case "data":
-				if open.tag != "object" {
-					return
-				}
-			default:
-				return
-			}
-			decoded := html.UnescapeString(value)
-			var normalized strings.Builder
-			for _, r := range decoded {
-				if r <= 0x20 || r == 0x7f {
-					continue
-				}
-				normalized.WriteRune(r)
-			}
-			url := strings.ToLower(normalized.String())
-			if strings.HasPrefix(url, "javascript:") || strings.HasPrefix(url, "vbscript:") {
-				unsafe = true
-				return
-			}
-			if strings.HasPrefix(url, "data:") {
-				media := strings.TrimPrefix(url, "data:")
-				if comma := strings.IndexByte(media, ','); comma >= 0 {
-					media = media[:comma]
-				}
-				if semi := strings.IndexByte(media, ';'); semi >= 0 {
-					media = media[:semi]
-				}
-				if media == "text/html" || media == "application/xhtml+xml" {
-					unsafe = true
-				}
+				unsafe = unsafe || open.tag == "object" && unsafeReplacementURL(value)
 			}
 		})
 		if unsafe {
 			return true
+		}
+		if open.tag != "animate" && open.tag != "set" {
+			continue
+		}
+		targets := attrs["attributename"]
+		if len(targets) == 0 {
+			continue
+		}
+		target := normalizedURLValue(targets[0])
+		if target != "href" && target != "xlink:href" {
+			continue
+		}
+		for _, name := range []string{"from", "to", "values"} {
+			for _, value := range attrs[name] {
+				candidates := []string{value}
+				if name == "values" {
+					candidates = strings.Split(html.UnescapeString(value), ";")
+				}
+				for _, candidate := range candidates {
+					if unsafeReplacementURL(candidate) {
+						return true
+					}
+				}
+			}
 		}
 	}
 	return false
