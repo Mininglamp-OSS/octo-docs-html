@@ -336,6 +336,39 @@ func TestSafeReplacementFragment(t *testing.T) {
 	}
 }
 
+func TestUnsafeReplacementURLRegisteredXMLMediaTypes(t *testing.T) {
+	unsafe := []string{
+		`data:application/atom+xml,<feed/>`,
+		`data:application/rss+xml,<rss/>`,
+		`data:application/atom+xml;base64,PGZlZWQvPg==`,
+		`data:application/rss+xml;base64,PHJzcy8+`,
+		`DATA:APPLICATION/ATOM+XML;CHARSET=UTF-8,<feed/>`,
+		`DATA:APPLICATION/RSS+XML;CHARSET=UTF-8;BASE64,PHJzcy8+`,
+		`data:application&#x2f;atom+xml,<feed/>`,
+		`data:application&sol;rss+xml,<rss/>`,
+		"data:application/at\tom+xml,<feed/>",
+		"data:application/rs\ts+xml,<rss/>",
+	}
+	for _, value := range unsafe {
+		if !unsafeReplacementURL(value) {
+			t.Errorf("expected registered XML media type reject: %q", value)
+		}
+	}
+
+	safe := []string{
+		`data:text/plain,application/atom+xml`,
+		`data:image/png;name=application/rss+xml,AAAA`,
+		`data:application/json,{"type":"application/atom+xml"}`,
+		`data:image/png;base64,AAAA`,
+		`https://example.com/application/atom+xml`,
+	}
+	for _, value := range safe {
+		if unsafeReplacementURL(value) {
+			t.Errorf("expected non-XML media type accept: %q", value)
+		}
+	}
+}
+
 func TestSafeReplacementFragmentDuplicateSinkFirstWins(t *testing.T) {
 	tests := []struct {
 		name, safeFirst, unsafeFirst string

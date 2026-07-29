@@ -2,6 +2,7 @@ package core
 
 import (
 	"html"
+	"mime"
 	"regexp"
 	"sort"
 	"strings"
@@ -711,11 +712,15 @@ func unsafeReplacementURL(value string) bool {
 	if semi := strings.IndexByte(media, ';'); semi >= 0 {
 		media = media[:semi]
 	}
-	switch media {
+	mediaType, _, err := mime.ParseMediaType(media)
+	if err != nil {
+		return false
+	}
+	switch mediaType {
 	case "text/html", "application/xhtml+xml", "text/xml", "application/xml", "image/svg+xml":
 		return true
 	default:
-		return false
+		return strings.HasSuffix(mediaType, "+xml")
 	}
 }
 
