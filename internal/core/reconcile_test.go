@@ -110,7 +110,7 @@ func TestPinnedReconcileRefreshesFingerprintTag(t *testing.T) {
 	if res.Status != 200 {
 		t.Fatalf("create status = %d", res.Status)
 	}
-	reconcileAnchors(list, []StampedArtifact{{AID: "pinned", Tag: "figure"}}, 2, "pinned", "figure")
+	reconcileAnchors(list, []StampedArtifact{{AID: "pinned", Tag: "figure"}}, 2, "pinned", "figure", nil)
 	a := SnapshotList(list, 2)[0].Anchor
 	if a == nil || a.AID != "pinned" || a.Label != "figure" || a.Fingerprint == nil || a.Fingerprint.Tag != "figure" {
 		t.Fatalf("pinned anchor = %+v, want refreshed figure fingerprint", a)

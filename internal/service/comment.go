@@ -172,9 +172,14 @@ func wipeOp() core.CommentOp { return core.CommentOp{Kind: "wipe", At: nowISO()}
 // serializes the whole publish sequence under one lock). It must not re-acquire
 // the lock — sluglock.Memory is not reentrant, so doing so would self-deadlock.
 func (s *CommentService) PublishMergeLocked(ctx context.Context, slug string, local []core.Comment, aids []core.StampedArtifact, version int, pinnedAID, pinnedTag string) (MutationResult, error) {
+	return s.PublishMergeWithMigrationsLocked(ctx, slug, local, aids, version, pinnedAID, pinnedTag, nil)
+}
+
+// PublishMergeWithMigrationsLocked additionally applies trusted server-derived AID migrations.
+func (s *CommentService) PublishMergeWithMigrationsLocked(ctx context.Context, slug string, local []core.Comment, aids []core.StampedArtifact, version int, pinnedAID, pinnedTag string, anchorMigrations map[string]string) (MutationResult, error) {
 	return s.applyOp(ctx, slug, core.CommentOp{
 		Kind: "publish_merge", LocalComments: local, AIDs: aids, Version: version, At: nowISO(),
-		PinnedAID: pinnedAID, PinnedTag: pinnedTag,
+		PinnedAID: pinnedAID, PinnedTag: pinnedTag, AnchorMigrations: anchorMigrations,
 	})
 }
 

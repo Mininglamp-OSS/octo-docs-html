@@ -345,7 +345,7 @@ func TestLegacyPromoteDoesNotClaimUnregistered(t *testing.T) {
 // issue-21: element/replace must preserve the target's aid so a comment anchored
 // to it stays anchored (not marked lost) after the re-stamp — even when the
 // replacement changes the element's tag and content — and the rendered v2 must
-// still carry that old aid so the DOM selector resolves.
+// immediately carry the canonical aid so the DOM selector resolves.
 func TestReplaceElementPreservesAnchoredCommentAcrossTagChange(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()
@@ -388,19 +388,20 @@ func TestReplaceElementPreservesAnchoredCommentAcrossTagChange(t *testing.T) {
 		t.Fatalf("replace: %v", err)
 	}
 
-	// v2 must still contain the old aid (so the anchor's selector resolves).
+	// v2 immediately contains the canonical replacement aid.
 	v2, err := docs.Render(ctx, "anchored", 2)
 	if err != nil || v2 == nil {
 		t.Fatalf("render v2: data=%v err=%v", v2, err)
 	}
-	if !strings.Contains(v2.HTML, `data-odoc-aid="`+oldAID+`"`) {
-		t.Fatalf("v2 dropped the preserved aid %q: %q", oldAID, v2.HTML)
+	canonicalAID := core.StampAids(`<figure class="odoc-artifact"><p>brand new</p></figure>`).AIDs[0].AID
+	if !strings.Contains(v2.HTML, `data-odoc-aid="`+canonicalAID+`"`) {
+		t.Fatalf("v2 dropped canonical aid %q: %q", canonicalAID, v2.HTML)
 	}
 	if !strings.Contains(v2.HTML, "<figure") || strings.Contains(v2.HTML, "<section") {
 		t.Fatalf("v2 did not apply the tag-changing replacement: %q", v2.HTML)
 	}
 
-	// The comment must still be element-anchored to oldAID, NOT lost.
+	// The comment uses canonical identity, with oldAID retained for this pinned DOM.
 	snaps, err := comments.List(ctx, "anchored", 2)
 	if err != nil {
 		t.Fatalf("list comments: %v", err)
@@ -416,8 +417,8 @@ func TestReplaceElementPreservesAnchoredCommentAcrossTagChange(t *testing.T) {
 	if got == "" && a.Selector != "" {
 		got = a.Selector // selector carries [data-odoc-aid="..."] after a reconcile rebind
 	}
-	if !strings.Contains(got, oldAID) {
-		t.Fatalf("comment anchor lost the aid: kind=%q aid=%q selector=%q", a.Kind, a.AID, a.Selector)
+	if strings.Contains(got, oldAID) {
+		t.Fatalf("comment anchor was not canonically migrated: %+v", a)
 	}
 }
 
@@ -462,14 +463,15 @@ func TestReplaceElementRejectsBareNonAddressableRoot(t *testing.T) {
 	if err != nil || v2 == nil {
 		t.Fatalf("render v2: data=%v err=%v", v2, err)
 	}
-	if !strings.Contains(v2.HTML, `data-odoc-aid="`+oldAID+`"`) {
-		t.Fatalf("opt-in div root did not carry the preserved aid: %q", v2.HTML)
+	canonicalAID := core.StampAids(`<div class="odoc-artifact">brand new</div>`).AIDs[0].AID
+	if !strings.Contains(v2.HTML, `data-odoc-aid="`+canonicalAID+`"`) {
+		t.Fatalf("opt-in div root did not carry canonical aid: %q", v2.HTML)
 	}
 }
 
 // issue-21 P1(2): a self-closing void (<img/>) is a valid replacement root. The
-// backend injects the old aid before the trailing slash and re-stamps preserving
-// it, so v2 carries a well-formed single-slash <img .../> with the aid and the
+// backend injects the canonical aid before the trailing slash, so v2 carries a
+// well-formed single-slash <img .../> with the canonical identity and the
 // anchored comment stays element-anchored to it.
 func TestReplaceElementPreservesAnchorForSelfClosingRoot(t *testing.T) {
 	store := memory.New()
@@ -505,7 +507,7 @@ func TestReplaceElementPreservesAnchorForSelfClosingRoot(t *testing.T) {
 	if err != nil || v2 == nil {
 		t.Fatalf("render v2: data=%v err=%v", v2, err)
 	}
-	if !strings.Contains(v2.HTML, `<img src="a.png" alt="x" data-odoc-aid="`+oldAID+`"/>`) {
+	if !strings.Contains(v2.HTML, `<img src="a.png" alt="x" data-odoc-aid="`+core.StampAids(`<img src="a.png" alt="x"/>`).AIDs[0].AID+`"/>`) {
 		t.Fatalf("self-closing root not reconstructed with single slash + preserved aid: %q", v2.HTML)
 	}
 	if strings.Contains(v2.HTML, `/ data-odoc-aid`) {
@@ -527,8 +529,8 @@ func TestReplaceElementPreservesAnchorForSelfClosingRoot(t *testing.T) {
 	if got == "" && a.Selector != "" {
 		got = a.Selector
 	}
-	if !strings.Contains(got, oldAID) {
-		t.Fatalf("comment anchor lost the aid: kind=%q aid=%q selector=%q", a.Kind, a.AID, a.Selector)
+	if strings.Contains(got, oldAID) {
+		t.Fatalf("comment anchor was not canonically migrated: %+v", a)
 	}
 }
 
@@ -551,8 +553,8 @@ func TestReplaceElementAcceptsSelfClosingForeignRoot(t *testing.T) {
 				t.Fatalf("replace %q: %v", replacement, err)
 			}
 
-			view, err := docs.GetElement(ctx, "svgroot", 2, oldAID)
-			if err != nil || view == nil || view.Tag != "svg" || view.HTML != `<svg data-odoc-aid="`+oldAID+`"/>` {
+			view, err := docs.GetElement(ctx, "svgroot", 2, core.StampAids(replacement).AIDs[0].AID)
+			if err != nil || view == nil || view.Tag != "svg" || view.HTML != core.StampAids(replacement).HTML {
 				t.Fatalf("GetElement v2 = view=%v err=%v", view, err)
 			}
 			v2, err := docs.Render(ctx, "svgroot", 2)
@@ -560,11 +562,11 @@ func TestReplaceElementAcceptsSelfClosingForeignRoot(t *testing.T) {
 				t.Fatalf("render v2 = data=%v err=%v", v2, err)
 			}
 
-			if _, err := docs.ReplaceElement(ctx, "svgroot", 2, oldAID, `<svg width="9"/>`); err != nil {
+			if _, err := docs.ReplaceElement(ctx, "svgroot", 2, core.StampAids(replacement).AIDs[0].AID, `<svg width="9"/>`); err != nil {
 				t.Fatalf("second replace: %v", err)
 			}
-			view, err = docs.GetElement(ctx, "svgroot", 3, oldAID)
-			if err != nil || view == nil || view.HTML != `<svg width="9" data-odoc-aid="`+oldAID+`"/>` {
+			view, err = docs.GetElement(ctx, "svgroot", 3, core.StampAids(`<svg width="9"/>`).AIDs[0].AID)
+			if err != nil || view == nil || view.HTML != core.StampAids(`<svg width="9"/>`).HTML {
 				t.Fatalf("GetElement v3 = view=%v err=%v", view, err)
 			}
 
@@ -603,11 +605,8 @@ func firstAID(t *testing.T, docs *service.DocService, slug string, version int) 
 	return rd.HTML[start : start+end]
 }
 
-// Honest contract continuity: on a SUPPORTED (naturally harvestable) root the
-// pinned aid survives a GetElement, a SECOND ReplaceElement, AND a later plain
-// Publish. We use a stampable <figure> root; because the stamper re-harvests it
-// on every plain re-stamp, no persistent marker is needed and the anchored
-// comment stays element-anchored through v4.
+// ReplaceElement records the replacement root's canonical identity immediately,
+// while retaining the pinned identity as a bounded overlay fallback for that version.
 func TestSupportedRootStaysAddressableAcrossPlainRestamp(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()
@@ -616,11 +615,15 @@ func TestSupportedRootStaysAddressableAcrossPlainRestamp(t *testing.T) {
 	ctx := context.Background()
 
 	if _, err := docs.Publish(ctx, service.PublishInput{
-		Slug: "keepfig", HTML: "<html><body><section><p>old</p></section></body></html>",
+		Slug: "keepfig", HTML: "<html><body><section><p>other</p></section><section><p>old</p></section></body></html>",
 	}); err != nil {
 		t.Fatalf("publish v1: %v", err)
 	}
-	oldAID := firstAID(t, docs, "keepfig", 1)
+	v1, err := docs.Render(ctx, "keepfig", 1)
+	if err != nil || v1 == nil {
+		t.Fatalf("render v1: data=%v err=%v", v1, err)
+	}
+	oldAID := core.StampAids("<section><p>old</p></section>").AIDs[0].AID
 
 	if res, err := comments.Create(ctx, "keepfig", &core.Author{Login: "u"}, "note",
 		&core.Anchor{Kind: "element", AID: oldAID}, 1); err != nil || res.Status != 200 {
@@ -633,18 +636,19 @@ func TestSupportedRootStaysAddressableAcrossPlainRestamp(t *testing.T) {
 		t.Fatalf("replace to figure (v2): %v", err)
 	}
 	v2snaps, err := comments.List(ctx, "keepfig", 2)
+	canonicalV2 := core.StampAids("<figure>brand new</figure>").AIDs[0].AID
 	if err != nil || len(v2snaps) != 1 || v2snaps[0].Anchor == nil ||
-		v2snaps[0].Anchor.Fingerprint == nil || v2snaps[0].Anchor.Fingerprint.Tag != "figure" {
-		t.Fatalf("v2 anchor fingerprint was not refreshed to figure: snaps=%+v err=%v", v2snaps, err)
+		v2snaps[0].Anchor.Fingerprint == nil || v2snaps[0].Anchor.Fingerprint.Tag != "figure" ||
+		v2snaps[0].Anchor.AID != canonicalV2 {
+		t.Fatalf("v2 anchor did not migrate to canonical identity with pinned fallback: snaps=%+v err=%v", v2snaps, err)
 	}
-	view, err := docs.GetElement(ctx, "keepfig", 2, oldAID)
+	view, err := docs.GetElement(ctx, "keepfig", 2, canonicalV2)
 	if err != nil || view == nil || view.Tag != "figure" || !strings.Contains(view.HTML, "brand new") {
 		t.Fatalf("GetElement v2 = view=%v err=%v; want the pinned figure", view, err)
 	}
 
-	// Second ReplaceElement by the SAME old aid must edit the figure and carry the
-	// aid forward (v3).
-	if _, err := docs.ReplaceElement(ctx, "keepfig", 2, oldAID, "<figure>edited twice</figure>"); err != nil {
+	// A second ReplaceElement by the current canonical aid edits the same figure.
+	if _, err := docs.ReplaceElement(ctx, "keepfig", 2, canonicalV2, "<figure>edited twice</figure>"); err != nil {
 		t.Fatalf("second replace (v3): %v", err)
 	}
 	v3, err := docs.Render(ctx, "keepfig", 3)
@@ -654,42 +658,53 @@ func TestSupportedRootStaysAddressableAcrossPlainRestamp(t *testing.T) {
 	if !strings.Contains(v3.HTML, "edited twice") || strings.Contains(v3.HTML, "brand new") {
 		t.Fatalf("second replace edited the wrong element: %q", v3.HTML)
 	}
-	if !strings.Contains(v3.HTML, `data-odoc-aid="`+oldAID+`"`) {
-		t.Fatalf("v3 dropped the preserved aid %q: %q", oldAID, v3.HTML)
+	canonicalV3 := core.StampAids("<figure>edited twice</figure>").AIDs[0].AID
+	if !strings.Contains(v3.HTML, `data-odoc-aid="`+canonicalV3+`"`) {
+		t.Fatalf("v3 dropped canonical aid %q: %q", canonicalV3, v3.HTML)
 	}
 
-	// A subsequent PLAIN publish (v4) re-stamps the whole doc via StampAids. The
-	// figure is stampable, so it is re-harvested and content-addressed: its aid may
-	// change (content differs), but the anchored comment REBINDS to it by fingerprint
-	// (tag + nearest heading) rather than going lost — the honest continuity
-	// guarantee for a supported root.
-	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "keepfig", HTML: v3.HTML}); err != nil {
-		t.Fatalf("plain publish v4: %v", err)
+	// Replace the unrelated same-tag section. The figure anchor must remain exact;
+	// tag-only reconciliation would be ambiguous here.
+	otherAID := core.StampAids("<section><p>other</p></section>").AIDs[0].AID
+	if _, err := docs.ReplaceElement(ctx, "keepfig", 3, otherAID, "<section><p>other changed</p></section>"); err != nil {
+		t.Fatalf("unrelated replace v4: %v", err)
 	}
-	figAIDv4 := firstAID(t, docs, "keepfig", 4)
-	if view, err := docs.GetElement(ctx, "keepfig", 4, figAIDv4); err != nil || view == nil || view.Tag != "figure" {
-		t.Fatalf("GetElement v4 = view=%v err=%v; want the figure still addressable", view, err)
+	figAID := core.StampAids("<figure>edited twice</figure>").AIDs[0].AID
+	immediate, err := comments.List(ctx, "keepfig", 4)
+	if err != nil || len(immediate) != 1 || immediate[0].Anchor == nil || immediate[0].Anchor.AID != figAID {
+		t.Fatalf("anchor drifted on unrelated replacement: snaps=%+v err=%v", immediate, err)
 	}
 
-	snaps, err := comments.List(ctx, "keepfig", 4)
+	v4, err := docs.Render(ctx, "keepfig", 4)
+	if err != nil || v4 == nil {
+		t.Fatalf("render v4: data=%v err=%v", v4, err)
+	}
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "keepfig", HTML: v4.HTML}); err != nil {
+		t.Fatalf("plain publish v5: %v", err)
+	}
+	if view, err := docs.GetElement(ctx, "keepfig", 5, figAID); err != nil || view == nil || view.Tag != "figure" {
+		t.Fatalf("GetElement v5 = view=%v err=%v; want the figure still addressable", view, err)
+	}
+
+	snaps, err := comments.List(ctx, "keepfig", 5)
 	if err != nil {
-		t.Fatalf("list comments v4: %v", err)
+		t.Fatalf("list comments v5: %v", err)
 	}
 	if len(snaps) != 1 {
 		t.Fatalf("comment count = %d; want 1", len(snaps))
 	}
 	a := snaps[0].Anchor
 	if a == nil || a.Kind != "element" {
-		t.Fatalf("comment anchor = %+v; want element-anchored (rebound, not lost) at v4", a)
+		t.Fatalf("comment anchor = %+v; want element-anchored (not lost) at v5", a)
 	}
-	// Rebound to the figure's current aid at v4 (the only figure in the doc).
+	// Canonical identity remains the exact figure through the plain restamp.
 	got := a.AID
 	if got == "" && a.Selector != "" {
 		got = a.Selector
 	}
-	if !strings.Contains(got, figAIDv4) {
-		t.Fatalf("comment did not rebind to the figure at v4: kind=%q aid=%q selector=%q want %q",
-			a.Kind, a.AID, a.Selector, figAIDv4)
+	if !strings.Contains(got, figAID) {
+		t.Fatalf("comment did not remain on the figure at v5: kind=%q aid=%q selector=%q want %q",
+			a.Kind, a.AID, a.Selector, figAID)
 	}
 }
 
@@ -856,5 +871,75 @@ func TestReplaceElementDataOdocLiteralInValueOrTextAccepted(t *testing.T) {
 	nestedOptIn := `<div><span class="odoc-artifact">nested</span></div>`
 	if _, err := docs.ReplaceElement(ctx, "odoclit", 2, aid2, nestedOptIn); err == nil {
 		t.Fatal("nested opt-in on bare root: want validation error, got nil")
+	}
+}
+
+func TestReplaceElementRejectsDuplicateCanonicalIdentity(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+	ctx := context.Background()
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "dupcanonical", HTML: `<section>target</section><figure>blue</figure>`}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	target := core.StampAids(`<section>target</section>`).AIDs[0].AID
+	if _, err := docs.ReplaceElement(ctx, "dupcanonical", 1, target, `<figure>blue</figure>`); err == nil || !strings.Contains(err.Error(), "canonical aid is ambiguous") {
+		t.Fatalf("duplicate canonical replacement error = %v", err)
+	}
+}
+
+func TestReplaceElementDoesNotResurrectLostAnchor(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+	ctx := context.Background()
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "lostreplace", HTML: `<section>old</section>`}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	oldAID := core.StampAids(`<section>old</section>`).AIDs[0].AID
+	res, err := comments.Create(ctx, "lostreplace", &core.Author{Login: "u"}, "note", &core.Anchor{Kind: "lost", Reason: "no_candidate", AID: oldAID}, 1)
+	if err != nil || res.Status != 200 {
+		t.Fatalf("create: status=%d err=%v", res.Status, err)
+	}
+	if _, err := docs.ReplaceElement(ctx, "lostreplace", 1, oldAID, `<figure>blue</figure>`); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	snaps, err := comments.List(ctx, "lostreplace", 2)
+	if err != nil || len(snaps) != 1 || snaps[0].Anchor == nil || snaps[0].Anchor.Kind != "lost" {
+		t.Fatalf("lost anchor resurrected: snaps=%+v err=%v", snaps, err)
+	}
+}
+
+func TestCommentCreatedAfterReplacementKeepsCanonicalAnchor(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+	ctx := context.Background()
+	if _, err := docs.Publish(ctx, service.PublishInput{Slug: "postreplace", HTML: `<section>other</section><section>old</section>`}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	oldAID := core.StampAids(`<section>old</section>`).AIDs[0].AID
+	if _, err := docs.ReplaceElement(ctx, "postreplace", 1, oldAID, `<figure>blue</figure>`); err != nil {
+		t.Fatalf("replace target: %v", err)
+	}
+	canonicalAID := core.StampAids(`<figure>blue</figure>`).AIDs[0].AID
+	res, err := comments.Create(ctx, "postreplace", &core.Author{Login: "u"}, "after", &core.Anchor{Kind: "element", AID: canonicalAID}, 2)
+	if err != nil || res.Status != 200 {
+		t.Fatalf("create: status=%d err=%v", res.Status, err)
+	}
+	otherAID := core.StampAids(`<section>other</section>`).AIDs[0].AID
+	if _, err := docs.ReplaceElement(ctx, "postreplace", 2, otherAID, `<section>changed</section>`); err != nil {
+		t.Fatalf("replace unrelated: %v", err)
+	}
+	snaps, err := comments.List(ctx, "postreplace", 3)
+	if err != nil || len(snaps) != 1 || snaps[0].Anchor == nil || snaps[0].Anchor.Kind != "element" || snaps[0].Anchor.AID != canonicalAID {
+		t.Fatalf("post-replacement comment drifted: snaps=%+v err=%v", snaps, err)
+	}
+	v1, err := comments.List(ctx, "postreplace", 1)
+	if err != nil || len(v1) != 0 {
+		t.Fatalf("version folding exposed later comment in v1: snaps=%+v err=%v", v1, err)
 	}
 }

@@ -128,6 +128,7 @@ type PublishInput struct {
 	mountContextKnown bool
 	pinnedAID         string
 	pinnedTag         string
+	anchorMigrations  map[string]string
 }
 
 // PublishResult is the result of a successful publish.
@@ -238,7 +239,7 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		return nil, err
 	}
 
-	merge, err := s.comments.PublishMergeLocked(ctx, in.Slug, in.LocalComments, stamped.AIDs, version, in.pinnedAID, in.pinnedTag)
+	merge, err := s.comments.PublishMergeWithMigrationsLocked(ctx, in.Slug, in.LocalComments, stamped.AIDs, version, in.pinnedAID, in.pinnedTag, in.anchorMigrations)
 	if err != nil {
 		return nil, err
 	}
@@ -390,19 +391,32 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 		if int64(len(replaced)) > s.maxBytes {
 			return apperr.PayloadTooLarge(fmt.Sprintf("document exceeds %d bytes", s.maxBytes), "html_too_large")
 		}
-		// Stamp here (publishLocked expects a stamped result) and publish without
-		// re-acquiring the lock (Publish would deadlock via nested lock.With). Pin ONLY
-		// the replacement root to the injected old aid so it keeps its identity and its
-		// comment anchor is refreshed atomically across this tag/content change. The root
-		// '<' sits at boundary+localRoot (localRoot accounts for leading whitespace);
-		// every other element rehashes normally.
-		stamped := core.StampAidsPinned(replaced, aid, boundary+localRoot)
+		// Emit the replacement root's canonical content identity immediately. Pinning
+		// that canonical AID at the exact replacement offset salts any other collision
+		// away while every unrelated artifact is stamped normally.
+		rootCanonical := core.StampAids(newHTML)
+		if len(rootCanonical.AIDs) == 0 {
+			return apperr.Validation("new_html root has no canonical aid", "new_html_root_not_addressable")
+		}
+		canonicalAID := rootCanonical.AIDs[0].AID
+		canonical := core.StampAids(replaced)
+		matches := 0
+		for _, artifact := range canonical.AIDs {
+			if artifact.AID == canonicalAID {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return apperr.Validation("replacement canonical aid is ambiguous", "new_html_canonical_aid_ambiguous")
+		}
+		stamped := core.StampAidsPinned(replaced, canonicalAID, boundary+localRoot)
 		in, ierr := s.existingPublishInput(ctx, slug, replaced, "")
 		if ierr != nil {
 			return ierr
 		}
 		in.pinnedAID = aid
 		in.pinnedTag, _ = core.SingleTopLevelTag(newHTML)
+		in.anchorMigrations = map[string]string{aid: canonicalAID}
 		r, perr := s.publishLocked(ctx, in, stamped)
 		if perr != nil {
 			return perr

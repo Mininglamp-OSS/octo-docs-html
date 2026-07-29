@@ -259,7 +259,7 @@ func TestAgentElementReplaceDataOdocOnlyInValueOrTextAccepted(t *testing.T) {
 
 // issue-21: a comment whose anchor is an ELEMENT anchor pointing at the replaced
 // aid must stay anchored to that SAME aid across the republish. The backend
-// injects the old aid onto the replacement root and re-stamps preserving it, so
+// emits the replacement root canonical aid immediately, so
 // the element keeps its identity and the anchor never drifts to a new aid or
 // goes lost. (The prior test only exercised a text anchor and only asserted the
 // text was still readable, which does not prove element-anchor persistence.)
@@ -315,8 +315,8 @@ func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 		if c.Anchor.Kind != "element" {
 			t.Errorf("anchor kind = %q; want element (aid preserved across replace): %s", c.Anchor.Kind, list)
 		}
-		if c.Anchor.AID != aid {
-			t.Errorf("anchor aid = %q; want the preserved aid %q: %s", c.Anchor.AID, aid, list)
+		if c.Anchor.AID == aid {
+			t.Errorf("anchor was not migrated to canonical aid with pinned fallback %q: %s", aid, list)
 		}
 	}
 	if !found {
