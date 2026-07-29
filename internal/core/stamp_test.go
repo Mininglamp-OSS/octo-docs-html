@@ -336,6 +336,55 @@ func TestSafeReplacementFragment(t *testing.T) {
 	}
 }
 
+func TestSafeReplacementFragmentDuplicateSinkFirstWins(t *testing.T) {
+	tests := []struct {
+		name, safeFirst, unsafeFirst string
+	}{
+		{"href", `<a href="https://safe" href="javascript:alert(1)">x</a>`, `<a href="javascript:alert(1)" href="https://safe">x</a>`},
+		{"src", `<img src="safe.png" src="javascript:alert(1)">`, `<img src="javascript:alert(1)" src="safe.png">`},
+		{"xlink href", `<svg><a xlink:href="https://safe" xlink:href="javascript:alert(1)">x</a></svg>`, `<svg><a xlink:href="javascript:alert(1)" xlink:href="https://safe">x</a></svg>`},
+		{"action", `<form action="/safe" action="javascript:alert(1)"></form>`, `<form action="javascript:alert(1)" action="/safe"></form>`},
+		{"formaction", `<button formaction="/safe" formaction="javascript:alert(1)">x</button>`, `<button formaction="javascript:alert(1)" formaction="/safe">x</button>`},
+		{"object data", `<object data="/safe" data="javascript:alert(1)"></object>`, `<object data="javascript:alert(1)" data="/safe"></object>`},
+		{"srcdoc", `<iframe srcdoc="" srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"></iframe>`, `<iframe srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;" srcdoc=""></iframe>`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, ok := SafeReplacementFragment(tt.safeFirst); !ok {
+				t.Errorf("safe first duplicate rejected: %q", tt.safeFirst)
+			}
+			if _, ok := SafeReplacementFragment(tt.unsafeFirst); ok {
+				t.Errorf("unsafe first duplicate accepted: %q", tt.unsafeFirst)
+			}
+		})
+	}
+}
+
+func TestSafeReplacementFragmentForeignBreakoutNamespace(t *testing.T) {
+	pass := `<svg><p><set attributeName="href" to="javascript:prose"></set></p></svg>`
+	if _, ok := SafeReplacementFragment(pass); !ok {
+		t.Fatalf("HTML set after SVG breakout rejected: %q", pass)
+	}
+	for _, fragment := range []string{
+		`<svg><set attributeName="href" to="javascript:alert(1)"></set></svg>`,
+		`<svg><g><set attributeName="href" to="javascript:alert(1)"></set></g></svg>`,
+		`<svg><foreignObject><svg><set attributeName="href" to="javascript:alert(1)"></set></svg></foreignObject></svg>`,
+	} {
+		if _, ok := SafeReplacementFragment(fragment); ok {
+			t.Errorf("true SVG assignment accepted: %q", fragment)
+		}
+	}
+
+	opens := scanOpenTags(`<svg><g><p></p><set attributeName="href" to="javascript:prose"></set></g></svg>`)
+	for _, open := range opens {
+		if open.tag == "p" || open.tag == "set" {
+			if open.namespace != namespaceHTML {
+				t.Errorf("%s namespace = %v, want HTML after breakout", open.tag, open.namespace)
+			}
+		}
+	}
+}
+
 func TestStampAidsMathMLAnnotationXMLDirectSVG(t *testing.T) {
 	in := `<body><math><annotation-xml><svg><foreignObject><section/><figure>inside</figure></section><aside>html-sibling</aside></foreignObject><section/><figure>svg-sibling</figure></svg><figure>math-sibling</figure></annotation-xml></math><figure>after</figure></body>`
 	res := StampAids(in)

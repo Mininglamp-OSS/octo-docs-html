@@ -88,6 +88,7 @@ type parsedOpenTag struct {
 	attrs                string
 	namespace            contentNamespace
 	annotationHTML       bool
+	foreignPopped        bool
 }
 
 type scanStats struct {
@@ -723,12 +724,14 @@ func unsafeReplacementAttrs(s string) bool {
 		attrs := make(map[string][]string)
 		unsafe := false
 		forEachAttr(open.attrs, func(name, value string) {
-			// Browsers keep the first duplicate attribute on an element.
-			if _, exists := attrs[name]; !exists {
-				attrs[name] = []string{value}
+			// The tokenizer drops duplicate attributes; no sink may inspect a value
+			// the browser will not retain.
+			if _, exists := attrs[name]; exists {
+				return
 			}
+			attrs[name] = []string{value}
 			if name == "srcdoc" {
-				unsafe = true
+				unsafe = value != ""
 				return
 			}
 			switch name {
@@ -1359,6 +1362,9 @@ func commentEnd(s string, lt int) int {
 
 // namespaceForChild applies the foreign-content integration-point rules.
 func namespaceForChild(parent parsedOpenTag, childTag string) contentNamespace {
+	if parent.foreignPopped {
+		return namespaceHTML
+	}
 	base := parent.namespace
 	switch parent.namespace {
 	case namespaceSVG:
@@ -1389,6 +1395,25 @@ func namespaceForChild(parent parsedOpenTag, childTag string) contentNamespace {
 		}
 	}
 	return base
+}
+
+// foreignBreakoutStart reports start tags that the HTML parser reprocesses in
+// the HTML namespace after popping active foreign content.
+func foreignBreakoutStart(tag, attrs string) bool {
+	switch tag {
+	case "b", "big", "blockquote", "body", "br", "center", "code", "dd", "div", "dl", "dt",
+		"em", "embed", "h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i", "img",
+		"li", "listing", "menu", "meta", "nobr", "ol", "p", "pre", "ruby", "s", "small",
+		"span", "strong", "strike", "sub", "sup", "table", "tt", "u", "ul", "var":
+		return true
+	case "font":
+		for _, name := range []string{"color", "face", "size"} {
+			if _, ok := attrValue(attrs, name); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func scanOpenTags(s string) []parsedOpenTag {
@@ -1475,6 +1500,14 @@ func scanOpenTagsWithStats(s string, stats *scanStats) []parsedOpenTag {
 		ns := namespaceHTML
 		if len(stack) > 0 {
 			ns = namespaceForChild(opens[stack[len(stack)-1]], tag)
+			if ns != namespaceHTML && foreignBreakoutStart(tag, attrs) {
+				// These source frames remain for close-boundary accounting, but are
+				// no longer active foreign parser nodes after token reprocessing.
+				for pos := len(stack) - 1; pos >= 0 && namespaceForChild(opens[stack[pos]], tag) != namespaceHTML; pos-- {
+					opens[stack[pos]].foreignPopped = true
+				}
+				ns = namespaceHTML
+			}
 		} else if tag == "svg" {
 			ns = namespaceSVG
 		} else if tag == "math" {
