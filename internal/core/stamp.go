@@ -115,8 +115,6 @@ const wsClass = `[` + jsSpace + `]`
 
 var (
 	dataOdocAttrRe  = regexp.MustCompile(wsClass + `data-odoc-[\w-]+` + wsClass + `*=` + wsClass + `*"[^"]*"`)
-	dataOdocAidRe   = regexp.MustCompile(wsClass + `+data-odoc-aid` + wsClass + `*=` + wsClass + `*"[^"]*"`)
-	dataOdocAidRe2  = regexp.MustCompile(wsClass + `data-odoc-aid` + wsClass + `*=` + wsClass + `*"[^"]*"`)
 	htmlCommentRe   = regexp.MustCompile(`(?s)<!--.*?-->`)
 	whitespaceRunRe = regexp.MustCompile(wsClass + `+`)
 	tagStripRe      = regexp.MustCompile(`<[^>]+>`)
@@ -494,6 +492,97 @@ func forEachAttrName(attrs string, fn func(name string)) {
 			}
 		}
 	}
+}
+
+// stripAttribute removes every case-insensitive occurrence of target from an
+// open-tag attribute slice, including quoted, unquoted, and valueless forms.
+func stripAIDAttribute(attrs string) string {
+	var out strings.Builder
+	cursor := 0
+	i := 0
+	for i < len(attrs) {
+		for i < len(attrs) && (isASCIISpace(attrs[i]) || attrs[i] == '/') {
+			i++
+		}
+		if i >= len(attrs) {
+			break
+		}
+		nameStart := i
+		for i < len(attrs) && !isASCIISpace(attrs[i]) && attrs[i] != '=' && attrs[i] != '/' {
+			i++
+		}
+		if i == nameStart {
+			i++
+			continue
+		}
+		nameEnd := i
+		for i < len(attrs) && isASCIISpace(attrs[i]) {
+			i++
+		}
+		valueEnd := nameEnd
+		if i < len(attrs) && attrs[i] == '=' {
+			i++
+			for i < len(attrs) && isASCIISpace(attrs[i]) {
+				i++
+			}
+			if i < len(attrs) && (attrs[i] == '"' || attrs[i] == '\'') {
+				quote := attrs[i]
+				i++
+				for i < len(attrs) && attrs[i] != quote {
+					i++
+				}
+				if i < len(attrs) {
+					i++
+				}
+			} else {
+				for i < len(attrs) && !isASCIISpace(attrs[i]) {
+					if attrs[i] == '/' && (i+1 == len(attrs) || isASCIISpace(attrs[i+1])) {
+						break
+					}
+					i++
+				}
+			}
+			valueEnd = i
+			if valueEnd < len(attrs) && attrs[valueEnd] == '/' {
+				i++ // leave the slash outside the removed attribute
+			}
+		}
+		if strings.EqualFold(attrs[nameStart:nameEnd], "data-odoc-aid") {
+			removeStart := nameStart
+			for removeStart > cursor && isASCIISpace(attrs[removeStart-1]) {
+				removeStart--
+			}
+			out.WriteString(attrs[cursor:removeStart])
+			cursor = valueEnd
+		}
+	}
+	out.WriteString(attrs[cursor:])
+	return out.String()
+}
+
+func stripNonArtifactAIDs(html string) string {
+	opens := scanOpenTags(html)
+	var out strings.Builder
+	cursor := 0
+	for _, open := range opens {
+		if isStampableTag(open.tag) || classTokenMatch(open.attrs, "odoc-artifact") {
+			continue
+		}
+		cleaned := stripAIDAttribute(open.attrs)
+		if cleaned == open.attrs {
+			continue
+		}
+		attrsStart := open.start + 1 + len(open.origTag)
+		attrsEnd := open.openEnd - 1
+		out.WriteString(html[cursor:attrsStart])
+		out.WriteString(cleaned)
+		cursor = attrsEnd
+	}
+	if cursor == 0 {
+		return html
+	}
+	out.WriteString(html[cursor:])
+	return out.String()
 }
 
 func hasEventHandlerAttr(s string) bool {
@@ -1397,6 +1486,22 @@ func StampAidsPinned(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 // element whose open tag starts there is force-harvested and keeps pinnedAID
 // instead of a content hash.
 func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
+	pinnedOrdinal := -1
+	if pinnedAID != "" && pinnedOffset >= 0 {
+		for i, open := range scanOpenTags(rawHTML) {
+			if open.start == pinnedOffset {
+				pinnedOrdinal = i
+				break
+			}
+		}
+	}
+	rawHTML = stripNonArtifactAIDs(rawHTML)
+	if pinnedOrdinal >= 0 {
+		opens := scanOpenTags(rawHTML)
+		if pinnedOrdinal < len(opens) {
+			pinnedOffset = opens[pinnedOrdinal].start
+		}
+	}
 	headings := collectHeadings(rawHTML)
 	opens := scanOpenTags(rawHTML)
 	nearestHeadingAt := func(idx int) *string {
@@ -1448,8 +1553,8 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 	aids := []StampedArtifact{}
 	elements := make([]stampElement, 0, len(harvested))
 	for _, e := range harvested {
-		cleanedAttrs := dataOdocAidRe.ReplaceAllString(e.attrs, "")
-		cleanedInner := dataOdocAidRe2.ReplaceAllString(e.innerHTML, "")
+		cleanedAttrs := stripAIDAttribute(e.attrs)
+		cleanedInner := e.innerHTML
 		var aid string
 		if effectivePinned != "" && e.openStart == pinnedOffset {
 			aid = pinnedAID // pin exactly the replacement root for this stamp
@@ -1494,7 +1599,7 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 			// Strip any trailing self-close slash from cleanedAttrs so we don't emit a
 			// stray '/' before data-odoc-aid, then re-add exactly one closing slash for
 			// a self-terminated void tag: <img ... data-odoc-aid="x"/>.
-			attrs := trimTrailingASCIISpace(dataOdocAidRe.ReplaceAllString(stripTerminalSelfClose(e.attrs), ""))
+			attrs := trimTrailingASCIISpace(stripAIDAttribute(stripTerminalSelfClose(e.attrs)))
 			selfClose := ""
 			if terminalSelfCloseSlash(e.attrs) >= 0 {
 				selfClose = "/"
@@ -1509,7 +1614,7 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 			// so self-closing semantics survive: <path ... data-odoc-aid="x"/>. HTML
 			// non-void <section/> never reaches here — not in foreign content and it
 			// spans to a real close (closeEnd > openEnd) — so it stays non-self-closing.
-			attrs := trimTrailingASCIISpace(dataOdocAidRe.ReplaceAllString(stripTerminalSelfClose(e.attrs), ""))
+			attrs := trimTrailingASCIISpace(stripAIDAttribute(stripTerminalSelfClose(e.attrs)))
 			stampedOpen = "<" + name + attrs + ` data-odoc-aid="` + e.aid + `"/>`
 		} else {
 			stampedOpen = "<" + name + trimTrailingASCIISpace(e.cleanedAttrs) + ` data-odoc-aid="` + e.aid + `">`

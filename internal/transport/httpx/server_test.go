@@ -617,6 +617,33 @@ func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCommentMutationRejectsFutureAndDuplicateVersions(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	if rec := do(t, h, http.MethodPost, "/v1/docs", auth,
+		`{"slug":"strict-versions","html":"<html><body><section>v1</section></body></html>"}`); rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+	payloads := []string{
+		`{"slug":"strict-versions","text":"future","version":999999}`,
+		`{"slug":"strict-versions","text":"duplicate","version":1,"version":999999}`,
+		`{"slug":"strict-versions","text":"nested duplicate","version":1,"anchor":{"kind":"element","aid":"a","aid":"b"}}`,
+	}
+	for _, payload := range payloads {
+		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("payload %s = %d, want 400: %s", payload, rec.Code, rec.Body.String())
+		}
+	}
+	rec := do(t, h, http.MethodGet, "/v1/comments?slug=strict-versions&version=all", authorHdrNoCT(), "")
+	var listed struct {
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil || len(listed.Data) != 0 {
+		t.Fatalf("rejected mutations persisted: data=%s err=%v", rec.Body.String(), err)
+	}
+}
+
 func TestForkExport(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()

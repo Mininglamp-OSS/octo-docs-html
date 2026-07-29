@@ -1,7 +1,9 @@
 package httpx
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -73,7 +75,11 @@ func decodeCommentMutation(w http.ResponseWriter, r *http.Request, body any) err
 		return apperr.Validation("invalid request body", "invalid_body")
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
-	decoder := json.NewDecoder(r.Body)
+	data, err := io.ReadAll(r.Body)
+	if err != nil || rejectDuplicateJSONKeys(data) != nil {
+		return apperr.Validation("invalid request body", "invalid_body")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(body); err != nil {
 		return apperr.Validation("invalid request body", "invalid_body")
 	}
@@ -82,6 +88,61 @@ func decodeCommentMutation(w http.ResponseWriter, r *http.Request, body any) err
 		return apperr.Validation("invalid request body", "invalid_body")
 	}
 	return nil
+}
+
+func rejectDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := inspectJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return fmt.Errorf("trailing JSON")
+	}
+	return nil
+}
+
+func inspectJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("invalid object key")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := inspectJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	case '[':
+		for decoder.More() {
+			if err := inspectJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	default:
+		return fmt.Errorf("unexpected delimiter")
+	}
 }
 
 // resolveMutationVersion turns the request's version selector into a CONCRETE
@@ -103,6 +164,17 @@ func (s *Server) resolveMutationVersion(r *http.Request, slug string, version mu
 	}
 	if version <= 0 {
 		return 1, nil
+	}
+	versions, err := s.docs.ListVersions(r.Context(), slug)
+	if err != nil {
+		return 0, err
+	}
+	latest := 1
+	if versions != nil && len(versions.Versions) > 0 {
+		latest = versions.Versions[len(versions.Versions)-1].N
+	}
+	if int(version) > latest {
+		return 0, apperr.Validation("version exceeds latest document version", "invalid_version")
 	}
 	return int(version), nil
 }

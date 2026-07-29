@@ -2072,6 +2072,43 @@ func TestIframeLegacyAIDIsReconciliationOnly(t *testing.T) {
 	}
 }
 
+func TestStampAidsStripsAllAIDAttributeForms(t *testing.T) {
+	forms := []string{
+		`data-odoc-aid="forged"`,
+		`data-odoc-aid='forged'`,
+		`data-odoc-aid=forged`,
+		`DATA-ODOC-AID="forged"`,
+		`data-odoc-aid`,
+		`data-odoc-aid class=x`,
+		`data-odoc-aid="first" data-odoc-aid='second'`,
+	}
+	for _, attrs := range forms {
+		t.Run(attrs, func(t *testing.T) {
+			first := StampAids(`<body><section ` + attrs + `>x</section></body>`)
+			if len(first.AIDs) != 1 {
+				t.Fatalf("aid count = %d: %q", len(first.AIDs), first.HTML)
+			}
+			want := `data-odoc-aid="` + first.AIDs[0].AID + `"`
+			if strings.Count(strings.ToLower(first.HTML), "data-odoc-aid") != 1 || !strings.Contains(first.HTML, want) || strings.Contains(first.HTML, "forged") {
+				t.Fatalf("forged aid survived: %q", first.HTML)
+			}
+			second := StampAids(first.HTML)
+			if second.HTML != first.HTML || second.AIDs[0].AID != first.AIDs[0].AID {
+				t.Fatalf("restamp changed canonical output:\n first %q\nsecond %q", first.HTML, second.HTML)
+			}
+		})
+	}
+
+	nested := StampAids(`<body><section><div data-odoc-aid='forged' class=x>x</div></section></body>`)
+	if strings.Contains(strings.ToLower(nested.HTML), "forged") || !strings.Contains(nested.HTML, `<div class=x>`) {
+		t.Fatalf("nested non-artifact aid was not safely stripped: %q", nested.HTML)
+	}
+	again := StampAids(nested.HTML)
+	if again.HTML != nested.HTML || len(again.AIDs) != 1 || again.AIDs[0].AID != nested.AIDs[0].AID {
+		t.Fatalf("nested strip was not idempotent: first=%q second=%q", nested.HTML, again.HTML)
+	}
+}
+
 func TestStampAidsMalformedAttributeQuoteRecovery(t *testing.T) {
 	tests := []struct {
 		name string
