@@ -2072,6 +2072,48 @@ func TestIframeLegacyAIDIsReconciliationOnly(t *testing.T) {
 	}
 }
 
+func TestStampAidsMalformedAttributeQuoteRecovery(t *testing.T) {
+	tests := []struct {
+		name string
+		html string
+		want int
+	}{
+		{
+			name: "quote becomes attribute-name character after quoted value",
+			html: `<html><body><div title="a"b">X</div><figure>REAL</figure><table><tr><td>T</td></tr></table></body></html>`,
+			want: 2,
+		},
+		{
+			name: "inch mark in malformed attribute name",
+			html: `<html><body><img src="s.png" alt="a 5" screen"><figure>ONE</figure><figure>TWO</figure></body></html>`,
+			want: 3,
+		},
+		{
+			name: "quoted value open through eof",
+			html: `<html><body><div title="BEFORE><figure>decoy</figure><table>T</table></body></html>`,
+			want: 0,
+		},
+		{
+			name: "slash before unterminated quoted attribute",
+			html: `<html><body><img/src="BEFORE><figure>decoy</figure><aside>decoy</aside></body></html>`,
+			want: 0,
+		},
+		{
+			name: "slash exits attribute name before malformed equals quote",
+			html: `<html><body><div a/=">X</div><figure>REAL</figure></body></html>`,
+			want: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := StampAids(tt.html)
+			if got := len(result.AIDs); got != tt.want {
+				t.Fatalf("artifact count = %d, want %d: %#v", got, tt.want, result.AIDs)
+			}
+		})
+	}
+}
+
 func BenchmarkStampAids4000Sections(b *testing.B) {
 	var doc strings.Builder
 	doc.WriteString(`<body>`)

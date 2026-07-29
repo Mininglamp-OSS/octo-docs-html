@@ -693,6 +693,50 @@ func TestSupportedRootStaysAddressableAcrossPlainRestamp(t *testing.T) {
 	}
 }
 
+func TestRecoverableMalformedQuotePreservesAnchoredArtifact(t *testing.T) {
+	store := memory.New()
+	locker := sluglock.NewMemory()
+	comments := service.NewCommentService(store, locker)
+	docs := service.NewDocService(store, store, comments, locker, "", 5<<20)
+	ctx := context.Background()
+
+	clean := `<html><body><figure>ONE</figure><figure>TWO</figure></body></html>`
+	result, err := docs.Publish(ctx, service.PublishInput{Slug: "recoverable-quote", HTML: clean})
+	if err != nil || result.AIDs != 2 {
+		t.Fatalf("publish v1: result=%+v err=%v", result, err)
+	}
+	rd, err := docs.Render(ctx, "recoverable-quote", 1)
+	if err != nil || rd == nil {
+		t.Fatalf("render v1: data=%v err=%v", rd, err)
+	}
+	needle := `<figure data-odoc-aid="`
+	first := strings.Index(rd.HTML, needle)
+	second := strings.Index(rd.HTML[first+len(needle):], needle)
+	if first < 0 || second < 0 {
+		t.Fatalf("v1 missing two figure aids: %q", rd.HTML)
+	}
+	second += first + 2*len(needle)
+	end := strings.IndexByte(rd.HTML[second:], '"')
+	if end < 0 {
+		t.Fatalf("v1 malformed second aid: %q", rd.HTML)
+	}
+	secondAID := rd.HTML[second : second+end]
+	anchor := &core.Anchor{Kind: "element", AID: secondAID, Fingerprint: &core.AnchorFingerprint{Tag: "figure"}}
+	if res, createErr := comments.Create(ctx, "recoverable-quote", &core.Author{Login: "u"}, "note", anchor, 1); createErr != nil || res.Status != 200 {
+		t.Fatalf("create comment: status=%d err=%v", res.Status, createErr)
+	}
+
+	malformed := `<html><body><img src="s.png" alt="a 5" screen"><figure>ONE</figure><figure>TWO</figure></body></html>`
+	result, err = docs.Publish(ctx, service.PublishInput{Slug: "recoverable-quote", HTML: malformed})
+	if err != nil || result.AIDs != 3 {
+		t.Fatalf("publish v2: result=%+v err=%v", result, err)
+	}
+	snaps, err := comments.List(ctx, "recoverable-quote", 2)
+	if err != nil || len(snaps) != 1 || snaps[0].Anchor == nil || snaps[0].Anchor.Kind != "element" {
+		t.Fatalf("v2 anchor was lost: snaps=%+v err=%v", snaps, err)
+	}
+}
+
 func TestMalformedOpenDoesNotPublishPhantomArtifacts(t *testing.T) {
 	store := memory.New()
 	locker := sluglock.NewMemory()

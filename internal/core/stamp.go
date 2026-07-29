@@ -217,24 +217,107 @@ func saltAwayFromPinnedWithHasher(base, pinnedAID string, maxAttempts uint32, ha
 	return pinnedAID + "0"
 }
 
-// attrAwareOpenTagEnd returns the index just past the > that closes the open tag
-// starting at lt, treating > inside quoted attribute values as ordinary text.
-// Returns -1 if unterminated.
+// attrAwareOpenTagEnd returns the index just past the > that closes the open tag.
+// It keeps quoted values distinct from attribute names so malformed-but-
+// recoverable quotes follow browser tokenization. Returns -1 if unterminated.
 func attrAwareOpenTagEnd(html string, lt int) int {
+	const (
+		tagName = iota
+		beforeAttr
+		attrName
+		afterAttrName
+		beforeValue
+		quotedValue
+		unquotedValue
+		afterQuotedValue
+		selfClosingStartTag
+	)
+	state := tagName
 	var quote byte
 	for i := lt + 1; i < len(html); i++ {
 		ch := html[i]
-		if quote != 0 {
-			if ch == quote {
-				quote = 0
+		switch state {
+		case tagName:
+			switch {
+			case isASCIISpace(ch):
+				state = beforeAttr
+			case ch == '/':
+				state = selfClosingStartTag
+			case ch == '>':
+				return i + 1
 			}
-			continue
-		}
-		switch ch {
-		case '"', '\'':
-			quote = ch
-		case '>':
-			return i + 1
+		case beforeAttr:
+			switch {
+			case isASCIISpace(ch):
+			case ch == '/':
+				state = selfClosingStartTag
+			case ch == '>':
+				return i + 1
+			default:
+				state = attrName
+			}
+		case attrName:
+			switch {
+			case isASCIISpace(ch):
+				state = afterAttrName
+			case ch == '/':
+				state = selfClosingStartTag
+			case ch == '=':
+				state = beforeValue
+			case ch == '>':
+				return i + 1
+			}
+		case afterAttrName:
+			switch {
+			case isASCIISpace(ch):
+			case ch == '/':
+				state = selfClosingStartTag
+			case ch == '=':
+				state = beforeValue
+			case ch == '>':
+				return i + 1
+			default:
+				state = attrName
+			}
+		case beforeValue:
+			switch {
+			case isASCIISpace(ch):
+			case ch == '"' || ch == '\'':
+				quote = ch
+				state = quotedValue
+			case ch == '>':
+				return i + 1
+			default:
+				state = unquotedValue
+			}
+		case quotedValue:
+			if ch == quote {
+				state = afterQuotedValue
+			}
+		case unquotedValue:
+			switch {
+			case isASCIISpace(ch):
+				state = beforeAttr
+			case ch == '>':
+				return i + 1
+			}
+		case afterQuotedValue:
+			switch {
+			case isASCIISpace(ch):
+				state = beforeAttr
+			case ch == '>':
+				return i + 1
+			case ch == '/':
+				state = selfClosingStartTag
+			default:
+				state = attrName
+			}
+		case selfClosingStartTag:
+			if ch == '>' {
+				return i + 1
+			}
+			state = beforeAttr
+			i-- // reconsume under before-attribute-name semantics
 		}
 	}
 	return -1
