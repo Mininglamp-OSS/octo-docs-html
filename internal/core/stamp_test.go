@@ -2109,6 +2109,233 @@ func TestStampAidsStripsAllAIDAttributeForms(t *testing.T) {
 	}
 }
 
+func TestStampAidsNestedForgedAIDsDoNotAffectAncestorHash(t *testing.T) {
+	tests := []struct {
+		name  string
+		dirty string
+		clean string
+	}{
+		{
+			name:  "stampable single quoted",
+			dirty: `<body><section><figure data-odoc-aid='forged'>x</figure></section></body>`,
+			clean: `<body><section><figure>x</figure></section></body>`,
+		},
+		{
+			name:  "stampable double quoted",
+			dirty: `<body><section><figure data-odoc-aid="forged">x</figure></section></body>`,
+			clean: `<body><section><figure>x</figure></section></body>`,
+		},
+		{
+			name:  "stampable unquoted",
+			dirty: `<body><section><figure data-odoc-aid=forged>x</figure></section></body>`,
+			clean: `<body><section><figure>x</figure></section></body>`,
+		},
+		{
+			name:  "stampable valueless",
+			dirty: `<body><section><figure data-odoc-aid>x</figure></section></body>`,
+			clean: `<body><section><figure>x</figure></section></body>`,
+		},
+		{
+			name:  "stampable mixed case duplicate",
+			dirty: `<body><section><figure DATA-ODOC-AID='first' data-odoc-aid=second title=x>x</figure></section></body>`,
+			clean: `<body><section><figure title=x>x</figure></section></body>`,
+		},
+		{
+			name:  "opt in single quoted",
+			dirty: `<body><section><div class="odoc-artifact" data-odoc-aid='forged'>x</div></section></body>`,
+			clean: `<body><section><div class="odoc-artifact">x</div></section></body>`,
+		},
+		{
+			name:  "opt in double quoted",
+			dirty: `<body><section><div class="odoc-artifact" data-odoc-aid="forged">x</div></section></body>`,
+			clean: `<body><section><div class="odoc-artifact">x</div></section></body>`,
+		},
+		{
+			name:  "opt in unquoted",
+			dirty: `<body><section><div class="odoc-artifact" data-odoc-aid=forged>x</div></section></body>`,
+			clean: `<body><section><div class="odoc-artifact">x</div></section></body>`,
+		},
+		{
+			name:  "opt in valueless",
+			dirty: `<body><section><div class="odoc-artifact" data-odoc-aid>x</div></section></body>`,
+			clean: `<body><section><div class="odoc-artifact">x</div></section></body>`,
+		},
+		{
+			name:  "opt in mixed case duplicate",
+			dirty: `<body><section><div DATA-ODOC-AID="first" class="odoc-artifact" data-odoc-aid='second'>x</div></section></body>`,
+			clean: `<body><section><div class="odoc-artifact">x</div></section></body>`,
+		},
+		{
+			name:  "non void slash belongs to unquoted aid value",
+			dirty: `<body><section><figure data-odoc-aid=forged/>x</figure></section></body>`,
+			clean: `<body><section><figure>x</figure></section></body>`,
+		},
+		{
+			name:  "void slash belongs to unquoted aid value",
+			dirty: `<body><section><img data-odoc-aid=forged/></section></body>`,
+			clean: `<body><section><img></section></body>`,
+		},
+		{
+			name:  "foreign slash belongs to unquoted aid value",
+			dirty: `<body><section><svg><path data-odoc-aid=forged/></svg></section></body>`,
+			clean: `<body><section><svg><path></svg></section></body>`,
+		},
+		{
+			name:  "true explicit foreign self close after unquoted aid",
+			dirty: `<body><section><svg><path data-odoc-aid=forged /></svg></section></body>`,
+			clean: `<body><section><svg><path/></svg></section></body>`,
+		},
+		{
+			name:  "foreign self closing descendant",
+			dirty: `<body><section><svg><path data-odoc-aid='forged'/></svg></section></body>`,
+			clean: `<body><section><svg><path/></svg></section></body>`,
+		},
+		{
+			name: "only real attribute names are stripped",
+			dirty: `<body><section title="data-odoc-aid='literal'">` +
+				`<!-- <figure data-odoc-aid='comment'>fake</figure> -->` +
+				`<script>"<figure data-odoc-aid=raw>fake</figure>"</script>` +
+				`<textarea><figure data-odoc-aid=rawtext>fake</figure></textarea>` +
+				`<figure data-note="data-odoc-aid=literal" data-odoc-aid='real'>x</figure>` +
+				`</section></body>`,
+			clean: `<body><section title="data-odoc-aid='literal'">` +
+				`<!-- <figure data-odoc-aid='comment'>fake</figure> -->` +
+				`<script>"<figure data-odoc-aid=raw>fake</figure>"</script>` +
+				`<textarea><figure data-odoc-aid=rawtext>fake</figure></textarea>` +
+				`<figure data-note="data-odoc-aid=literal">x</figure>` +
+				`</section></body>`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := StampAids(tt.clean)
+			first := StampAids(tt.dirty)
+			if first.HTML != want.HTML {
+				t.Fatalf("caller AID changed canonical parent/child output:\n got  %q\n want %q", first.HTML, want.HTML)
+			}
+			if len(first.AIDs) != 2 || len(want.AIDs) != 2 {
+				t.Fatalf("artifacts = %#v, want canonical parent and child", first.AIDs)
+			}
+			for i := range first.AIDs {
+				if first.AIDs[i].Tag != want.AIDs[i].Tag || first.AIDs[i].AID != want.AIDs[i].AID {
+					t.Fatalf("artifact %d = %+v, want %+v", i, first.AIDs[i], want.AIDs[i])
+				}
+			}
+			second := StampAids(first.HTML)
+			if second.HTML != first.HTML {
+				t.Fatalf("nested stamp was not idempotent:\n first  %q\n second %q", first.HTML, second.HTML)
+			}
+		})
+	}
+}
+
+func TestStampAidsCleanSelfCloseSpacingCompatibility(t *testing.T) {
+	tests := []struct {
+		name  string
+		clean string
+		dirty string
+		tag   string
+	}{
+		{
+			name:  "foreign opt in unquoted class",
+			clean: `<body><section><svg><path class=odoc-artifact /></svg></section></body>`,
+			dirty: `<body><section><svg><path class=odoc-artifact data-odoc-aid=forged /></svg></section></body>`,
+			tag:   "path",
+		},
+		{
+			name:  "void unquoted src",
+			clean: `<body><section><img src=x /></section></body>`,
+			dirty: `<body><section><img src=x data-odoc-aid=forged /></section></body>`,
+			tag:   "img",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clean := StampAids(tt.clean)
+			dirty := StampAids(tt.dirty)
+			if aidOf(clean, tt.tag) == "" || aidOf(dirty, tt.tag) == "" {
+				t.Fatalf("%s ceased to be harvested: clean=%#v dirty=%#v", tt.tag, clean.AIDs, dirty.AIDs)
+			}
+			if dirty.HTML != clean.HTML {
+				t.Fatalf("dirty AID changed clean compatibility output:\n dirty %q\n clean %q", dirty.HTML, clean.HTML)
+			}
+			if again := StampAids(clean.HTML); again.HTML != clean.HTML {
+				t.Fatalf("clean self-close changed on restamp:\n first  %q\n second %q", clean.HTML, again.HTML)
+			}
+		})
+	}
+}
+
+func TestStampAidsSelfCloseCanonicalOutputCompatibility(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		tag   string
+	}{
+		{"void unquoted attribute", `<body><img src=x /></body>`, "img"},
+		{"foreign unquoted attribute", `<body><svg class=foo /></body>`, "svg"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := StampAids(tt.input)
+			aid := aidOf(res, tt.tag)
+			want := `<body><` + tt.tag + ` `
+			if tt.tag == "img" {
+				want += `src=x`
+			} else {
+				want += `class=foo`
+			}
+			want += ` data-odoc-aid="` + aid + `"/></body>`
+			if res.HTML != want {
+				t.Fatalf("canonical output changed:\n got  %q\n want %q", res.HTML, want)
+			}
+			if again := StampAids(res.HTML); again.HTML != res.HTML {
+				t.Fatalf("canonical output not idempotent:\n first  %q\n second %q", res.HTML, again.HTML)
+			}
+		})
+	}
+}
+
+func TestStampAidsTrueForeignSelfCloseParentIsIdempotent(t *testing.T) {
+	dirty := `<body><section><svg data-odoc-aid=x /><path class="odoc-artifact"/></section></body>`
+	clean := `<body><section><svg/><path class="odoc-artifact"/></section></body>`
+
+	first := StampAids(dirty)
+	want := StampAids(clean)
+	if first.HTML != want.HTML {
+		t.Fatalf("caller AID changed canonical foreign self-close output:\n got  %q\n want %q", first.HTML, want.HTML)
+	}
+	if aidOf(first, "section") == "" || aidOf(first, "svg") == "" || aidOf(first, "path") == "" {
+		t.Fatalf("missing parent/foreign/opt-in artifacts: %#v", first.AIDs)
+	}
+	second := StampAids(first.HTML)
+	if second.HTML != first.HTML || aidOf(second, "section") != aidOf(first, "section") {
+		t.Fatalf("foreign self-close parent changed on restamp:\n first  %q\n second %q", first.HTML, second.HTML)
+	}
+}
+
+func TestStampAidsPinnedStripsNestedForgedAID(t *testing.T) {
+	const prefix = `<body><section>`
+	dirty := prefix + `<figure data-odoc-aid='forged'><img data-odoc-aid=child src=x/></figure></section></body>`
+	clean := prefix + `<figure><img src=x/></figure></section></body>`
+
+	got := StampAidsPinned(dirty, "serverpin", len(prefix))
+	want := StampAidsPinned(clean, "serverpin", len(prefix))
+	if got.HTML != want.HTML {
+		t.Fatalf("nested caller AIDs changed pinned output:\n got  %q\n want %q", got.HTML, want.HTML)
+	}
+	if !strings.Contains(got.HTML, `<figure data-odoc-aid="serverpin">`) {
+		t.Fatalf("server pin was not preserved: %q", got.HTML)
+	}
+	if strings.Contains(got.HTML, "forged") || strings.Contains(got.HTML, "child") {
+		t.Fatalf("caller AID survived pinned stamp: %q", got.HTML)
+	}
+	if again := StampAidsPinned(got.HTML, "serverpin", len(prefix)); again.HTML != got.HTML {
+		t.Fatalf("pinned restamp changed bytes:\n first  %q\n second %q", got.HTML, again.HTML)
+	}
+}
+
 func TestStampAidsMalformedAttributeQuoteRecovery(t *testing.T) {
 	tests := []struct {
 		name string

@@ -535,17 +535,14 @@ func stripAIDAttribute(attrs string) string {
 					i++
 				}
 			} else {
+				// In HTML's unquoted-attribute-value state, '/' is ordinary data.
+				// Only whitespace can end the value and make a later slash an actual
+				// self-closing marker (for example "aid=x />", not "aid=x/>").
 				for i < len(attrs) && !isASCIISpace(attrs[i]) {
-					if attrs[i] == '/' && (i+1 == len(attrs) || isASCIISpace(attrs[i+1])) {
-						break
-					}
 					i++
 				}
 			}
 			valueEnd = i
-			if valueEnd < len(attrs) && attrs[valueEnd] == '/' {
-				i++ // leave the slash outside the removed attribute
-			}
 		}
 		if strings.EqualFold(attrs[nameStart:nameEnd], "data-odoc-aid") {
 			removeStart := nameStart
@@ -560,17 +557,106 @@ func stripAIDAttribute(attrs string) string {
 	return out.String()
 }
 
-func stripNonArtifactAIDs(html string) string {
+// endsInUnquotedAttrValue reports whether attrs ends while the HTML tokenizer is
+// in an unquoted attribute value. Appending '/' directly in that state would
+// make the slash value data, not a self-close marker.
+func endsInUnquotedAttrValue(attrs string) bool {
+	const (
+		beforeName = iota
+		name
+		afterName
+		beforeValue
+		quotedValue
+		unquotedValue
+		afterQuotedValue
+	)
+	state := beforeName
+	var quote byte
+	for i := 0; i < len(attrs); i++ {
+		ch := attrs[i]
+		switch state {
+		case beforeName:
+			if !isASCIISpace(ch) && ch != '/' {
+				state = name
+			}
+		case name:
+			switch {
+			case isASCIISpace(ch):
+				state = afterName
+			case ch == '=':
+				state = beforeValue
+			}
+		case afterName:
+			switch {
+			case isASCIISpace(ch):
+			case ch == '=':
+				state = beforeValue
+			default:
+				state = name
+			}
+		case beforeValue:
+			switch {
+			case isASCIISpace(ch):
+			case ch == '"' || ch == '\'':
+				quote = ch
+				state = quotedValue
+			default:
+				state = unquotedValue
+			}
+		case quotedValue:
+			if ch == quote {
+				state = afterQuotedValue
+			}
+		case unquotedValue:
+			if isASCIISpace(ch) {
+				state = beforeName
+			}
+		case afterQuotedValue:
+			if isASCIISpace(ch) {
+				state = beforeName
+			} else {
+				state = name
+			}
+		}
+	}
+	return state == unquotedValue
+}
+
+// stripAllAIDs removes caller-supplied AIDs from every real opening tag in one
+// structural pass before harvesting. This makes every ancestor hash independent
+// of nested forged/stale AIDs without rescanning each artifact subtree.
+//
+// A removed attribute can expose a slash that was not originally a terminal
+// self-close marker ("<svg/ data-odoc-aid=...>"). Keep a separating space in
+// that case. Likewise, preserve the distinction between an unquoted value ending
+// in slash and a following true self-close marker.
+func stripAllAIDs(html string) string {
 	opens := scanOpenTags(html)
 	var out strings.Builder
 	cursor := 0
 	for _, open := range opens {
-		if isStampableTag(open.tag) || classTokenMatch(open.attrs, "odoc-artifact") {
-			continue
+		attrs := open.attrs
+		terminalSlash := terminalSelfCloseSlash(attrs)
+		base := attrs
+		if terminalSlash >= 0 {
+			base = attrs[:terminalSlash]
 		}
-		cleaned := stripAIDAttribute(open.attrs)
-		if cleaned == open.attrs {
-			continue
+		cleaned := stripAIDAttribute(base)
+		if cleaned == base {
+			continue // never normalize a caller tag unless an AID was removed
+		}
+		if terminalSlash >= 0 {
+			cleaned = trimTrailingASCIISpace(cleaned)
+			if endsInUnquotedAttrValue(cleaned) || strings.HasSuffix(cleaned, "/") {
+				cleaned += " /"
+			} else {
+				cleaned += "/"
+			}
+		} else if terminalSelfCloseSlash(cleaned) >= 0 &&
+			(open.namespace != namespaceHTML || voidTagRe.MatchString(open.tag)) {
+			// Canonical output places an AID after a malformed slash on void/foreign
+			// tags. Removing that AID must not turn the slash into a real self-close.
+			cleaned += " "
 		}
 		attrsStart := open.start + 1 + len(open.origTag)
 		attrsEnd := open.openEnd - 1
@@ -1495,7 +1581,7 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 			}
 		}
 	}
-	rawHTML = stripNonArtifactAIDs(rawHTML)
+	rawHTML = stripAllAIDs(rawHTML)
 	if pinnedOrdinal >= 0 {
 		opens := scanOpenTags(rawHTML)
 		if pinnedOrdinal < len(opens) {
