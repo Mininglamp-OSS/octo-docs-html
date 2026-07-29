@@ -723,7 +723,10 @@ func unsafeReplacementAttrs(s string) bool {
 		attrs := make(map[string][]string)
 		unsafe := false
 		forEachAttr(open.attrs, func(name, value string) {
-			attrs[name] = append(attrs[name], value)
+			// Browsers keep the first duplicate attribute on an element.
+			if _, exists := attrs[name]; !exists {
+				attrs[name] = []string{value}
+			}
 			if name == "srcdoc" {
 				unsafe = true
 				return
@@ -738,7 +741,7 @@ func unsafeReplacementAttrs(s string) bool {
 		if unsafe {
 			return true
 		}
-		if open.tag != "animate" && open.tag != "set" {
+		if open.namespace != namespaceSVG || (open.tag != "animate" && open.tag != "set") {
 			continue
 		}
 		targets := attrs["attributename"]
