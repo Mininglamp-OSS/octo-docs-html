@@ -1532,7 +1532,7 @@ func scanOpenTagsWithStats(s string, stats *scanStats) []parsedOpenTag {
 				stats.annotationAttrParses++
 			}
 			if encoding, found := attrValue(attrs, "encoding"); found {
-				encoding = strings.ToLower(strings.TrimSpace(encoding))
+				encoding = strings.ToLower(strings.TrimSpace(html.UnescapeString(encoding)))
 				annotationHTML = encoding == "text/html" || encoding == "application/xhtml+xml"
 			}
 		}

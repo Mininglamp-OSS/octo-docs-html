@@ -495,6 +495,57 @@ func TestMathMLAnnotationXMLNamespaceControls(t *testing.T) {
 	}
 }
 
+func TestSafeReplacementFragmentAnnotationXMLEncodingEntities(t *testing.T) {
+	tests := []struct {
+		name string
+		html string
+		want bool
+	}{
+		{
+			name: "hex text html exposes nested SVG set",
+			html: `<math><annotation-xml encoding="text&#x2f;html"><x-foo><svg><set attributeName="href" to="javascript:alert(1)"/></svg></x-foo></annotation-xml></math>`,
+		},
+		{
+			name: "hex XHTML exposes nested SVG animate",
+			html: `<math><annotation-xml encoding="application&#x2f;xhtml+xml"><x-foo><svg><animate attributeName="href" values="javascript:alert(1)"/></svg></x-foo></annotation-xml></math>`,
+		},
+		{
+			name: "named slash exposes nested SVG set",
+			html: `<math><annotation-xml encoding="text&sol;html"><x-foo><svg><set attributeName="href" to="javascript:alert(1)"/></svg></x-foo></annotation-xml></math>`,
+		},
+		{
+			name: "decimal slash exposes nested SVG animate",
+			html: `<math><annotation-xml encoding="application&#47;xhtml+xml"><x-foo><svg><animate attributeName="href" values="javascript:alert(1)"/></svg></x-foo></annotation-xml></math>`,
+		},
+		{
+			name: "ordinary encoding remains MathML",
+			html: `<math><annotation-xml encoding="application/xml"><x-foo><svg><set attributeName="href" to="javascript:alert(1)"/></svg></x-foo></annotation-xml></math>`,
+			want: true,
+		},
+		{
+			name: "benign assignment remains safe",
+			html: `<math><annotation-xml encoding="text&#x2f;html"><x-foo><svg><set attributeName="href" to="https://safe"/></svg></x-foo></annotation-xml></math>`,
+			want: true,
+		},
+		{
+			name: "first integration encoding wins",
+			html: `<math><annotation-xml encoding="text&#x2f;html" encoding="application/xml"><x-foo><svg><set attributeName="href" to="javascript:alert(1)"/></svg></x-foo></annotation-xml></math>`,
+		},
+		{
+			name: "first ordinary encoding wins",
+			html: `<math><annotation-xml encoding="application/xml" encoding="text&#x2f;html"><x-foo><svg><set attributeName="href" to="javascript:alert(1)"/></svg></x-foo></annotation-xml></math>`,
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, ok := SafeReplacementFragment(tt.html); ok != tt.want {
+				t.Fatalf("SafeReplacementFragment() ok = %v, want %v", ok, tt.want)
+			}
+		})
+	}
+}
+
 // Fix D: hand-written replacements must not carry stamper-owned data-odoc-*
 // attributes (Publish re-stamps only stampable open tags; residue ⇒ ambiguous
 // selector).
