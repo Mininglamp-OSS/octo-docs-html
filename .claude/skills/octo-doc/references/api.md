@@ -110,6 +110,7 @@ Note the wire field is **`created_at`** (the stored form is `created`).
 
 ### `POST /v1/comments` — create a comment or reply (reader)
 Body: `{slug, text, version?, anchor?, parent_id?}`.
+`version` accepts omitted / `null` / `0`, a positive number or quoted number, `vN`, or `latest`; explicit versions above the latest published version are rejected.
 - `anchor` binds a top-level comment (see `references/anchoring.md`); omit for a
   doc-level comment.
 - `parent_id` makes it a reply instead.
@@ -122,12 +123,12 @@ Body: `{slug, parent_id, text, status?, applied_in?}` where `status` is
 status emoji (✅ / 🟡 / ❓).
 
 ### `PATCH /v1/comments` — re-anchor (reader)
-Body: `{slug, id, anchor, version?}`. Resets an element comment onto a new anchor.
+Body: `{slug, id, anchor, version?}`. `version` accepts the same forms as comment create. Resets an element comment onto a new anchor.
 
 ### `DELETE /v1/comments?slug=<slug>&id=<id>&version=<n>` — soft-delete (reader)
 
 ### `POST /v1/reactions` — toggle a reaction (reader)
-Body: `{slug, comment_id, emoji, version?}`. Reacting again with the same
+Body: `{slug, comment_id, emoji, version?}`. `version` accepts the same forms as comment create. Reacting again with the same
 `(login, emoji)` toggles it off.
 
 ## Media assets

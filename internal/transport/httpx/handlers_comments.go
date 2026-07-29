@@ -90,9 +90,11 @@ func decodeCommentMutation(w http.ResponseWriter, r *http.Request, body any) err
 	return nil
 }
 
+const maxCommentJSONDepth = 64
+
 func rejectDuplicateJSONKeys(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	if err := inspectJSONValue(decoder); err != nil {
+	if err := inspectJSONValue(decoder, 0); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); err != io.EOF {
@@ -101,7 +103,7 @@ func rejectDuplicateJSONKeys(data []byte) error {
 	return nil
 }
 
-func inspectJSONValue(decoder *json.Decoder) error {
+func inspectJSONValue(decoder *json.Decoder, depth int) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -109,6 +111,9 @@ func inspectJSONValue(decoder *json.Decoder) error {
 	delim, ok := token.(json.Delim)
 	if !ok {
 		return nil
+	}
+	if depth >= maxCommentJSONDepth {
+		return fmt.Errorf("JSON nesting exceeds limit")
 	}
 	switch delim {
 	case '{':
@@ -126,7 +131,7 @@ func inspectJSONValue(decoder *json.Decoder) error {
 				return fmt.Errorf("duplicate object key %q", key)
 			}
 			seen[key] = struct{}{}
-			if err := inspectJSONValue(decoder); err != nil {
+			if err := inspectJSONValue(decoder, depth+1); err != nil {
 				return err
 			}
 		}
@@ -134,7 +139,7 @@ func inspectJSONValue(decoder *json.Decoder) error {
 		return err
 	case '[':
 		for decoder.More() {
-			if err := inspectJSONValue(decoder); err != nil {
+			if err := inspectJSONValue(decoder, depth+1); err != nil {
 				return err
 			}
 		}

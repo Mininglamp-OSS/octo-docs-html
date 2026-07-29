@@ -628,6 +628,7 @@ func TestCommentMutationRejectsFutureAndDuplicateVersions(t *testing.T) {
 		`{"slug":"strict-versions","text":"future","version":999999}`,
 		`{"slug":"strict-versions","text":"duplicate","version":1,"version":999999}`,
 		`{"slug":"strict-versions","text":"nested duplicate","version":1,"anchor":{"kind":"element","aid":"a","aid":"b"}}`,
+		`{"slug":"strict-versions","anchor":` + strings.Repeat(`[`, 10_000) + `null` + strings.Repeat(`]`, 10_000) + `}`,
 	}
 	for _, payload := range payloads {
 		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
