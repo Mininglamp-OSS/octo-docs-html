@@ -457,6 +457,74 @@ func TestSafeReplacementFragmentForeignEndBreakoutNamespace(t *testing.T) {
 	}
 }
 
+func TestSafeReplacementFragmentForeignBreakoutReentry(t *testing.T) {
+	breakouts := []struct {
+		name, prefix string
+	}{
+		{"start", `<svg><p></p>`},
+		{"end", `<svg></p>`},
+	}
+	for _, tt := range breakouts {
+		t.Run(tt.name, func(t *testing.T) {
+			unsafe := tt.prefix + `<svg><set attributeName="href" to="javascript:alert(1)"/></svg></svg>`
+			if _, ok := SafeReplacementFragment(unsafe); ok {
+				t.Fatalf("executable assignment accepted after SVG re-entry: %q", unsafe)
+			}
+
+			for _, fragment := range []string{
+				tt.prefix + `<svg><set attributeName="href" to="https://safe"/></svg></svg>`,
+				tt.prefix + `<math><mtext>safe</mtext></math></svg>`,
+				tt.prefix + `<svg></svg><set attributeName="href" to="javascript:alert(1)"></set></svg>`,
+				tt.prefix + `<svg><set attributeName="href" to="https://safe"/></svg><set attributeName="href" to="javascript:alert(1)"></set></svg>`,
+			} {
+				if _, ok := SafeReplacementFragment(fragment); !ok {
+					t.Errorf("safe breakout/re-entry control rejected: %q", fragment)
+				}
+			}
+
+			nested := tt.prefix + `<svg></svg><math></math><set></set></svg><svg><set></set></svg>`
+			opens := scanOpenTags(nested)
+			var svgNamespaces, mathNamespaces, setNamespaces []contentNamespace
+			for _, open := range opens {
+				switch open.tag {
+				case "svg":
+					svgNamespaces = append(svgNamespaces, open.namespace)
+				case "math":
+					mathNamespaces = append(mathNamespaces, open.namespace)
+				case "set":
+					setNamespaces = append(setNamespaces, open.namespace)
+				}
+			}
+			if len(svgNamespaces) != 3 || svgNamespaces[1] != namespaceSVG || svgNamespaces[2] != namespaceSVG {
+				t.Fatalf("SVG namespaces after breakout = %v", svgNamespaces)
+			}
+			if len(mathNamespaces) != 1 || mathNamespaces[0] != namespaceMathML {
+				t.Fatalf("MathML namespace after breakout = %v", mathNamespaces)
+			}
+			if len(setNamespaces) != 2 || setNamespaces[0] != namespaceHTML || setNamespaces[1] != namespaceSVG {
+				t.Fatalf("set namespaces after nested close/root transition = %v", setNamespaces)
+			}
+		})
+	}
+}
+
+func TestSafeReplacementFragmentForeignBreakoutMathSVGReentry(t *testing.T) {
+	for _, fragment := range []string{
+		`<svg><p></p><math><mtext><svg><set attributeName="href" to="javascript:alert(1)"/></svg></mtext></math></svg>`,
+		`<svg></p><math><mtext><svg><set attributeName="href" to="javascript:alert(1)"/></svg></mtext></math></svg>`,
+	} {
+		if _, ok := SafeReplacementFragment(fragment); ok {
+			t.Errorf("executable assignment accepted through MathML re-entry: %q", fragment)
+		}
+	}
+
+	// Tag spelling alone must not turn an ordinary HTML unknown element into SVG.
+	fragment := `<div><set attributeName="href" to="javascript:alert(1)"></set></div>`
+	if _, ok := SafeReplacementFragment(fragment); !ok {
+		t.Fatalf("HTML unknown set rejected: %q", fragment)
+	}
+}
+
 func TestStampAidsMathMLAnnotationXMLDirectSVG(t *testing.T) {
 	in := `<body><math><annotation-xml><svg><foreignObject><section/><figure>inside</figure></section><aside>html-sibling</aside></foreignObject><section/><figure>svg-sibling</figure></svg><figure>math-sibling</figure></annotation-xml></math><figure>after</figure></body>`
 	res := StampAids(in)

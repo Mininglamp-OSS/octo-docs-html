@@ -1368,7 +1368,14 @@ func commentEnd(s string, lt int) int {
 // namespaceForChild applies the foreign-content integration-point rules.
 func namespaceForChild(parent parsedOpenTag, childTag string) contentNamespace {
 	if parent.foreignPopped {
-		return namespaceHTML
+		switch childTag {
+		case "svg":
+			return namespaceSVG
+		case "math":
+			return namespaceMathML
+		default:
+			return namespaceHTML
+		}
 	}
 	base := parent.namespace
 	switch parent.namespace {
