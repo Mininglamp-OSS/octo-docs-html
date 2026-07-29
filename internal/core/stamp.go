@@ -396,13 +396,6 @@ func terminalSelfCloseSlash(attrs string) int {
 	return -1
 }
 
-func trimTrailingASCIISpace(s string) string {
-	for len(s) > 0 && isASCIISpace(s[len(s)-1]) {
-		s = s[:len(s)-1]
-	}
-	return s
-}
-
 // stampedOpenTag preserves caller attribute bytes and inserts the canonical AID
 // before trailing attribute whitespace and, when real, the self-close slash.
 // Stripping the inserted attribute therefore reconstructs the original opening
@@ -527,6 +520,7 @@ func stripAIDAttribute(attrs string) string {
 			i++
 		}
 		valueEnd := nameEnd
+		canonicalAID := false
 		if i < len(attrs) && attrs[i] == '=' {
 			i++
 			for i < len(attrs) && isASCIISpace(attrs[i]) {
@@ -535,8 +529,16 @@ func stripAIDAttribute(attrs string) string {
 			if i < len(attrs) && (attrs[i] == '"' || attrs[i] == '\'') {
 				quote := attrs[i]
 				i++
+				valueStart := i
 				for i < len(attrs) && attrs[i] != quote {
 					i++
+				}
+				if quote == '"' && i < len(attrs) {
+					value := attrs[valueStart:i]
+					canonicalAID = len(value) >= 9 && len(value) <= 12
+					for j := 0; canonicalAID && j < len(value); j++ {
+						canonicalAID = value[j] >= '0' && value[j] <= '9' || value[j] >= 'a' && value[j] <= 'z'
+					}
 				}
 				if i < len(attrs) {
 					i++
@@ -553,10 +555,17 @@ func stripAIDAttribute(attrs string) string {
 		}
 		if strings.EqualFold(attrs[nameStart:nameEnd], "data-odoc-aid") {
 			removeStart := nameStart
-			// Emission adds exactly one separating space. Remove only that byte so
-			// caller-owned formatting before the attribute survives a restamp.
-			if removeStart > cursor && attrs[removeStart-1] == ' ' {
+			spaceStart := removeStart
+			for spaceStart > cursor && isASCIISpace(attrs[spaceStart-1]) {
+				spaceStart--
+			}
+			// Emission contributes exactly one ASCII space. Preserve preceding
+			// formatting only for that canonical shape; otherwise the whole caller
+			// separator belongs to the forged attribute and must not affect hashes.
+			if canonicalAID && removeStart-spaceStart == 1 && attrs[spaceStart] == ' ' {
 				removeStart--
+			} else {
+				removeStart = spaceStart
 			}
 			out.WriteString(attrs[cursor:removeStart])
 			cursor = valueEnd
@@ -684,6 +693,10 @@ func unsafeReplacementAttrs(s string) bool {
 			}
 			switch name {
 			case "href", "src", "xlink:href", "action", "formaction":
+			case "data":
+				if open.tag != "object" {
+					return
+				}
 			default:
 				return
 			}
@@ -1716,11 +1729,7 @@ func stampAids(rawHTML, pinnedAID string, pinnedOffset int) StampResult {
 			// spans to a real close (closeEnd > openEnd) — so it stays non-self-closing.
 			stampedOpen = stampedOpenTag(name, e.cleanedAttrs, e.aid, true)
 		} else {
-			attrs := e.cleanedAttrs
-			if strings.Contains(attrs, "/") {
-				attrs = trimTrailingASCIISpace(attrs)
-			}
-			stampedOpen = stampedOpenTag(name, attrs, e.aid, false)
+			stampedOpen = stampedOpenTag(name, e.cleanedAttrs, e.aid, false)
 		}
 		out.WriteString(stampedOpen)
 		cursor = e.openEnd

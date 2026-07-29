@@ -278,6 +278,8 @@ func TestSafeReplacementFragment(t *testing.T) {
 		`<a href="https://example.com/a">safe</a>`,
 		`<a href="/relative">safe</a>`,
 		`<img src="data:image/png;base64,AAAA">`,
+		`<object data="/relative"></object>`,
+		`<object data="data:image/svg+xml,<svg/>"></object>`,
 	}
 	for _, s := range pass {
 		if _, ok := SafeReplacementFragment(s); !ok {
@@ -304,6 +306,10 @@ func TestSafeReplacementFragment(t *testing.T) {
 		`<a href="vb&#115;cript:alert(1)">x</a>`,
 		`<iframe src="DATA:TEXT/HTML;base64,PHNjcmlwdD4="></iframe>`,
 		`<iframe src="data:text&#x2f;html,<p>x</p>"></iframe>`,
+		`<object data="javascript:alert(1)"></object>`,
+		`<object data="&#106;avascript:alert(1)"></object>`,
+		"<object data=\"java\tscript:alert(1)\"></object>",
+		`<object data="data:text/html,<script>x</script>"></object>`,
 	}
 	for _, s := range fail {
 		if _, ok := SafeReplacementFragment(s); ok {
@@ -1943,7 +1949,7 @@ func TestTerminalSelfCloseRequiresImmediateGreaterThan(t *testing.T) {
 		svgAID := aidOf(malformed, "svg")
 		figureAID := aidOf(malformed, "figure")
 		asideAID := aidOf(malformed, "aside")
-		want := `<body><svg/ data-odoc-aid="` + svgAID + `"><figure data-odoc-aid="` + figureAID + `">inside</figure></svg><aside data-odoc-aid="` + asideAID + `">after</aside></body>`
+		want := `<body><svg/ data-odoc-aid="` + svgAID + `" ><figure data-odoc-aid="` + figureAID + `">inside</figure></svg><aside data-odoc-aid="` + asideAID + `">after</aside></body>`
 		if malformed.HTML != want {
 			t.Fatalf("malformed svg reconstruction:\n got %q\nwant %q", malformed.HTML, want)
 		}
@@ -2354,6 +2360,30 @@ func TestStampAidsFixedPointCorpus(t *testing.T) {
 		if !reflect.DeepEqual(second.AIDs, first.AIDs) {
 			t.Fatalf("not AID fixed point for %q:\nfirst  %#v\nsecond %#v", seed, first.AIDs, second.AIDs)
 		}
+	}
+}
+
+func TestStampAidsForgedAIDWhitespaceMatchesClean(t *testing.T) {
+	clean := StampAids(`<body><section><figure>x</figure></section></body>`)
+	for _, separator := range []string{"  ", "\t", " \t ", "\n  "} {
+		dirty := StampAids(`<body><section><figure` + separator + `data-odoc-aid=forged>x</figure></section></body>`)
+		if dirty.HTML != clean.HTML || !reflect.DeepEqual(dirty.AIDs, clean.AIDs) {
+			t.Fatalf("separator %q affected canonical output:\ndirty %q\nclean %q", separator, dirty.HTML, clean.HTML)
+		}
+		if again := StampAids(dirty.HTML); again.HTML != dirty.HTML || !reflect.DeepEqual(again.AIDs, dirty.AIDs) {
+			t.Fatalf("separator %q was not a fixed point: first=%q second=%q", separator, dirty.HTML, again.HTML)
+		}
+	}
+}
+
+func TestStampAidsPreservesSlashValueTrailingWhitespace(t *testing.T) {
+	in := `<body><section title="/"  >x</section></body>`
+	first := StampAids(in)
+	if !strings.Contains(first.HTML, `title="/" data-odoc-aid="`) || !strings.Contains(first.HTML, `"  >x`) {
+		t.Fatalf("attribute whitespace was not preserved: %q", first.HTML)
+	}
+	if again := StampAids(first.HTML); again.HTML != first.HTML || !reflect.DeepEqual(again.AIDs, first.AIDs) {
+		t.Fatalf("slash-value stamp was not fixed: first=%q second=%q", first.HTML, again.HTML)
 	}
 }
 

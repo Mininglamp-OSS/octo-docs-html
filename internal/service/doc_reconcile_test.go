@@ -554,7 +554,7 @@ func TestReplaceElementAcceptsSelfClosingForeignRoot(t *testing.T) {
 			}
 
 			view, err := docs.GetElement(ctx, "svgroot", 2, core.StampAids(replacement).AIDs[0].AID)
-			if err != nil || view == nil || view.Tag != "svg" || view.HTML != core.StampAids(replacement).HTML {
+			if err != nil || view == nil || view.Tag != "svg" || view.HTML != core.StampAids(`<svg/>`).HTML {
 				t.Fatalf("GetElement v2 = view=%v err=%v", view, err)
 			}
 			v2, err := docs.Render(ctx, "svgroot", 2)
