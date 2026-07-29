@@ -385,6 +385,45 @@ func TestSafeReplacementFragmentForeignBreakoutNamespace(t *testing.T) {
 	}
 }
 
+func TestSafeReplacementFragmentForeignEndBreakoutNamespace(t *testing.T) {
+	for _, endTag := range []string{"p", "br"} {
+		t.Run(endTag, func(t *testing.T) {
+			pass := []string{
+				`<svg></` + endTag + `><set attributeName="href" to="javascript:prose"></set></svg>`,
+				`<svg><g></` + endTag + `><set attributeName="href" to="javascript:prose"></set></g></svg>`,
+				`<math><mtext><svg><g></` + endTag + `><set attributeName="href" to="javascript:prose"></set></g></svg></mtext></math>`,
+				`<div><svg></` + endTag + `><set attributeName="href" to="javascript:prose"></set></svg><set attributeName="href" to="javascript:prose"></set></div>`,
+			}
+			for _, fragment := range pass {
+				if _, ok := SafeReplacementFragment(fragment); !ok {
+					t.Errorf("HTML set after foreign end-tag breakout rejected: %q", fragment)
+				}
+			}
+
+			for _, fragment := range []string{
+				`<svg><set attributeName="href" to="javascript:alert(1)"></set></` + endTag + `></svg>`,
+				`<math><mtext><svg><set attributeName="href" to="javascript:alert(1)"></set></svg></mtext></` + endTag + `></math>`,
+				`<div><svg></` + endTag + `><set attributeName="href" to="javascript:prose"></set></svg><svg><set attributeName="href" to="javascript:alert(1)"></set></svg></div>`,
+			} {
+				if _, ok := SafeReplacementFragment(fragment); ok {
+					t.Errorf("true SVG assignment accepted around end-tag breakout: %q", fragment)
+				}
+			}
+
+			opens := scanOpenTags(`<svg><g></` + endTag + `><set></set></g></svg><svg><set></set></svg>`)
+			var sets []parsedOpenTag
+			for _, open := range opens {
+				if open.tag == "set" {
+					sets = append(sets, open)
+				}
+			}
+			if len(sets) != 2 || sets[0].namespace != namespaceHTML || sets[1].namespace != namespaceSVG {
+				t.Fatalf("set namespaces after breakout and close = %#v", sets)
+			}
+		})
+	}
+}
+
 func TestStampAidsMathMLAnnotationXMLDirectSVG(t *testing.T) {
 	in := `<body><math><annotation-xml><svg><foreignObject><section/><figure>inside</figure></section><aside>html-sibling</aside></foreignObject><section/><figure>svg-sibling</figure></svg><figure>math-sibling</figure></annotation-xml></math><figure>after</figure></body>`
 	res := StampAids(in)

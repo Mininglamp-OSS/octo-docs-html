@@ -1437,6 +1437,14 @@ func scanOpenTagsWithStats(s string, stats *scanStats) []parsedOpenTag {
 			}
 		}
 	}
+	popForeign := func(tokenTag string) bool {
+		popped := false
+		for pos := len(stack) - 1; pos >= 0 && namespaceForChild(opens[stack[pos]], tokenTag) != namespaceHTML; pos-- {
+			opens[stack[pos]].foreignPopped = true
+			popped = true
+		}
+		return popped
+	}
 	for i := 0; i < len(s); {
 		lt := strings.IndexByte(s[i:], '<')
 		if lt < 0 {
@@ -1464,14 +1472,22 @@ func scanOpenTagsWithStats(s string, stats *scanStats) []parsedOpenTag {
 				i = lt + 1
 				continue
 			}
-			pos, active := stackTopByTag[closeTag]
-			if !active || pos < 0 {
-				i = lt + 1
-				continue
-			}
 			closeEnd, ok := endTagBoundary(s, lt, closeTag)
 			if !ok {
 				i = lt + 1
+				continue
+			}
+			// Foreign-content </p> and </br> tokens pop foreign nodes, then are
+			// reprocessed in HTML mode. Keep source frames only for boundaries.
+			if (closeTag == "p" || closeTag == "br") && popForeign(closeTag) {
+				if closeTag == "br" {
+					i = closeEnd
+					continue
+				}
+			}
+			pos, active := stackTopByTag[closeTag]
+			if !active || pos < 0 {
+				i = closeEnd
 				continue
 			}
 			idx := stack[pos]
@@ -1501,11 +1517,8 @@ func scanOpenTagsWithStats(s string, stats *scanStats) []parsedOpenTag {
 		if len(stack) > 0 {
 			ns = namespaceForChild(opens[stack[len(stack)-1]], tag)
 			if ns != namespaceHTML && foreignBreakoutStart(tag, attrs) {
-				// These source frames remain for close-boundary accounting, but are
-				// no longer active foreign parser nodes after token reprocessing.
-				for pos := len(stack) - 1; pos >= 0 && namespaceForChild(opens[stack[pos]], tag) != namespaceHTML; pos-- {
-					opens[stack[pos]].foreignPopped = true
-				}
+				// Source frames remain only for close-boundary accounting.
+				popForeign(tag)
 				ns = namespaceHTML
 			}
 		} else if tag == "svg" {
