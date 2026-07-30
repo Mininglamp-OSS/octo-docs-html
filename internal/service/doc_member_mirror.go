@@ -9,20 +9,23 @@ import (
 
 const (
 	// DocMemberRoleReader is the rich-doc doc_member.role reader encoding
-	// (>= this = at least reader). bestCred consumes it for the plan③ A4
-	// tier so a forwarded direct grant lifts CapReader.
+	// (>= this = at least reader). bestCred maps it via CapabilityForDocRole.
 	DocMemberRoleReader = 1
-	// DocMemberRoleAdmin mirrors the rich-doc doc_member.role admin encoding.
-	// bestCred consumes this to short-circuit CapAuthor when the caller's
-	// owner uid holds an admin row — the plan③ A3② tier.
-	DocMemberRoleAdmin = 3
+	// DocMemberRoleCommenter can comment/react and edit/delete own comments.
+	DocMemberRoleCommenter = 2
+	// DocMemberRoleWriter can edit (AI/publish/undo) but not manage members.
+	DocMemberRoleWriter = 3
+	// DocMemberRoleAdmin is the highest tier: full management. bestCred consumes
+	// this to short-circuit CapManage when the caller's owner uid holds an admin
+	// row — the plan③ A3② tier. The DB-level admin guard binds this constant.
+	DocMemberRoleAdmin = 4
 )
 
 // ErrDocMemberAdminGuard is returned by DeleteGrant when the DB-level guard
-// (WHERE role<>3) refuses the delete because a concurrent backfill promoted
-// the row to admin between the caller's probe and the DELETE. Callers should
-// translate this into their domain-level "protected" error (grants.RemoveGrant
-// turns it into ErrGrantProtected).
+// (WHERE role<>?, bound to DocMemberRoleAdmin) refuses the delete because a
+// concurrent backfill promoted the row to admin between the caller's probe and
+// the DELETE. Callers should translate this into their domain-level "protected"
+// error (grants.RemoveGrant turns it into ErrGrantProtected).
 var ErrDocMemberAdminGuard = errors.New("doc_member: refuse to modify admin row")
 
 // DocMember is one row of the rich-doc doc_member table exposed to callers that
@@ -65,9 +68,9 @@ func NewMySQLDocMemberMirror(db *sql.DB) *MySQLDocMemberMirror {
 // permission_epoch so live connections re-evaluate access.
 //
 // yujiawei round-4 P2 race guard: when the caller writes a non-admin role we
-// preserve any existing admin (role=3) row rather than downgrading it — a
+// preserve any existing admin row rather than downgrading it — a
 // concurrent backfill can promote a row between the caller's probe and this
-// write, and clobbering that admin down to reader silently strips the
+// write, and clobbering that admin down to a lesser role silently strips the
 // author's capability. The ON DUPLICATE KEY UPDATE branch keeps the existing
 // role/granted_by whenever the pre-image is admin. When the caller IS
 // writing admin (e.g. an M1 owner backfill) we skip the guard so the promote
@@ -82,16 +85,23 @@ func (m *MySQLDocMemberMirror) UpsertDirectGrant(ctx context.Context, docID, uid
 		insertSQL = `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
 		 VALUES (?,?,?,?,1,'')
 		 ON DUPLICATE KEY UPDATE role=VALUES(role), granted_by=VALUES(granted_by)`
+		if _, err := tx.ExecContext(ctx, insertSQL, docID, uid, role, grantedBy); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("upsert doc_member: %w", err)
+		}
 	} else {
+		// Preserve an existing admin row (bind DocMemberRoleAdmin, do not hardcode
+		// the numeric encoding) so a concurrent backfill promotion is never
+		// clobbered down to a lesser role.
 		insertSQL = `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
 		 VALUES (?,?,?,?,1,'')
 		 ON DUPLICATE KEY UPDATE
-		   role       = IF(role = 3, role, VALUES(role)),
-		   granted_by = IF(role = 3, granted_by, VALUES(granted_by))`
-	}
-	if _, err := tx.ExecContext(ctx, insertSQL, docID, uid, role, grantedBy); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("upsert doc_member: %w", err)
+		   role       = IF(role = ?, role, VALUES(role)),
+		   granted_by = IF(role = ?, granted_by, VALUES(granted_by))`
+		if _, err := tx.ExecContext(ctx, insertSQL, docID, uid, role, grantedBy, DocMemberRoleAdmin, DocMemberRoleAdmin); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("upsert doc_member: %w", err)
+		}
 	}
 	if _, err := tx.ExecContext(ctx,
 		"UPDATE doc_meta SET permission_epoch=permission_epoch+1 WHERE doc_id=?",
@@ -107,9 +117,9 @@ func (m *MySQLDocMemberMirror) UpsertDirectGrant(ctx context.Context, docID, uid
 
 // DeleteGrant removes a doc_member row and bumps permission_epoch.
 //
-// yujiawei round-4 P2 race guard: the DELETE carries WHERE role<>3 so a
-// row promoted to admin between the caller's probe and this call is not
-// silently deleted. Affected=0 with the row still present (probe returned
+// yujiawei round-4 P2 race guard: the DELETE carries WHERE role<>? (bound to
+// DocMemberRoleAdmin) so a row promoted to admin between the caller's probe and
+// this call is not silently deleted. Affected=0 with the row still present (probe returned
 // hit → row existed) means the guard kicked in; we return
 // ErrDocMemberAdminGuard so callers can surface a protected-row error and
 // skip the permission_epoch bump.
@@ -189,8 +199,8 @@ func (m *MySQLDocMemberMirror) DocIDBySlug(ctx context.Context, slug string) (st
 }
 
 // RoleByDocUID returns the role (doc_member.role) uid holds on docID; ok=false
-// when the uid has no row. Used by bestCred to decide owner-admin (role=3) and
-// reader (role>=1) capability without touching meta.grants (plan③ A3/A4).
+// when the uid has no row. Used by bestCred (via CapabilityForDocRole) to derive
+// the caller's capability without touching meta.grants (plan③ A3/A4).
 // No cache: doc_member is fast and any cache here would tie freshness of auth
 // to permission_epoch invalidation logic we do not need to add.
 func (m *MySQLDocMemberMirror) RoleByDocUID(ctx context.Context, docID, uid string) (int, bool, error) {

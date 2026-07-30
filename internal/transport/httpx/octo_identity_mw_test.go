@@ -149,22 +149,28 @@ func TestProxyAdminAndMemberDoNotGrantAuthor(t *testing.T) {
 	}
 }
 
-// §C.3: non-superAdmin identity + share code → CapReader (share code path),
-// and the comment author uid comes from the trust headers, not the code.
+// §C.3: non-superAdmin identity + share code → CapRead (share code path). A
+// share code is read-only (plan §1), so even with a resolved proxy identity the
+// caller cannot create a comment: the mutation requires CapComment → hidden 404.
 func TestProxyIdentityPlusShareCodeGrantsReader(t *testing.T) {
 	h := newTestServerWithProxyIdentity(t)
 	publish(t, h, "docC")
 	code := generateShareCode(t, h, "docC")
 
+	// Read paths still work with the share code.
+	if rec := do(t, h, http.MethodGet, "/v1/comments?slug=docC",
+		with(proxyHeaders("u-42", "User", "member"),
+			map[string]string{"Authorization": "Bearer " + code}), ""); rec.Code != 200 {
+		t.Fatalf("reader+identity list-comments = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Creating a comment is a comment-tier write the share code cannot satisfy.
 	rec := do(t, h, http.MethodPost, "/v1/comments",
 		with(proxyHeaders("u-42", "User", "member"),
 			map[string]string{"Authorization": "Bearer " + code, "Content-Type": "application/json"}),
 		`{"slug":"docC","text":"hi","version":1,"anchor":{"kind":"text","text":"hello"}}`)
-	if rec.Code != 200 {
-		t.Fatalf("reader+identity comment = %d: %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), `"u-42"`) {
-		t.Errorf("expected octo uid u-42 in comment author: %s", rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("reader+identity comment = %d; want 404 (share code is read-only): %s", rec.Code, rec.Body.String())
 	}
 }
 

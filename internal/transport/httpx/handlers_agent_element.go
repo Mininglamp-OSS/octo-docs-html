@@ -22,7 +22,7 @@ func (s *Server) handleAgentElementGet(w http.ResponseWriter, r *http.Request) e
 	if err != nil {
 		return err
 	}
-	if err := s.requireDocAuthorSlug(r, slug); err != nil {
+	if err := s.requireDocEditSlug(r, slug); err != nil {
 		return err
 	}
 	if body.AID == "" {
@@ -65,7 +65,7 @@ func (s *Server) handleAgentElementReplace(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		return err
 	}
-	if err := s.requireDocAuthorSlug(r, slug); err != nil {
+	if err := s.requireDocEditSlug(r, slug); err != nil {
 		return err
 	}
 	if body.AID == "" {

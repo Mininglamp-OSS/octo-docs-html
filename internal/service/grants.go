@@ -12,10 +12,16 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
-// grantRoleReader is the only role a per-uid grant may carry today. Editing
-// (writer) needs a new Capability tier + a full pass over the resolution chain,
-// so grants are read+comment only for now.
-const grantRoleReader = "reader"
+// grant role labels accepted/emitted by the HTML /grants API. They map 1:1 to
+// the doc_member.role encoding via roleLabelToCode / roleCodeToLabel so the HTML
+// grants path and the rich-doc doc_member table share one four-role vocabulary
+// (no second permission fact).
+const (
+	grantRoleReader    = "reader"
+	grantRoleCommenter = "commenter"
+	grantRoleWriter    = "writer"
+	grantRoleAdmin     = "admin"
+)
 
 // ErrGrantProtected is returned by AddGrant / RemoveGrant when the target uid
 // is the doc's creator or a doc_member admin — those rows must never be
@@ -102,13 +108,17 @@ func legacyListGrantsFromMeta(meta *storage.DocMeta, creator string) map[string]
 	return out
 }
 
-// roleCodeToLabel translates rich-doc doc_member.role integers to the string
-// labels this API has always returned. Only reader is used today; admin is
-// added so the creator row from ListGrants renders correctly.
+// roleCodeToLabel translates rich-doc doc_member.role integers to string labels.
+// Unknown codes fail closed to reader (least privilege) rather than surprise-
+// promoting a stray value.
 func roleCodeToLabel(role int) string {
 	switch role {
 	case DocMemberRoleAdmin:
-		return "admin"
+		return grantRoleAdmin
+	case DocMemberRoleWriter:
+		return grantRoleWriter
+	case DocMemberRoleCommenter:
+		return grantRoleCommenter
 	case DocMemberRoleReader:
 		return grantRoleReader
 	default:
@@ -116,13 +126,27 @@ func roleCodeToLabel(role int) string {
 	}
 }
 
+// roleLabelToCode maps a grant role label to its doc_member.role encoding.
+// ok=false for any unknown label so callers fail closed (never default reader).
+func roleLabelToCode(role string) (int, bool) {
+	switch role {
+	case grantRoleReader:
+		return DocMemberRoleReader, true
+	case grantRoleCommenter:
+		return DocMemberRoleCommenter, true
+	case grantRoleWriter:
+		return DocMemberRoleWriter, true
+	case grantRoleAdmin:
+		return DocMemberRoleAdmin, true
+	default:
+		return 0, false
+	}
+}
+
 // AddGrant grants uid a role on slug (upsert). grantedBy records who authorized
-// it. Only the reader role is accepted for now.
-//
-// Plan③ A6: doc_member is authoritative — the upsert goes straight through
-// UpsertDirectGrant (source=1 direct grant, encoded inside the mirror impl).
-// meta.grants is no longer written. When no mirror is wired we still write
-// meta.grants so single-node deploys keep working.
+// it. Accepts reader/commenter/writer; admin is refused here — admin identity is
+// owned by creator_uid + the M1 backfill, never mintable through the grants API
+// (RemoveGrant/AddGrant both refuse to touch an admin row).
 //
 // TODO: verify uid is a real octo user (anti ghost-member) once octo-server
 // exposes a uid-existence lookup the doc can call; today any uid is accepted.
@@ -130,27 +154,23 @@ func (s *AuthService) AddGrant(ctx context.Context, slug, uid, role, grantedBy s
 	if uid == "" {
 		return apperr.Validation("uid required", "invalid_grant")
 	}
-	if role != grantRoleReader {
-		return apperr.Validation("role must be reader", "invalid_grant")
+	code, ok := roleLabelToCode(role)
+	if !ok || code == DocMemberRoleAdmin {
+		return apperr.Validation("role must be reader|commenter|writer", "invalid_grant")
 	}
 	if s.docMembers != nil {
-		return s.addGrantToDocMember(ctx, slug, uid, grantedBy)
+		return s.addGrantToDocMember(ctx, slug, uid, code, grantedBy)
 	}
 	return s.addGrantToMeta(ctx, slug, uid, role, grantedBy)
 }
 
 // addGrantToDocMember is the plan③ A6 primary path. UpsertDirectGrant is
-// idempotent — repeated calls for the same (docID,uid,role) update
-// updated_at only, no duplicate row.
-//
-// Probe RoleByDocUID first and refuse reader-grants that would
-// silently downgrade an admin (role=3) or the creator uid. UpsertDirectGrant
-// runs ON DUPLICATE KEY UPDATE role=VALUES(role), so a naive reader upsert on
-// an existing admin row would clobber it — and once A1 flips creator_uid to
-// the bot, the owner's author is nothing but their doc_member admin row.
-// One reader grant would demote them. Idempotent reader→reader is a no-op
-// (no permission_epoch bump).
-func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grantedBy string) error {
+// idempotent for the same (docID,uid,role). It probes RoleByDocUID first and
+// refuses grants that would touch the creator uid or an admin (role=4) row.
+// An identical existing role is a no-op (no permission_epoch bump); a different
+// non-admin role is a legitimate change (e.g. reader→commenter, commenter→writer,
+// or a downgrade) and is written through.
+func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid string, roleCode int, grantedBy string) error {
 	// Existence check via meta so we still 404 on a bogus slug (rich-doc
 	// mirror only knows registered docs).
 	meta, err := s.meta.GetMeta(ctx, slug)
@@ -169,13 +189,9 @@ func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grante
 	}
 	if !ok {
 		// Doc not yet registered in doc_member (post-commit registration gap, or
-		// a non-mounted / failed registration). Thread mounts are registerable,
-		// but may transiently land here during that gap. Reads /
-		// ListGrants / RemoveGrant all fall back to meta.grants in this state;
-		// AddGrant used to 404 here, breaking API symmetry and making such docs
-		// un-grantable. Fall back to the legacy meta.grants writer so the four
-		// operations stay aligned.
-		return s.addGrantToMeta(ctx, slug, uid, grantRoleReader, grantedBy)
+		// a non-mounted / failed registration). Fall back to the legacy
+		// meta.grants writer so the four operations stay aligned.
+		return s.addGrantToMeta(ctx, slug, uid, roleCodeToLabel(roleCode), grantedBy)
 	}
 	role, ok, err := s.docMembers.RoleByDocUID(ctx, docID, uid)
 	if err != nil {
@@ -185,11 +201,11 @@ func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grante
 		if role == DocMemberRoleAdmin {
 			return ErrGrantProtected
 		}
-		if role >= DocMemberRoleReader {
-			return nil // already reader (or higher-that-is-not-admin); no-op, no epoch bump
+		if role == roleCode {
+			return nil // identical role; no-op, no epoch bump
 		}
 	}
-	return s.docMembers.UpsertDirectGrant(ctx, docID, uid, DocMemberRoleReader, grantedBy)
+	return s.docMembers.UpsertDirectGrant(ctx, docID, uid, roleCode, grantedBy)
 }
 
 // addGrantToMeta preserves the pre-plan③ meta.grants write path for the

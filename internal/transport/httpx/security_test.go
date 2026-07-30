@@ -81,7 +81,9 @@ func TestDocsPrivateByDefault(t *testing.T) {
 		t.Fatalf("share returned no code: %s", sh.Body.String())
 	}
 
-	// Reader (code as Bearer) reads published + can comment, but NOT the draft.
+	// Reader (code as Bearer) reads published + list-comments, but a share code is
+	// READ-ONLY: it can neither create comments nor read the draft (plan §1 — the
+	// share code always has read capability only, never comment).
 	codeAuth := map[string]string{"Authorization": "Bearer " + code}
 	if rec := do(t, h, http.MethodGet, "/d/doc/v/1", codeAuth, ""); rec.Code != http.StatusOK {
 		t.Errorf("reader render with code = %d; want 200", rec.Code)
@@ -92,8 +94,8 @@ func TestDocsPrivateByDefault(t *testing.T) {
 	cm := do(t, h, http.MethodPost, "/v1/comments",
 		map[string]string{"Authorization": "Bearer " + code, "Content-Type": "application/json"},
 		`{"slug":"doc","version":1,"text":"nice"}`)
-	if cm.Code != http.StatusOK {
-		t.Errorf("reader comment with code = %d; want 200: %s", cm.Code, cm.Body.String())
+	if cm.Code != http.StatusNotFound {
+		t.Errorf("reader comment with code = %d; want 404 (share code is read-only): %s", cm.Code, cm.Body.String())
 	}
 
 	// A wrong code is rejected (404) on read and comment.
@@ -236,8 +238,9 @@ func TestFreshCodeBeatsStaleCookie(t *testing.T) {
 }
 
 // TestRenderCapMarkerReflectsViewer asserts the render injects window.__ODOC_CAP__
-// with isAuthor true only for the write-token holder, so the overlay hides the
-// author-only Share (mint-code) button from a reader.
+// as the four-tier capability object (with the transitional isAuthor=canEdit
+// alias), so the overlay can gate role-scoped UI. The creator resolves to manage
+// (admin); a share-code reader gets read-only.
 func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
@@ -248,22 +251,29 @@ func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	_ = json.Unmarshal(sh.Body.Bytes(), &share)
 	code, _ := share["data"].(map[string]any)["code"].(string)
 
-	// Author (creator uid via trust header) → isAuthor: true.
+	// Author (creator uid via trust header) → manage tier: canManage/canEdit/
+	// canComment/canRead all true, role admin, isAuthor alias true.
 	rec := do(t, h, http.MethodGet, "/d/cap/v/1", authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("author render = %d", rec.Code)
 	}
-	if !contains(rec.Body.String(), `window.__ODOC_CAP__ = {isAuthor: true}`) {
-		t.Error("author render should carry isAuthor: true")
+	body := rec.Body.String()
+	for _, want := range []string{`role: "admin"`, `canManage: true`, `canEdit: true`, `canComment: true`, `canRead: true`, `isAuthor: true`} {
+		if !contains(body, want) {
+			t.Errorf("author render marker missing %q: %s", want, body)
+		}
 	}
 
-	// Reader (share code cookie) → isAuthor: false.
+	// Reader (share code cookie) → read-only: role reader, only canRead true.
 	rec = do(t, h, http.MethodGet, "/d/cap/v/1", map[string]string{"Cookie": capCookie("cap", code)}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("reader render = %d: %s", rec.Code, rec.Body.String())
 	}
-	if !contains(rec.Body.String(), `window.__ODOC_CAP__ = {isAuthor: false}`) {
-		t.Error("reader render should carry isAuthor: false (Share button hidden)")
+	body = rec.Body.String()
+	for _, want := range []string{`role: "reader"`, `canRead: true`, `canComment: false`, `canEdit: false`, `canManage: false`, `isAuthor: false`} {
+		if !contains(body, want) {
+			t.Errorf("reader render marker missing %q: %s", want, body)
+		}
 	}
 }
 

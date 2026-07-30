@@ -141,8 +141,9 @@ func TestDocMetaGrantRole(t *testing.T) {
 	}
 }
 
-// AddGrant upserts, ListGrants reads back, RemoveGrant is idempotent, and a
-// non-reader role is rejected.
+// AddGrant upserts, ListGrants reads back, RemoveGrant is idempotent. Grantable
+// roles are reader/commenter/writer; admin is rejected (never mintable via the
+// grants API), and an unknown role/empty uid is rejected.
 func TestGrantLifecycle(t *testing.T) {
 	svc, slug := newGrantSvc(t)
 	ctx := context.Background()
@@ -158,8 +159,22 @@ func TestGrantLifecycle(t *testing.T) {
 		t.Fatalf("grants[u1] = %q; want reader", grants["u1"])
 	}
 
-	if err := svc.AddGrant(ctx, slug, "u1", "writer", "owner"); err == nil {
-		t.Fatalf("AddGrant writer should be rejected")
+	// writer is now a grantable role (four-role redesign) and updates in place.
+	if err := svc.AddGrant(ctx, slug, "u1", "writer", "owner"); err != nil {
+		t.Fatalf("AddGrant writer should be accepted: %v", err)
+	}
+	grants, _ = svc.ListGrants(ctx, slug)
+	if grants["u1"] != "writer" {
+		t.Fatalf("grants[u1] after writer = %q; want writer", grants["u1"])
+	}
+
+	// admin may never be granted through this API.
+	if err := svc.AddGrant(ctx, slug, "u2", "admin", "owner"); err == nil {
+		t.Fatalf("AddGrant admin should be rejected")
+	}
+	// unknown role fails closed.
+	if err := svc.AddGrant(ctx, slug, "u2", "superuser", "owner"); err == nil {
+		t.Fatalf("AddGrant unknown role should be rejected")
 	}
 	if err := svc.AddGrant(ctx, slug, "", "reader", "owner"); err == nil {
 		t.Fatalf("AddGrant empty uid should be rejected")

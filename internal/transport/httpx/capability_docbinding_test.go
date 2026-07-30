@@ -3,7 +3,6 @@ package httpx_test
 import (
 	"context"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -109,7 +108,8 @@ func TestDocBindingCreatorGrantsAuthor(t *testing.T) {
 }
 
 // FEAT-3 §hook: non-superAdmin identity + visible binding but not creator
-// → CapReader. A comment (reader-gate) succeeds without any share code.
+// → CapRead. A read (render/list) succeeds without any share code, but a
+// binding reader is read-only — comment and author ops are hidden 404.
 func TestDocBindingMemberGrantsReader(t *testing.T) {
 	bf := &stubBindingFetcher{byKey: map[string]*service.DocBindingInfo{
 		"tok-member|docH": {Slug: "docH", MountType: "group", GroupNo: "g1", CreatorUID: "u-other"},
@@ -120,17 +120,15 @@ func TestDocBindingMemberGrantsReader(t *testing.T) {
 	rec := do(t, h, http.MethodGet, "/d/docH/v/1",
 		proxiedMember("u-member", "tok-member"), "")
 	if rec.Code != 200 {
-		t.Fatalf("binding member render = %d; want 200 (CapReader)", rec.Code)
+		t.Fatalf("binding member render = %d; want 200 (CapRead)", rec.Code)
 	}
 
+	// A binding-derived reader is read-only: creating a comment needs CapComment.
 	rec = do(t, h, http.MethodPost, "/v1/comments",
 		merge(proxiedMember("u-member", "tok-member"), map[string]string{"Content-Type": "application/json"}),
 		`{"slug":"docH","text":"hi","version":1,"anchor":{"kind":"text","text":"hello"}}`)
-	if rec.Code != 200 {
-		t.Fatalf("binding member comment = %d: %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), `"u-member"`) {
-		t.Errorf("expected octo uid u-member in comment: %s", rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("binding member comment = %d; want 404 (read-only binding): %s", rec.Code, rec.Body.String())
 	}
 
 	// A binding-derived reader must NOT be able to hit author-only ops —

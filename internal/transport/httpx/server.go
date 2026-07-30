@@ -90,7 +90,7 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/docs", s.cors(s.wrap(s.handleListDocs)))
 		r.Get("/docs/{slug}", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleGetDoc))))
 		r.Get("/docs/{slug}/versions", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleVersions))))
-		r.With(s.requireDocAuthor).Delete("/docs/{slug}", s.cors(s.wrap(s.handleDeleteDoc)))
+		r.With(s.requireDocManage).Delete("/docs/{slug}", s.cors(s.wrap(s.handleDeleteDoc)))
 		// Draft slot. Draft-first creation must work before any version exists, so
 		// these use requireDocAuthorOrFirstCreate: any authenticated session may
 		// create a brand-new slug (creator stamped on that write); once owned it is
@@ -98,21 +98,21 @@ func (s *Server) Handler() http.Handler {
 		r.With(s.requireDocAuthorOrFirstCreate).Method(http.MethodPut, "/docs/{slug}/draft", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleSaveDraft))))
 		r.With(s.requireDocAuthorOrFirstCreate).Post("/docs/{slug}/draft/promote", s.cors(s.limit(writeLimiter, false, s.wrap(s.handlePromote))))
 		// Share: mint / rotate / revoke the per-doc read+comment code (author-only).
-		r.With(s.requireDocAuthor).Post("/docs/{slug}/share", s.cors(s.wrap(s.handleShare)))
-		r.With(s.requireDocAuthor).Delete("/docs/{slug}/share", s.cors(s.wrap(s.handleRevokeShare)))
+		r.With(s.requireDocManage).Post("/docs/{slug}/share", s.cors(s.wrap(s.handleShare)))
+		r.With(s.requireDocManage).Delete("/docs/{slug}/share", s.cors(s.wrap(s.handleRevokeShare)))
 
-		// Per-uid access grants (member management): author lists/grants/revokes;
-		// a granted uid resolves to reader in bestCred.
-		r.With(s.requireDocAuthor).Get("/docs/{slug}/grants", s.cors(s.wrap(s.handleListGrants)))
-		r.With(s.requireDocAuthor).Put("/docs/{slug}/grants", s.cors(s.wrap(s.handleAddGrant)))
-		r.With(s.requireDocAuthor).Delete("/docs/{slug}/grants/{uid}", s.cors(s.wrap(s.handleRemoveGrant)))
+		// Per-uid access grants (member management): manage-only lists/grants/revokes;
+		// a granted uid resolves to its role capability in bestCred.
+		r.With(s.requireDocManage).Get("/docs/{slug}/grants", s.cors(s.wrap(s.handleListGrants)))
+		r.With(s.requireDocManage).Put("/docs/{slug}/grants", s.cors(s.wrap(s.handleAddGrant)))
+		r.With(s.requireDocManage).Delete("/docs/{slug}/grants/{uid}", s.cors(s.wrap(s.handleRemoveGrant)))
 
-		// Media assets: author uploads/deletes; a reader (share code) may list.
-		// The raw bytes are served from the /d/ tree below, under the same reader
-		// gate as a version render.
-		r.With(s.requireDocAuthor).Method(http.MethodPost, "/docs/{slug}/assets", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleUploadAsset))))
+		// Media assets: an editor (writer+) uploads/deletes; a reader (share code)
+		// may list. The raw bytes are served from the /d/ tree below, under the same
+		// reader gate as a version render.
+		r.With(s.requireDocEdit).Method(http.MethodPost, "/docs/{slug}/assets", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleUploadAsset))))
 		r.Get("/docs/{slug}/assets", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleListAssets))))
-		r.With(s.requireDocAuthor).Delete("/docs/{slug}/assets/{sha256}", s.cors(s.wrap(s.handleDeleteAsset)))
+		r.With(s.requireDocEdit).Delete("/docs/{slug}/assets/{sha256}", s.cors(s.wrap(s.handleDeleteAsset)))
 
 		// Comments + reactions. Reads and writes require at least a reader
 		// capability (the doc's share code) — enforced per-handler since the slug
@@ -128,6 +128,10 @@ func (s *Server) Handler() http.Handler {
 		// read-only; Replace republishes a new version (rate-limited like publish).
 		r.Post("/agent/element/get", s.cors(s.wrap(s.handleAgentElementGet)))
 		r.Post("/agent/element/replace", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleAgentElementReplace))))
+		// Conflict-safe append-only undo of one AI element_replace. Slug is in the
+		// path, so it rides the requireDocEdit path middleware (Edit tier); the
+		// handler enforces expected_current_version → 409 on any later change.
+		r.With(s.requireDocEdit).Post("/docs/{slug}/operations/{operationId}/undo", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleUndoOperation))))
 	})
 
 	// Rendered docs + export/fork. Default-private: a reader needs the doc's share

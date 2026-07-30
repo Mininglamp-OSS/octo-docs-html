@@ -11,18 +11,57 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
-// Capability is a viewer's access level for a specific document.
+// Capability is a viewer's access level for a specific document. The tiers are
+// totally ordered (None < Read < Comment < Edit < Manage) so a required minimum
+// can be checked with AtLeast / a plain comparison.
 type Capability int
 
 const (
 	// CapNone means the credential grants no access to the doc → treat as absent.
 	CapNone Capability = iota
-	// CapReader can read published versions and comment/react, via a share code.
-	CapReader
-	// CapAuthor can do everything (read incl. drafts, publish, promote, delete,
-	// generate/rotate codes) — the holder of a write token.
-	CapAuthor
+	// CapRead can view published pages, comments, history, source and diff.
+	CapRead
+	// CapComment can additionally create/reply/react and edit/delete OWN comments.
+	CapComment
+	// CapEdit can additionally run "let AI process"/AI edits, save drafts, publish,
+	// resolve/reopen threads and undo its own AI change.
+	CapEdit
+	// CapManage can additionally manage members/invites/access-requests, share
+	// settings and delete the doc. Owner/creator/superAdmin resolve here.
+	CapManage
 )
+
+// Legacy aliases. Pre-redesign code and tests refer to a two-tier model
+// (reader vs author); those names now point at the new bounds so the callers
+// keep compiling while the four ordered tiers land. A share-code reader is
+// exactly CapRead; the former all-powerful "author" is exactly CapManage.
+const (
+	// CapReader is the legacy name for CapRead.
+	CapReader = CapRead
+	// CapAuthor is the legacy name for CapManage.
+	CapAuthor = CapManage
+)
+
+// AtLeast reports whether c meets a required minimum capability.
+func (c Capability) AtLeast(required Capability) bool { return c >= required }
+
+// CapabilityForDocRole maps a rich-doc doc_member.role integer to a Capability.
+// 1→Read, 2→Comment, 3→Edit, 4→Manage; any other value (0/negative/unknown)
+// is CapNone (fail closed).
+func CapabilityForDocRole(role int) Capability {
+	switch role {
+	case DocMemberRoleReader:
+		return CapRead
+	case DocMemberRoleCommenter:
+		return CapComment
+	case DocMemberRoleWriter:
+		return CapEdit
+	case DocMemberRoleAdmin:
+		return CapManage
+	default:
+		return CapNone
+	}
+}
 
 // shareExtraKey is the DocMeta.Extra key holding the per-doc share code hash.
 const shareExtraKey = "share"

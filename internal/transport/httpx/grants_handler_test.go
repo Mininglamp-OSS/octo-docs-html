@@ -151,7 +151,7 @@ func TestRemoveAdminGrantReturns409(t *testing.T) {
 	// we protect a separate admin uid ("admin-uid").
 	mirror := &stubMirror{
 		slugToDoc: map[string]string{"docP2A": "dP2A"},
-		roles:     map[string]int{"dP2A|admin-uid": 3},
+		roles:     map[string]int{"dP2A|admin-uid": service.DocMemberRoleAdmin},
 	}
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
 	publishAsBot(t, h, "docP2A")
@@ -169,7 +169,7 @@ func TestAddGrantDowngradeAdminReturns409(t *testing.T) {
 	withStubIdentity(t, stubIdentity{botUID: "bot-1", botName: "Bot One", botSpaceID: "s1", botOwnerUID: "owner-1"})
 	mirror := &stubMirror{
 		slugToDoc: map[string]string{"docP2AA": "dP2AA"},
-		roles:     map[string]int{"dP2AA|admin-uid": 3},
+		roles:     map[string]int{"dP2AA|admin-uid": service.DocMemberRoleAdmin},
 	}
 	h, _ := newServerWithMirrorAndBotAuth(t, mirror)
 	publishAsBot(t, h, "docP2AA")
@@ -194,8 +194,8 @@ func TestListGrantsWiredNoCreatorDup(t *testing.T) {
 		slugToDoc: map[string]string{"docLD": "dLD"},
 		listMembers: map[string][]service.DocMember{
 			"dLD": {
-				{UID: "owner-1", Role: 3, GrantedBy: "system"},
-				{UID: "friend-1", Role: 1, GrantedBy: "owner-1"},
+				{UID: "owner-1", Role: service.DocMemberRoleAdmin, GrantedBy: "system"},
+				{UID: "friend-1", Role: service.DocMemberRoleReader, GrantedBy: "owner-1"},
 			},
 		},
 	}

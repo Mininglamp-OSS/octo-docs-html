@@ -393,7 +393,7 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	html = injectCapMarker(html, cap == service.CapAuthor)
+	html = injectCapMarker(html, cap)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if r.Method == http.MethodHead {
 		w.WriteHeader(200)
@@ -422,11 +422,26 @@ func (s *Server) resolveVersionParam(ctx context.Context, slug, raw string) (int
 }
 
 // injectCapMarker adds window.__ODOC_CAP__ before the overlay script so the
-// overlay can gate author-only UI (the Share/mint-code button) without touching
-// the byte-frozen core.OverlayConfig. It is injected right before the overlay's
-// own <script> so it is defined when the overlay boots.
-func injectCapMarker(html string, isAuthor bool) string {
-	marker := `<script>window.__ODOC_CAP__ = {isAuthor: ` + strconv.FormatBool(isAuthor) + `};</script>`
+// overlay can gate role-scoped UI (comment composer, "let AI process", member
+// management, delete) without touching the byte-frozen core.OverlayConfig. It is
+// injected right before the overlay's own <script> so it is defined when the
+// overlay boots. The marker is a UX hint ONLY — every write is re-authorized
+// server-side. isAuthor is retained as an alias for canEdit so a transitional
+// Web build that still reads it keeps working.
+func injectCapMarker(html string, cap service.Capability) string {
+	role := capRoleLabel(cap)
+	canRead := cap.AtLeast(service.CapRead)
+	canComment := cap.AtLeast(service.CapComment)
+	canEdit := cap.AtLeast(service.CapEdit)
+	canManage := cap.AtLeast(service.CapManage)
+	marker := `<script>window.__ODOC_CAP__ = {` +
+		`role: ` + strconv.Quote(role) + `, ` +
+		`canRead: ` + strconv.FormatBool(canRead) + `, ` +
+		`canComment: ` + strconv.FormatBool(canComment) + `, ` +
+		`canEdit: ` + strconv.FormatBool(canEdit) + `, ` +
+		`canManage: ` + strconv.FormatBool(canManage) + `, ` +
+		`isAuthor: ` + strconv.FormatBool(canEdit) + // transitional alias
+		`};</script>`
 	// The overlay boot is the last "<script>" InjectOverlayCfg wrote; place the
 	// marker before the window.__ODOC__ config script so both precede the overlay.
 	const anchor = "<script>window.__ODOC__ = "
@@ -434,6 +449,23 @@ func injectCapMarker(html string, isAuthor bool) string {
 		return html[:i] + marker + "\n" + html[i:]
 	}
 	return html + marker
+}
+
+// capRoleLabel maps a capability to the HTML UI role label the overlay/Web
+// expect. writer is the internal name; the UI renders it as "可编辑".
+func capRoleLabel(cap service.Capability) string {
+	switch {
+	case cap.AtLeast(service.CapManage):
+		return "admin"
+	case cap.AtLeast(service.CapEdit):
+		return "writer"
+	case cap.AtLeast(service.CapComment):
+		return "commenter"
+	case cap.AtLeast(service.CapRead):
+		return "reader"
+	default:
+		return "none"
+	}
 }
 
 func (s *Server) handleForkExport(w http.ResponseWriter, r *http.Request) error {
