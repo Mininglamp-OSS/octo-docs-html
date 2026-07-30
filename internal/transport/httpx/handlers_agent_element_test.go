@@ -165,6 +165,8 @@ func TestAgentElementReplaceRejectsOutOfBounds(t *testing.T) {
 		{"multi_element", `<section></section><section></section>`},
 		{"script_fragment", `<script>alert(1)</script>`},
 		{"plain_text", `just text`},
+		{"bare_div_root", `<div>not addressable</div>`},
+		{"bare_p_root", `<p>not addressable</p>`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -220,11 +222,47 @@ func TestAgentElementReplaceRejectsInjection(t *testing.T) {
 	}
 }
 
-// Fix E: a comment whose anchor is an ELEMENT anchor pointing at the replaced
-// aid must be reconciled on republish — either rebound to the new aid or marked
-// lost — never silently dropped. (The prior test only exercised a text anchor and
-// only asserted the text was still readable, which does not prove element-anchor
-// rebind/lost.)
+// Fix 3 at the API boundary: the literal string "data-odoc-*" inside a TEXT node
+// or an attribute VALUE must NOT be mistaken for a stamper-owned attribute. Such
+// a replacement (with a supported root) is accepted; a REAL data-odoc-* attribute
+// name is still rejected.
+func TestAgentElementReplaceDataOdocOnlyInValueOrTextAccepted(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	aid := publishAndFirstAID(t, h, auth,
+		"elodoc", `<html><body><section><p>x</p></section></body></html>`)
+
+	// Literal only in a text node and in a title value — not real attributes.
+	ok := `<section title="data-odoc-aid=fake"><p>mentions data-odoc-artifact in text</p></section>`
+	rec := do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
+		`{"slug":"elodoc","aid":"`+aid+`","new_html":`+jsonString(ok)+`}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("literal-in-value/text replace = %d; want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	// A REAL data-odoc-* attribute name is still rejected.
+	v2 := do(t, h, http.MethodGet, "/d/elodoc/v/2", auth, "").Body.String()
+	const marker = `data-odoc-aid="`
+	i := strings.Index(v2, marker)
+	if i < 0 {
+		t.Fatalf("no stamped aid in v2: %s", v2)
+	}
+	rest := v2[i+len(marker):]
+	aid2 := rest[:strings.IndexByte(rest, '"')]
+	bad := `<section data-odoc-aid="forged"><p>y</p></section>`
+	rec = do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
+		`{"slug":"elodoc","aid":"`+aid2+`","new_html":`+jsonString(bad)+`}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("real data-odoc attr replace = %d; want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// issue-21: a comment whose anchor is an ELEMENT anchor pointing at the replaced
+// aid must stay anchored to that SAME aid across the republish. The backend
+// emits the replacement root canonical aid immediately, so
+// the element keeps its identity and the anchor never drifts to a new aid or
+// goes lost. (The prior test only exercised a text anchor and only asserted the
+// text was still readable, which does not prove element-anchor persistence.)
 func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
@@ -240,15 +278,18 @@ func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 		t.Fatalf("seed element comment = %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Replace the targeted element; Publish re-stamps (new aid) and reconciles.
+	// Replace the targeted element; the backend injects the OLD aid onto the
+	// replacement root and re-stamps preserving it, so the element keeps its
+	// identity across the republish (issue-21).
 	rec = do(t, h, http.MethodPost, "/v1/agent/element/replace", auth,
 		`{"slug":"elanchor","aid":"`+aid+`","new_html":`+jsonString(`<section><p>replaced text</p></section>`)+`}`)
 	if rec.Code != 200 {
 		t.Fatalf("element replace = %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Read v2 comments: the seeded comment must still exist and its anchor must be
-	// reconciled — rebound to a NEW element aid, or marked lost — never left stale.
+	// Read v2 comments: the seeded comment must still exist and stay ELEMENT-
+	// anchored to the SAME aid — the replacement inherited it, so the anchor never
+	// drifts to a new aid or goes lost.
 	list := do(t, h, http.MethodGet, "/v1/comments?slug=elanchor&version=2", auth, "").Body.String()
 	if !strings.Contains(list, "element note") {
 		t.Fatalf("element-anchored comment lost after republish: %s", list)
@@ -271,18 +312,11 @@ func TestAgentElementReplaceReconcilesElementAnchor(t *testing.T) {
 			continue
 		}
 		found = true
-		switch c.Anchor.Kind {
-		case "element":
-			if c.Anchor.AID == "" {
-				t.Errorf("rebound element anchor has empty aid: %s", list)
-			}
-			if c.Anchor.AID == aid {
-				t.Errorf("anchor still points at the stale replaced aid %q; reconcile did not run", aid)
-			}
-		case "lost":
-			// acceptable: reconcile ran but could not confidently rebind
-		default:
-			t.Errorf("unexpected anchor kind %q after reconcile: %s", c.Anchor.Kind, list)
+		if c.Anchor.Kind != "element" {
+			t.Errorf("anchor kind = %q; want element (aid preserved across replace): %s", c.Anchor.Kind, list)
+		}
+		if c.Anchor.AID == aid {
+			t.Errorf("anchor was not migrated to canonical aid with pinned fallback %q: %s", aid, list)
 		}
 	}
 	if !found {

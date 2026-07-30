@@ -105,7 +105,73 @@ func reconcileEvent(anchor *Anchor, version int, at string) CommentEvent {
 	}
 }
 
-func reconcileComment(c *Comment, aids []StampedArtifact, byAID map[string]struct{}, version int, at string) {
+func lostAnchor(a *Anchor, reason string) *Anchor {
+	if a.Kind == "lost" && a.Reason == reason {
+		return nil
+	}
+	return &Anchor{
+		Kind:        "lost",
+		Reason:      reason,
+		Label:       a.Label,
+		Fingerprint: a.Fingerprint,
+		Fallback:    a.Fallback,
+	}
+}
+
+func anchorMatchesArtifact(a *Anchor, artifact StampedArtifact) bool {
+	if a.Fingerprint != nil && a.Fingerprint.Tag != "" {
+		return artifact.Tag == strings.ToLower(a.Fingerprint.Tag)
+	}
+	return true
+}
+
+func migratedAnchor(a *Anchor, byAID map[string][]StampedArtifact, pinnedAID, pinnedTag string, migrations map[string]string) *Anchor {
+	canonicalAID := migrations[pinnedAID]
+	if a.Kind != "element" || canonicalAID == "" || canonicalAID == pinnedAID || knownAid(a) != pinnedAID {
+		return nil
+	}
+	artifacts := byAID[canonicalAID]
+	if len(artifacts) != 1 || artifacts[0].Tag != pinnedTag {
+		return nil
+	}
+	copy := *a
+	copy.Kind = "element"
+	copy.AID = canonicalAID
+	copy.Selector = `[data-odoc-aid="` + canonicalAID + `"]`
+	copy.Label = pinnedTag
+	copy.Fingerprint = &AnchorFingerprint{Tag: pinnedTag}
+	return &copy
+}
+
+func pinnedAnchor(a *Anchor, byAID map[string][]StampedArtifact, pinnedAID, pinnedTag string) *Anchor {
+	if pinnedAID == "" || pinnedTag == "" || knownAid(a) != pinnedAID {
+		return nil
+	}
+	artifacts := byAID[pinnedAID]
+	if len(artifacts) != 1 || artifacts[0].Tag != pinnedTag {
+		return nil
+	}
+	copy := *a
+	fingerprint := AnchorFingerprint{Tag: pinnedTag}
+	copy.Fingerprint = &fingerprint
+	copy.AID = pinnedAID
+	copy.Selector = `[data-odoc-aid="` + pinnedAID + `"]`
+	copy.Label = pinnedTag
+	return &copy
+}
+
+func canonicalAliasAnchor(a *Anchor, artifact StampedArtifact) *Anchor {
+	copy := *a
+	copy.Kind = "element"
+	copy.AID = artifact.AID
+	copy.Selector = `[data-odoc-aid="` + artifact.AID + `"]`
+	if copy.Label == "" {
+		copy.Label = artifact.Tag
+	}
+	return &copy
+}
+
+func reconcileComment(c *Comment, aids []StampedArtifact, byAID, byLegacyAID map[string][]StampedArtifact, version int, at, pinnedAID, pinnedTag string, migrations map[string]string) {
 	snap := SnapshotAt(c, version)
 	if snap == nil || snap.Deleted {
 		return
@@ -114,10 +180,53 @@ func reconcileComment(c *Comment, aids []StampedArtifact, byAID map[string]struc
 	if a == nil || (a.Kind != "element" && a.Kind != "lost") {
 		return
 	}
+	if a.Kind == "lost" && len(migrations) > 0 {
+		return
+	}
+	if migrated := migratedAnchor(a, byAID, pinnedAID, pinnedTag, migrations); migrated != nil {
+		AppendEvent(c, reconcileEvent(migrated, version, at))
+		return
+	}
+	if refreshed := pinnedAnchor(a, byAID, pinnedAID, pinnedTag); refreshed != nil {
+		AppendEvent(c, reconcileEvent(refreshed, version, at))
+		return
+	}
 	aid := knownAid(a)
 	if aid != "" {
-		if _, ok := byAID[aid]; ok {
-			return // still valid
+		artifacts := byAID[aid]
+		legacyMatches := byLegacyAID[aid]
+		if len(artifacts) > 0 && len(legacyMatches) > 0 {
+			if lost := lostAnchor(a, "ambiguous_aid"); lost != nil {
+				AppendEvent(c, reconcileEvent(lost, version, at))
+			}
+			return
+		}
+		if len(artifacts) == 1 && anchorMatchesArtifact(a, artifacts[0]) {
+			return
+		}
+		if len(artifacts) > 0 {
+			reason := "fingerprint_mismatch"
+			if len(artifacts) > 1 {
+				reason = "ambiguous_aid"
+			}
+			if lost := lostAnchor(a, reason); lost != nil {
+				AppendEvent(c, reconcileEvent(lost, version, at))
+			}
+			return
+		}
+		if len(legacyMatches) == 1 && anchorMatchesArtifact(a, legacyMatches[0]) {
+			AppendEvent(c, reconcileEvent(canonicalAliasAnchor(a, legacyMatches[0]), version, at))
+			return
+		}
+		if len(legacyMatches) > 0 {
+			reason := "fingerprint_mismatch"
+			if len(legacyMatches) > 1 {
+				reason = "ambiguous_aid"
+			}
+			if lost := lostAnchor(a, reason); lost != nil {
+				AppendEvent(c, reconcileEvent(lost, version, at))
+			}
+			return
 		}
 	}
 	if anchor := nextAnchor(a, aids); anchor != nil {
@@ -128,10 +237,18 @@ func reconcileComment(c *Comment, aids []StampedArtifact, byAID map[string]struc
 // ReconcileAnchors reconciles open comment anchors against the freshly-stamped
 // artifact set for a version, mutating comments in place.
 func ReconcileAnchors(comments []Comment, aidsInVersion []StampedArtifact, v int) {
+	reconcileAnchors(comments, aidsInVersion, v, "", "", nil)
+}
+
+func reconcileAnchors(comments []Comment, aidsInVersion []StampedArtifact, v int, pinnedAID, pinnedTag string, migrations map[string]string) {
 	EnsureMigrated(comments)
-	byAID := make(map[string]struct{}, len(aidsInVersion))
+	byAID := make(map[string][]StampedArtifact, len(aidsInVersion))
+	byLegacyAID := make(map[string][]StampedArtifact)
 	for _, a := range aidsInVersion {
-		byAID[a.AID] = struct{}{}
+		byAID[a.AID] = append(byAID[a.AID], a)
+		for _, legacyAID := range a.LegacyAIDs {
+			byLegacyAID[legacyAID] = append(byLegacyAID[legacyAID], a)
+		}
 	}
 	version := v
 	if version == 0 {
@@ -139,6 +256,6 @@ func ReconcileAnchors(comments []Comment, aidsInVersion []StampedArtifact, v int
 	}
 	at := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	for i := range comments {
-		reconcileComment(&comments[i], aidsInVersion, byAID, version, at)
+		reconcileComment(&comments[i], aidsInVersion, byAID, byLegacyAID, version, at, pinnedAID, pinnedTag, migrations)
 	}
 }

@@ -138,8 +138,11 @@ func TestPublishResponseIncludesRegistrationState(t *testing.T) {
 	if envelope.Data["doc_id"] != "" || envelope.Data["share_url"] != "" {
 		t.Fatalf("unregistered identifiers must be empty: %#v", envelope.Data)
 	}
-	if envelope.Data["url"] != "" || envelope.Data["render_url"] != "/d/contract/v/1" {
-		t.Fatalf("unregistered response must expose only render_url: %#v", envelope.Data)
+	if envelope.Data["url"] != "" {
+		t.Fatalf("unregistered response must not expose a url: %#v", envelope.Data)
+	}
+	if _, ok := envelope.Data["render_url"]; ok {
+		t.Fatalf("render_url must not be present in the publish response: %#v", envelope.Data)
 	}
 }
 
@@ -280,6 +283,49 @@ func TestCommentRequiresCapability(t *testing.T) {
 		`{"slug":"anon","text":"nice","version":1,"anchor":{"kind":"text","text":"hello"}}`)
 	if rec.Code != 200 {
 		t.Fatalf("author comment = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCommentMutationsHideVersionsBeforeAuthorization(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	for _, html := range []string{
+		`{"slug":"private-mutations","html":"<html><body><p>v1</p></body></html>"}`,
+		`{"slug":"private-mutations","html":"<html><body><p>v2</p></body></html>"}`,
+	} {
+		if rec := do(t, h, http.MethodPost, "/v1/docs", auth, html); rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := do(t, h, http.MethodPost, "/v1/comments", auth,
+		`{"slug":"private-mutations","text":"seed","version":2}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("seed comment = %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil || created.Data.ID == "" {
+		t.Fatalf("seed comment response = %s: %v", rec.Body.String(), err)
+	}
+
+	for _, tc := range []struct {
+		name, method, target, payload string
+	}{
+		{"patch in range", http.MethodPatch, "/v1/comments", `{"slug":"private-mutations","id":"` + created.Data.ID + `","anchor":{"kind":"element","aid":"a"},"version":2}`},
+		{"patch out of range", http.MethodPatch, "/v1/comments", `{"slug":"private-mutations","id":"` + created.Data.ID + `","anchor":{"kind":"element","aid":"a"},"version":999999}`},
+		{"react in range", http.MethodPost, "/v1/reactions", `{"slug":"private-mutations","comment_id":"` + created.Data.ID + `","emoji":"x","version":2}`},
+		{"react out of range", http.MethodPost, "/v1/reactions", `{"slug":"private-mutations","comment_id":"` + created.Data.ID + `","emoji":"x","version":999999}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, tc.method, tc.target, map[string]string{"Content-Type": "application/json"}, tc.payload)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }
 
@@ -528,6 +574,120 @@ func TestCommentLifecycle(t *testing.T) {
 	}
 }
 
+func TestCommentMutationValidationAndAnchorRoundTrip(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	for _, html := range []string{
+		`{"slug":"anchors","html":"<html><body><p>v1</p></body></html>"}`,
+		`{"slug":"anchors","html":"<html><body><p>v2</p></body></html>"}`,
+	} {
+		if rec := do(t, h, http.MethodPost, "/v1/docs", auth, html); rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	for _, payload := range []string{
+		`{"slug":"anchors","text":"element","version":2,"anchor":{"kind":"element","aid":"a1","selector":"p"}}`,
+		`{"slug":"anchors","text":"text","version":"2","anchor":{"kind":"text","text":"hello","context_before":"before","context_after":"after"}}`,
+		`{"slug":"anchors","text":"latest","version":"latest","anchor":{"kind":"element","aid":"a-latest"}}`,
+		`{"slug":"anchors","text":"v2","version":"v2"}`,
+		`{"slug":"anchors","text":"zero","version":0}`,
+		`{"slug":"anchors","text":"null","version":null}`,
+		`{"slug":"anchors","text":"omitted"}`,
+	} {
+		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("compatible create = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := do(t, h, http.MethodGet, "/v1/comments?slug=anchors&version=all", authorHdrNoCT(), "")
+	var listed struct {
+		Data []struct {
+			ID        string         `json:"id"`
+			CreatedIn int            `json:"created_in"`
+			Anchor    map[string]any `json:"anchor"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Data) != 7 {
+		t.Fatalf("comment count = %d, want 7: %s", len(listed.Data), rec.Body.String())
+	}
+	if listed.Data[0].Anchor["kind"] != "element" || listed.Data[0].Anchor["aid"] != "a1" || listed.Data[0].Anchor["selector"] != "p" {
+		t.Fatalf("element anchor not preserved: %#v", listed.Data[0].Anchor)
+	}
+	if listed.Data[1].Anchor["kind"] != "text" || listed.Data[1].Anchor["text"] != "hello" || listed.Data[1].Anchor["context_before"] != "before" || listed.Data[1].Anchor["context_after"] != "after" {
+		t.Fatalf("text anchor not preserved: %#v", listed.Data[1].Anchor)
+	}
+	if listed.Data[2].CreatedIn != 2 || listed.Data[2].Anchor["aid"] != "a-latest" {
+		t.Fatalf("latest did not resolve to rendered latest version: %#v", listed.Data[2])
+	}
+	for i := 3; i < len(listed.Data); i++ {
+		if listed.Data[i].Anchor != nil {
+			t.Fatalf("unanchored comment %d gained anchor: %#v", i, listed.Data[i].Anchor)
+		}
+	}
+
+	for _, tc := range []struct {
+		method, target, payload string
+	}{
+		{http.MethodPost, "/v1/comments", `{"slug":"anchors","text":"bad","version":-1}`},
+		{http.MethodPost, "/v1/comments", `{"slug":"anchors","text":"bad","version":"garbage"}`},
+		{http.MethodPost, "/v1/comments", `{"slug":"anchors","text":"bad","version":2}{"anchor":{"kind":"element","aid":"a2"}}`},
+		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":`},
+		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":2} trailing`},
+		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":`},
+		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[0].ID + `","emoji":"x","version":2}{}`},
+	} {
+		rec := do(t, h, tc.method, tc.target, auth, tc.payload)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("malformed %s = %d, want 400: %s", tc.target, rec.Code, rec.Body.String())
+		}
+	}
+
+	for _, tc := range []struct {
+		method, target, payload string
+	}{
+		{http.MethodPatch, "/v1/comments", `{"slug":"anchors","id":"` + listed.Data[0].ID + `","anchor":{"kind":"element","aid":"a2"},"version":"latest"}`},
+		{http.MethodPost, "/v1/reactions", `{"slug":"anchors","comment_id":"` + listed.Data[4].ID + `","emoji":"x","version":0}`},
+	} {
+		rec := do(t, h, tc.method, tc.target, auth, tc.payload)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("compatible %s = %d: %s", tc.target, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestCommentMutationRejectsFutureAndDuplicateVersions(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	if rec := do(t, h, http.MethodPost, "/v1/docs", auth,
+		`{"slug":"strict-versions","html":"<html><body><section>v1</section></body></html>"}`); rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+	payloads := []string{
+		`{"slug":"strict-versions","text":"future","version":999999}`,
+		`{"slug":"strict-versions","text":"duplicate","version":1,"version":999999}`,
+		`{"slug":"strict-versions","text":"nested duplicate","version":1,"anchor":{"kind":"element","aid":"a","aid":"b"}}`,
+		`{"slug":"strict-versions","anchor":` + strings.Repeat(`[`, 10_000) + `null` + strings.Repeat(`]`, 10_000) + `}`,
+	}
+	for _, payload := range payloads {
+		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("payload %s = %d, want 400: %s", payload, rec.Code, rec.Body.String())
+		}
+	}
+	rec := do(t, h, http.MethodGet, "/v1/comments?slug=strict-versions&version=all", authorHdrNoCT(), "")
+	var listed struct {
+		Data []json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil || len(listed.Data) != 0 {
+		t.Fatalf("rejected mutations persisted: data=%s err=%v", rec.Body.String(), err)
+	}
+}
+
 func TestForkExport(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
@@ -592,5 +752,114 @@ func TestInvalidSlugRejected(t *testing.T) {
 	rec := do(t, h, http.MethodGet, "/v1/comments?slug=../etc", nil, "")
 	if rec.Code != 400 {
 		t.Fatalf("bad slug = %d; want 400", rec.Code)
+	}
+}
+
+// Finding 1: on a draft-only doc (zero PUBLISHED versions) a comment created
+// with version="latest" must resolve to a CONCRETE version 1 — never the latest
+// sentinel (core.VersionLatest / math.MaxInt) — so the event folds correctly and
+// stays draft-overlay (version 0) compatible. The same doc must accept a
+// re-anchor and a reaction at "latest", and the persisted text/anchor/reaction
+// must fold back at version 1.
+func TestDraftOnlyLatestResolvesToConcreteVersion(t *testing.T) {
+	h := newTestServer(t, nil)
+	// Draft-first requires the IsOwner (superAdmin) identity; no publish happens,
+	// so ListVersions returns zero versions for this slug.
+	auth := adminHdr()
+	if rec := do(t, h, http.MethodPut, "/v1/docs/draftonly/draft", auth,
+		`{"html":"<html><body><section><p>draft body</p></section></body></html>"}`); rec.Code != http.StatusOK {
+		t.Fatalf("draft save = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Create at "latest" with an element anchor. Zero published versions ⇒ must
+	// resolve to concrete v1, not math.MaxInt.
+	rec := do(t, h, http.MethodPost, "/v1/comments", auth,
+		`{"slug":"draftonly","text":"draft note","version":"latest","anchor":{"kind":"element","aid":"a0"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create at latest (draft-only) = %d: %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		Data struct {
+			ID      string `json:"id"`
+			Version int    `json:"version"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v (%s)", err, rec.Body.String())
+	}
+	if created.Data.ID == "" {
+		t.Fatalf("no comment id: %s", rec.Body.String())
+	}
+	if created.Data.Version != 1 {
+		t.Fatalf("created version = %d; want concrete 1 (not the latest sentinel)", created.Data.Version)
+	}
+
+	// Re-anchor (PATCH) at "latest" — also draft-only, must resolve to v1.
+	rec = do(t, h, http.MethodPatch, "/v1/comments", auth,
+		`{"slug":"draftonly","id":"`+created.Data.ID+`","anchor":{"kind":"element","aid":"a1"},"version":"latest"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reanchor at latest (draft-only) = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// React at "latest" — same path.
+	rec = do(t, h, http.MethodPost, "/v1/reactions", auth,
+		`{"slug":"draftonly","comment_id":"`+created.Data.ID+`","emoji":"👍","version":"latest"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("react at latest (draft-only) = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Fold at the concrete version 1: the persisted text, the re-anchored aid, and
+	// the reaction must all be present — proving nothing landed on math.MaxInt.
+	list := do(t, h, http.MethodGet, "/v1/comments?slug=draftonly&version=1", adminHdrNoCT(), "").Body.String()
+	var folded struct {
+		Data []struct {
+			Text      string              `json:"text"`
+			Version   int                 `json:"version"`
+			Anchor    map[string]any      `json:"anchor"`
+			Reactions map[string][]string `json:"reactions"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(list), &folded); err != nil {
+		t.Fatalf("decode fold v1: %v (%s)", err, list)
+	}
+	if len(folded.Data) != 1 {
+		t.Fatalf("fold count = %d; want 1: %s", len(folded.Data), list)
+	}
+	c := folded.Data[0]
+	if c.Text != "draft note" {
+		t.Errorf("folded text = %q; want draft note", c.Text)
+	}
+	if c.Version != 1 {
+		t.Errorf("folded version = %d; want 1", c.Version)
+	}
+	if c.Anchor["kind"] != "element" || c.Anchor["aid"] != "a1" {
+		t.Errorf("folded anchor = %#v; want the re-anchored element aid a1", c.Anchor)
+	}
+	if len(c.Reactions["👍"]) == 0 {
+		t.Errorf("folded reaction missing: %#v", c.Reactions)
+	}
+}
+
+// Finding 1 defense-in-depth: a numeric version equal to the latest sentinel
+// (core.VersionLatest / math.MaxInt) supplied directly, quoted, or v-prefixed
+// must be REJECTED at decode — only the literal string "latest" reaches the
+// sentinel — so it can never be persisted as a comment's at_version.
+func TestSentinelNumericVersionRejected(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	if rec := do(t, h, http.MethodPost, "/v1/docs", auth,
+		`{"slug":"sentinel","html":"<html><body><p>v1</p></body></html>"}`); rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+	const maxInt = "9223372036854775807" // math.MaxInt on the 64-bit test platform
+	for _, payload := range []string{
+		`{"slug":"sentinel","text":"x","version":` + maxInt + `}`,
+		`{"slug":"sentinel","text":"x","version":"` + maxInt + `"}`,
+		`{"slug":"sentinel","text":"x","version":"v` + maxInt + `"}`,
+	} {
+		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("sentinel numeric version %q = %d; want 400", payload, rec.Code)
+		}
 	}
 }

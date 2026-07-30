@@ -126,6 +126,9 @@ type PublishInput struct {
 	PublisherToken string
 
 	mountContextKnown bool
+	pinnedAID         string
+	pinnedTag         string
+	anchorMigrations  map[string]string
 }
 
 // PublishResult is the result of a successful publish.
@@ -133,7 +136,6 @@ type PublishResult struct {
 	Slug           string `json:"slug"`
 	Version        int    `json:"version"`
 	URL            string `json:"url"`
-	RenderURL      string `json:"render_url"`
 	DocID          string `json:"doc_id"`
 	ShareURL       string `json:"share_url"`
 	Registered     bool   `json:"registered"`
@@ -237,7 +239,7 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		return nil, err
 	}
 
-	merge, err := s.comments.PublishMergeLocked(ctx, in.Slug, in.LocalComments, stamped.AIDs, version)
+	merge, err := s.comments.PublishMergeWithMigrationsLocked(ctx, in.Slug, in.LocalComments, stamped.AIDs, version, in.pinnedAID, in.pinnedTag, in.anchorMigrations)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +253,6 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 	return &PublishResult{
 		Slug:              in.Slug,
 		Version:           version,
-		RenderURL:         fmt.Sprintf("%s/d/%s/v/%d", s.baseURL, in.Slug, version),
 		Status:            publishStatusPublished,
 		Size:              size,
 		AIDs:              len(stamped.AIDs),
@@ -332,6 +333,10 @@ func (s *DocService) GetElement(ctx context.Context, slug string, version int, a
 // stamp here (StampAids) since publishLocked takes an already-stamped result.
 // newHTML must be a single top-level element (no multiple elements, no
 // script/style, no inline event handlers, no javascript: URLs, no data-odoc-*).
+// After validation the backend injects the target's existing aid onto the
+// replacement root for this publish only. Reconciliation validates that the aid
+// is unique and refreshes the anchor fingerprint atomically when the tag changes;
+// later plain publishes compute normal content-derived identity again.
 func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersion int, aid, newHTML string) (*PublishResult, error) {
 	if aid == "" {
 		return nil, apperr.Validation("aid required", "aid_required")
@@ -354,6 +359,13 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 	if core.HasDataOdocAttr(newHTML) {
 		return nil, apperr.Validation("new_html must not carry data-odoc-* attributes", "new_html_has_odoc_attr")
 	}
+	// Root must remain addressable in the replacement version. The pin is only an
+	// immediate publish exception; it is not a durable identity promise.
+	if !core.IsHarvestableReplacementRoot(newHTML) {
+		return nil, apperr.Validation(
+			"new_html root must be a stampable element or carry class \"odoc-artifact\"",
+			"new_html_root_not_addressable")
+	}
 
 	var result *PublishResult
 	err := s.lock.With(ctx, slug, func() error {
@@ -371,20 +383,40 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 		if rd == nil {
 			return apperr.NotFound("document version not found")
 		}
-		replaced, ok := core.ReplaceElementByAID(rd.HTML, aid, newHTML)
+		injected, localRoot := core.InjectRootAIDAt(newHTML, aid)
+		replaced, boundary, ok := core.ReplaceElementByAIDAt(rd.HTML, aid, injected)
 		if !ok {
 			return apperr.NotFound("aid not found in this version")
 		}
 		if int64(len(replaced)) > s.maxBytes {
 			return apperr.PayloadTooLarge(fmt.Sprintf("document exceeds %d bytes", s.maxBytes), "html_too_large")
 		}
-		// Stamp here (publishLocked expects a stamped result) and publish without
-		// re-acquiring the lock — Publish would deadlock via a nested lock.With.
-		stamped := core.StampAids(replaced)
+		// Emit the replacement root's canonical content identity immediately. Pinning
+		// that canonical AID at the exact replacement offset salts any other collision
+		// away while every unrelated artifact is stamped normally.
+		rootCanonical := core.StampAids(newHTML)
+		if len(rootCanonical.AIDs) == 0 {
+			return apperr.Validation("new_html root has no canonical aid", "new_html_root_not_addressable")
+		}
+		canonicalAID := rootCanonical.AIDs[0].AID
+		canonical := core.StampAids(replaced)
+		matches := 0
+		for _, artifact := range canonical.AIDs {
+			if artifact.AID == canonicalAID {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return apperr.Validation("replacement canonical aid is ambiguous", "new_html_canonical_aid_ambiguous")
+		}
+		stamped := core.StampAidsPinned(replaced, canonicalAID, boundary+localRoot)
 		in, ierr := s.existingPublishInput(ctx, slug, replaced, "")
 		if ierr != nil {
 			return ierr
 		}
+		in.pinnedAID = aid
+		in.pinnedTag, _ = core.SingleTopLevelTag(newHTML)
+		in.anchorMigrations = map[string]string{aid: canonicalAID}
 		r, perr := s.publishLocked(ctx, in, stamped)
 		if perr != nil {
 			return perr

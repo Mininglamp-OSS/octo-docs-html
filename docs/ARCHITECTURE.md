@@ -165,12 +165,35 @@ PATCH/DELETE are the seam a future Octo unified login activates.
 | `POST`   | `/v1/docs/:slug/share` | mint/rotate the per-doc read+comment code → `{ code, url }` |
 | `DELETE` | `/v1/docs/:slug/share` | revoke the share code |
 | `POST`   | `/v1/agent/replies` | agent posts a reply + verdict (✅/🟡/❓) |
+| `POST`   | `/v1/agent/element/get` | return one stamped element by AID; body `version` is an integer, where `0` means latest |
+| `POST`   | `/v1/agent/element/replace` | replace one stamped element and publish a new version; body `base_version` is an integer, where `0` means latest |
 | `DELETE` | `/v1/docs/:slug` | delete all versions + comments |
 | `DELETE` | `/v1/comments?slug=&all=1` | wipe all comments for a slug |
 | `POST`   | `/v1/admin/bootstrap` | mint the first write token (then 409s) |
 
 Author endpoints accept the write token as `Authorization: Bearer` (CLI) or, for
 the browser Publish/Share buttons, the author credential via the per-doc cookie.
+
+Comment mutation JSON accepts a non-negative integer, a decimal string, a
+`"v<N>"` string, or `"latest"` for `version`; omitted or `null` means the
+endpoint default. Comment list queries accept an integer, `v<N>`, `all`, or an
+omitted value. Element get/replace use integer fields only (`0` = latest).
+
+Element replacement requires `new_html` to contain exactly one safe root. The
+root must either be a normally stamped artifact tag or carry
+`class="odoc-artifact"`; otherwise the request returns `400 VALIDATION_ERROR`
+with detail code `new_html_root_not_addressable`. The replacement root keeps the
+requested AID for that immediate publish only. Reconciliation accepts it only
+when the AID is unique and refreshes the tag fingerprint in the same comment
+mutation; later plain publishes re-stamp normally. Reused or ambiguous AIDs are
+marked lost rather than guessed, so this endpoint does not promise a durable pin.
+
+`iframe` remains a non-void element for lookup and replacement boundaries, so
+fallback content is inside the addressed outer HTML. For compatibility with
+already-published documents, reconciliation also computes the historical alias
+`aidFor("iframe", "", attrs)`. That alias is never emitted and never used for
+element boundaries: a unique alias migrates to the canonical AID, while an
+ambiguous or reused alias is marked lost.
 
 ### Viewer sessions
 
@@ -203,7 +226,7 @@ POST /v1/docs  (Authorization: Bearer <token>, multipart or JSON)
   ├─ metaStore.putMeta        monotonic versions[]
   ├─ commentStore.publish_merge   reconcile anchors + merge local comments
   └─ docs-backend register       bounded idempotent retries; never republishes HTML
-     → { slug, version, url, render_url, doc_id, share_url, registered, status, size, aids, merged_comments }
+     → { slug, version, url, doc_id, share_url, registered, status, size, aids, merged_comments }
 ```
 
 `created:false` from docs-backend is an existing-row success. If registration

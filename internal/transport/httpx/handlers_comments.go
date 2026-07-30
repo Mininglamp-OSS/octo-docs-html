@@ -1,8 +1,13 @@
 package httpx
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/core"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
@@ -13,6 +18,171 @@ import (
 // mutationLike mirrors service.MutationResult so both create/reply branches can
 // be assigned to one variable.
 type mutationLike service.MutationResult
+
+type mutationVersion int
+
+// mutationVersionSentinel is core.VersionLatest as a mutationVersion. It is the
+// ONLY value meaning "latest", reachable ONLY via the literal string "latest";
+// resolveMutationVersion turns it into a concrete version before storage.
+const mutationVersionSentinel = mutationVersion(core.VersionLatest)
+
+func (v *mutationVersion) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "null" {
+		*v = 0
+		return nil
+	}
+	if len(raw) >= 2 && raw[0] == '"' {
+		var text string
+		if err := json.Unmarshal(data, &text); err != nil {
+			return err
+		}
+		switch text {
+		case "latest":
+			*v = mutationVersionSentinel
+			return nil
+		default:
+			text = strings.TrimPrefix(text, "v")
+			n, err := parseConcreteVersion(text)
+			if err != nil {
+				return err
+			}
+			*v = mutationVersion(n)
+			return nil
+		}
+	}
+	n, err := parseConcreteVersion(raw)
+	if err != nil {
+		return err
+	}
+	*v = mutationVersion(n)
+	return nil
+}
+
+// parseConcreteVersion parses a non-negative decimal version that is NOT the
+// latest sentinel. A numeric input equal to core.VersionLatest (bare, quoted, or
+// v-prefixed) is rejected so only the literal "latest" can reach the sentinel.
+func parseConcreteVersion(text string) (int, error) {
+	n, err := strconv.Atoi(text)
+	if err != nil || n < 0 || n == core.VersionLatest {
+		return 0, strconv.ErrSyntax
+	}
+	return n, nil
+}
+
+func decodeCommentMutation(w http.ResponseWriter, r *http.Request, body any) error {
+	if r.Body == nil {
+		return apperr.Validation("invalid request body", "invalid_body")
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+	data, err := io.ReadAll(r.Body)
+	if err != nil || rejectDuplicateJSONKeys(data) != nil {
+		return apperr.Validation("invalid request body", "invalid_body")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(body); err != nil {
+		return apperr.Validation("invalid request body", "invalid_body")
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return apperr.Validation("invalid request body", "invalid_body")
+	}
+	return nil
+}
+
+const maxCommentJSONDepth = 64
+
+func rejectDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := inspectJSONValue(decoder, 0); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return fmt.Errorf("trailing JSON")
+	}
+	return nil
+}
+
+func inspectJSONValue(decoder *json.Decoder, depth int) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	if depth >= maxCommentJSONDepth {
+		return fmt.Errorf("JSON nesting exceeds limit")
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("invalid object key")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate object key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := inspectJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	case '[':
+		for decoder.More() {
+			if err := inspectJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		_, err = decoder.Token()
+		return err
+	default:
+		return fmt.Errorf("unexpected delimiter")
+	}
+}
+
+// resolveMutationVersion turns the request's version selector into a CONCRETE
+// version to stamp on the mutation; it never returns the latest sentinel
+// (folding at MaxInt would misorder events and break draft-overlay v0). For
+// "latest" it picks the newest published version, or concrete v1 when nothing is
+// published yet (draft-only) — the same floor v0/omitted/null resolve to.
+func (s *Server) resolveMutationVersion(r *http.Request, slug string, version mutationVersion) (int, error) {
+	if version == mutationVersionSentinel {
+		versions, err := s.docs.ListVersions(r.Context(), slug)
+		if err != nil {
+			return 0, err
+		}
+		if versions != nil && len(versions.Versions) > 0 {
+			return versions.Versions[len(versions.Versions)-1].N, nil
+		}
+		// Zero published versions (draft-only): concrete floor, never the sentinel.
+		return 1, nil
+	}
+	if version <= 0 {
+		return 1, nil
+	}
+	versions, err := s.docs.ListVersions(r.Context(), slug)
+	if err != nil {
+		return 0, err
+	}
+	latest := 1
+	if versions != nil && len(versions.Versions) > 0 {
+		latest = versions.Versions[len(versions.Versions)-1].N
+	}
+	if int(version) > latest {
+		return 0, apperr.Validation("version exceeds latest document version", "invalid_version")
+	}
+	return int(version), nil
+}
 
 // viewer resolves the current viewer (octo bridge first, then legacy cookie),
 // or nil for anonymous. Never errors on "no session".
@@ -56,13 +226,15 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) err
 		return err
 	}
 	var body struct {
-		Slug     string       `json:"slug"`
-		Text     string       `json:"text"`
-		Version  json.Number  `json:"version"`
-		ParentID *string      `json:"parent_id"`
-		Anchor   *core.Anchor `json:"anchor"`
+		Slug     string          `json:"slug"`
+		Text     string          `json:"text"`
+		Version  mutationVersion `json:"version"`
+		ParentID *string         `json:"parent_id"`
+		Anchor   *core.Anchor    `json:"anchor"`
 	}
-	_ = decodeJSON(w, r, &body)
+	if err := decodeCommentMutation(w, r, &body); err != nil {
+		return err
+	}
 	slug, err := requireSlug(body.Slug)
 	if err != nil {
 		return err
@@ -75,7 +247,10 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) err
 	if body.Text == "" {
 		return apperr.Validation("slug and text required", "text_required")
 	}
-	version := numOr1(body.Version)
+	version, err := s.resolveMutationVersion(r, slug, body.Version)
+	if err != nil {
+		return err
+	}
 	var res mutationLike
 	if body.ParentID != nil && *body.ParentID != "" {
 		mr, merr := s.comments.Reply(r.Context(), slug, *body.ParentID, authorFromSession(session), body.Text, version)
@@ -100,27 +275,33 @@ func (s *Server) handlePatchComment(w http.ResponseWriter, r *http.Request) erro
 		return err
 	}
 	var body struct {
-		Slug    string       `json:"slug"`
-		ID      string       `json:"id"`
-		Anchor  *core.Anchor `json:"anchor"`
-		Version json.Number  `json:"version"`
+		Slug    string          `json:"slug"`
+		ID      string          `json:"id"`
+		Anchor  *core.Anchor    `json:"anchor"`
+		Version mutationVersion `json:"version"`
 	}
-	_ = decodeJSON(w, r, &body)
+	if err := decodeCommentMutation(w, r, &body); err != nil {
+		return err
+	}
 	slug, err := requireSlug(body.Slug)
 	if err != nil {
+		return err
+	}
+	if err := s.requireDocCap(r, slug); err != nil {
 		return err
 	}
 	if body.ID == "" || body.Anchor == nil {
 		return apperr.Validation("slug, id, anchor required", "anchor_required")
 	}
-	if err := s.requireDocCap(r, slug); err != nil {
+	version, err := s.resolveMutationVersion(r, slug, body.Version)
+	if err != nil {
 		return err
 	}
 	if err := s.authorizeMutation(r, slug, body.ID, session); err != nil {
 		return err
 	}
 	actor := actorLogin(session)
-	mr, err := s.comments.Reanchor(r.Context(), slug, body.ID, body.Anchor, numOr1(body.Version), actor)
+	mr, err := s.comments.Reanchor(r.Context(), slug, body.ID, body.Anchor, version, actor)
 	if err != nil {
 		return err
 	}
@@ -168,14 +349,19 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	var body struct {
-		Slug      string      `json:"slug"`
-		CommentID string      `json:"comment_id"`
-		Emoji     string      `json:"emoji"`
-		Version   json.Number `json:"version"`
+		Slug      string          `json:"slug"`
+		CommentID string          `json:"comment_id"`
+		Emoji     string          `json:"emoji"`
+		Version   mutationVersion `json:"version"`
 	}
-	_ = decodeJSON(w, r, &body)
+	if err := decodeCommentMutation(w, r, &body); err != nil {
+		return err
+	}
 	slug, err := requireSlug(body.Slug)
 	if err != nil {
+		return err
+	}
+	if err := s.requireDocCap(r, slug); err != nil {
 		return err
 	}
 	if body.CommentID == "" || body.Emoji == "" {
@@ -184,14 +370,15 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) error {
 	if len(body.Emoji) == 0 || len(body.Emoji) > 32 {
 		return apperr.Validation("invalid emoji", "invalid_emoji")
 	}
-	if err := s.requireDocCap(r, slug); err != nil {
+	version, err := s.resolveMutationVersion(r, slug, body.Version)
+	if err != nil {
 		return err
 	}
 	by := "anon"
 	if session != nil {
 		by = session.Login
 	}
-	mr, err := s.comments.React(r.Context(), slug, body.CommentID, body.Emoji, by, numOr1(body.Version))
+	mr, err := s.comments.React(r.Context(), slug, body.CommentID, body.Emoji, by, version)
 	if err != nil {
 		return err
 	}
@@ -261,15 +448,4 @@ func actorLogin(session *storage.Session) string {
 		return session.Login
 	}
 	return "local"
-}
-
-func numOr1(n json.Number) int {
-	if n == "" {
-		return 1
-	}
-	v, err := n.Int64()
-	if err != nil || v == 0 {
-		return 1
-	}
-	return int(v)
 }
