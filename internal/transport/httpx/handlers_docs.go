@@ -331,7 +331,18 @@ func (s *Server) handleVersionSource(w http.ResponseWriter, r *http.Request) err
 	etag := fmt.Sprintf(`"%x"`, sha256.Sum256([]byte(source)))
 	w.Header().Set("ETag", etag)
 	w.Header().Set("X-Document-Version", strconv.Itoa(resolved))
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Serve stored user-authored bytes as inert source, never active HTML.
+	// Consumers (the Web source-diff view) read this as text; nothing renders
+	// it as a document. text/plain + nosniff stops the browser from executing
+	// or content-sniffing it into an HTML/script context on this same origin.
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// This route sets headers by hand (not secHeaders), so re-apply the raw-byte
+	// lockdown the asset route uses for same-origin user content: no execution
+	// context, no framing, no Referer leak. Mirrors handleServeAsset.
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	if immutable {
 		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	}

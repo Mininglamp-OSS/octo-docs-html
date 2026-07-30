@@ -880,6 +880,14 @@ func TestVersionSourceReturnsStoredHTMLAndImmutableETag(t *testing.T) {
 	if strings.Contains(body, "window.__ODOC__") || strings.Contains(body, "/* overlay */") {
 		t.Fatalf("source contains overlay injection: %s", body)
 	}
+	// Source bytes must be served inert, never as an executable same-origin
+	// document. The Web source-diff view consumes this as text.
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Fatalf("source Content-Type = %q; want text/plain; charset=utf-8", ct)
+	}
+	if nosniff := rec.Header().Get("X-Content-Type-Options"); nosniff != "nosniff" {
+		t.Fatalf("source X-Content-Type-Options = %q; want nosniff", nosniff)
+	}
 	etag := rec.Header().Get("ETag")
 	if etag == "" || rec.Header().Get("Cache-Control") != "private, max-age=31536000, immutable" {
 		t.Fatalf("cache headers: ETag=%q Cache-Control=%q", etag, rec.Header().Get("Cache-Control"))
@@ -909,6 +917,56 @@ func TestVersionSourceReturnsStoredHTMLAndImmutableETag(t *testing.T) {
 	h.ServeHTTP(latestNotModified, latestReq)
 	if latestNotModified.Code != http.StatusNotModified || latestNotModified.Body.Len() != 0 {
 		t.Fatalf("conditional latest = %d body=%q", latestNotModified.Code, latestNotModified.Body.String())
+	}
+}
+
+// TestVersionSourceIsInertAndAuthGated pins the security contract for the raw
+// source endpoint: stored user-authored bytes are returned verbatim (the Web
+// source-diff view needs them) but are served inert so a browser cannot execute
+// them as a same-origin HTML/script document, and read authorization is still
+// required. This is a regression guard for the same-origin executable-surface
+// finding on PR #25.
+func TestVersionSourceIsInertAndAuthGated(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	// A payload that would run script if the browser ever treated it as HTML.
+	rec := do(t, h, http.MethodPost, "/v1/docs", auth,
+		`{"slug":"inert","html":"<html><body><section><p>needle</p><script>window.__pwned=1<\/script></section></body></html>"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Read auth remains: an unauthenticated caller gets a hidden 404, not the bytes.
+	if anon := do(t, h, http.MethodGet, "/v1/docs/inert/versions/1/source", nil, ""); anon.Code != http.StatusNotFound {
+		t.Fatalf("unauthenticated source = %d; want 404", anon.Code)
+	}
+
+	rec = do(t, h, http.MethodGet, "/v1/docs/inert/versions/1/source", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("source = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The bytes are returned (the source-diff consumer reads them as text)...
+	body := rec.Body.String()
+	if !strings.Contains(body, "needle") || !strings.Contains(body, "window.__pwned") {
+		t.Fatalf("source did not return stored bytes: %s", body)
+	}
+
+	// ...but the response cannot execute as HTML in a same-origin context.
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Fatalf("Content-Type = %q; want inert text/plain; charset=utf-8", ct)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q; want nosniff (no content sniffing into HTML)", got)
+	}
+	if csp := rec.Header().Get("Content-Security-Policy"); csp != "default-src 'none'; sandbox" {
+		t.Fatalf("Content-Security-Policy = %q; want default-src 'none'; sandbox", csp)
+	}
+	if xfo := rec.Header().Get("X-Frame-Options"); xfo != "DENY" {
+		t.Fatalf("X-Frame-Options = %q; want DENY", xfo)
+	}
+	if ref := rec.Header().Get("Referrer-Policy"); ref != "no-referrer" {
+		t.Fatalf("Referrer-Policy = %q; want no-referrer", ref)
 	}
 }
 
