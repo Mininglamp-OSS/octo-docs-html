@@ -143,6 +143,20 @@ func roleLabelToCode(role string) (int, bool) {
 	}
 }
 
+// CapabilityForGrantRole maps a legacy meta.grants role label to a Capability.
+// It composes roleLabelToCode + CapabilityForDocRole so the unwired/single-node
+// fallback honours the four-role vocabulary (reader→Read, commenter→Comment,
+// writer→Edit) instead of clamping every stored grant to read. Unknown labels
+// fail closed to CapNone. admin is never authored into meta.grants (AddGrant
+// rejects it), so this cannot mint Manage from the legacy fallback.
+func CapabilityForGrantRole(role string) Capability {
+	code, ok := roleLabelToCode(role)
+	if !ok {
+		return CapNone
+	}
+	return CapabilityForDocRole(code)
+}
+
 // AddGrant grants uid a role on slug (upsert). grantedBy records who authorized
 // it. Accepts reader/commenter/writer; admin is refused here — admin identity is
 // owned by creator_uid + the M1 backfill, never mintable through the grants API

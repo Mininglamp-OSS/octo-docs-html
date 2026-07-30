@@ -208,16 +208,24 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 				fallbackAllowed = false
 			}
 		}
-		if best < service.CapRead && fallbackAllowed && matchUID != "" {
+		// Legacy meta.grants can carry reader/commenter/writer in unwired mode,
+		// so probe while best is still below the writer ceiling (CapEdit) rather
+		// than below CapRead: a commenter/writer grant may legitimately upgrade a
+		// caller who already holds CapRead from another tier (e.g. a share code).
+		if best < service.CapEdit && fallbackAllowed && matchUID != "" {
 			meta, err := s.auth.MetaFor(r.Context(), slug)
 			if err != nil {
 				return service.CapNone, err
 			}
-			// Legacy meta.grants only ever carried reader-tier grants, so the
-			// unwired fallback lifts CapRead only — never comment/edit.
-			if meta != nil && meta.GrantRole(matchUID) != "" { //nolint:staticcheck // A4 fallback covers the registration gap and unwired deployments
-				if service.CapRead > best {
-					best = service.CapRead
+			// Legacy meta.grants is only consulted in unwired/single-node mode
+			// (registered docs force fallbackAllowed=false above). In that mode the
+			// same meta.grants store both grants and revokes, so there is no
+			// stale-grant revoke bypass, and the four-role vocabulary can be
+			// honoured: reader→Read, commenter→Comment, writer→Edit. Unknown
+			// labels map to CapNone (fail closed); admin is never authored here.
+			if meta != nil { //nolint:staticcheck // A4 fallback covers the registration gap and unwired deployments
+				if c := service.CapabilityForGrantRole(meta.GrantRole(matchUID)); c > best {
+					best = c
 				}
 			}
 		}
