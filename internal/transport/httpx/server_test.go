@@ -860,6 +860,10 @@ func TestSentinelNumericVersionRejected(t *testing.T) {
 		rec := do(t, h, http.MethodPost, "/v1/comments", auth, payload)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("sentinel numeric version %q = %d; want 400", payload, rec.Code)
+		}
+	}
+}
+
 func TestVersionSourceReturnsStoredHTMLAndImmutableETag(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()

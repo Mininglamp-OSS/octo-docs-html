@@ -13,6 +13,54 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
 )
 
+// TestDiffUnclosedTagTailIsPlainTextAndTerminates covers the malformed-input
+// hardening for the diff parser: an unclosed '<' tail (no closing '>' exists)
+// must be treated as plain text and terminate the scan — never an invalid
+// slice, panic, or infinite loop — while the existing bounds still hold. The
+// cases mirror the acceptance list ('<', 'abc<', '<div', '<!--', '<script')
+// plus a few adjacent shapes. Exercises BOTH parse paths (parseDiffHTML for the
+// structural tree and normalizedHTMLLines for the code-hunk view) via the full
+// buildVersionDiff entry point.
+func TestDiffUnclosedTagTailIsPlainTextAndTerminates(t *testing.T) {
+	cases := []string{
+		"<",
+		"abc<",
+		"<div",
+		"<!--",
+		"<script",
+		"text<",
+		"<!",
+		"<?",
+		"</",
+		"</div",
+		"<div class=\"x",
+		"<a href='",
+		"<!--unterminated comment",
+		"<script>alert(1)",
+		"<style>body{",
+		"<textarea>hi",
+		"<p>ok</p>trailing<",
+	}
+	for _, source := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parse panicked on %q: %v", source, r)
+				}
+			}()
+			if _, err := parseDiffHTML(source); err != nil && err != errDiffLimit {
+				t.Fatalf("parseDiffHTML(%q) unexpected err = %v", source, err)
+			}
+			if _, ok := normalizedHTMLLines(source); !ok {
+				t.Fatalf("normalizedHTMLLines(%q) returned ok=false for a bounded input", source)
+			}
+			if _, err := buildVersionDiff(1, 2, source, source+"x"); err != nil && err != errDiffLimit {
+				t.Fatalf("buildVersionDiff(%q) unexpected err = %v", source, err)
+			}
+		}()
+	}
+}
+
 func TestBuildVersionDiffMatchesChangedElementWithoutStableAID(t *testing.T) {
 	before := `<html><body><section data-odoc-aid="old"><p class="lead">alpha text</p></section></body></html>`
 	after := `<html><body><section data-odoc-aid="new"><p class="lead">alpha text updated</p></section></body></html>`

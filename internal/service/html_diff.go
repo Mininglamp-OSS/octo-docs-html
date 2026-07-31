@@ -964,7 +964,12 @@ func normalizedHTMLLines(source string) ([]string, bool) {
 		if source[cursor] == '<' {
 			end := diffTagEnd(source, cursor)
 			if end < 0 {
-				end = len(source) - 1
+				// Unclosed '<' tail (no closing '>'): treat the remainder as plain
+				// text and terminate; do not slice an invalid tag range.
+				if !appendNormalizedDiffText(&lines, source[cursor:], false) {
+					return nil, false
+				}
+				break
 			}
 			rawTag := source[cursor+1 : end]
 			trimmed := strings.TrimSpace(rawTag)
