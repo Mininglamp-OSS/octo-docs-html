@@ -343,7 +343,7 @@ func (s *Server) requireDocCommentSlug(r *http.Request, slug string) error {
 	return s.requireDocCapability(r, slug, service.CapComment)
 }
 
-// requireDocEditSlug requires CapEdit (AI/draft/publish/undo/thread moderation).
+// requireDocEditSlug requires CapEdit (AI/draft/publish/thread moderation).
 func (s *Server) requireDocEditSlug(r *http.Request, slug string) error {
 	return s.requireDocCapability(r, slug, service.CapEdit)
 }

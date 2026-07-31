@@ -2,8 +2,10 @@ package httpx
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -128,10 +130,6 @@ func (s *Server) Handler() http.Handler {
 		// read-only; Replace republishes a new version (rate-limited like publish).
 		r.Post("/agent/element/get", s.cors(s.wrap(s.handleAgentElementGet)))
 		r.Post("/agent/element/replace", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleAgentElementReplace))))
-		// Conflict-safe append-only undo of one AI element_replace. Slug is in the
-		// path, so it rides the requireDocEdit path middleware (Edit tier); the
-		// handler enforces expected_current_version → 409 on any later change.
-		r.With(s.requireDocEdit).Post("/docs/{slug}/operations/{operationId}/undo", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleUndoOperation))))
 	})
 
 	// Rendered docs + export/fork. Default-private: a reader needs the doc's share
@@ -157,13 +155,41 @@ func (s *Server) Handler() http.Handler {
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "Not found", http.StatusNotFound)
 	})
-	return middleware.RequestID(s.octoIdentityMiddleware(s.botAuthMiddleware(s.verifyUserToken(s.accessLog(r)))))
+	return s.recoverer(middleware.RequestID(s.octoIdentityMiddleware(s.botAuthMiddleware(s.verifyUserToken(s.accessLog(r))))))
+}
+
+// recoverer is the outermost middleware: it catches ANY panic in the middleware
+// chain or handlers (including unwrapped handlers and middleware itself). It
+// wraps the ResponseWriter to track whether the response has been committed. On
+// panic: if nothing was written yet, emit a controlled 500 envelope; if the
+// response was already committed, log only and never append a corrupt
+// status/body to the in-flight response.
+func (s *Server) recoverer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &recordingWriter{ResponseWriter: w}
+		defer func() {
+			if p := recover(); p != nil {
+				s.logger.Error("panic recovered",
+					"method", r.Method, "path", r.URL.Path,
+					"committed", rec.committed,
+					"panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+				if !rec.committed {
+					writeErr(rec, s.logger, fmt.Errorf("panic: %v", p))
+				}
+				// If already committed, the response is mid-flight: do not append
+				// a second status/body (would corrupt it). Log-only above.
+			}
+		}()
+		next.ServeHTTP(rec, r)
+	})
 }
 
 // handlerFunc is a handler that may return an error, mapped centrally.
 type handlerFunc func(w http.ResponseWriter, r *http.Request) error
 
 // wrap adapts a handlerFunc into an http.HandlerFunc, routing errors to writeErr.
+// Panics are caught by the outermost s.recoverer middleware, not here (single
+// recovery point, response-aware).
 func (s *Server) wrap(h handlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := h(w, r); err != nil {

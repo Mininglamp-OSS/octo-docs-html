@@ -24,7 +24,7 @@ const (
 	// CapComment can additionally create/reply/react and edit/delete OWN comments.
 	CapComment
 	// CapEdit can additionally run "let AI process"/AI edits, save drafts, publish,
-	// resolve/reopen threads and undo its own AI change.
+	// resolve/reopen threads and perform AI edits.
 	CapEdit
 	// CapManage can additionally manage members/invites/access-requests, share
 	// settings and delete the doc. Owner/creator/superAdmin resolve here.

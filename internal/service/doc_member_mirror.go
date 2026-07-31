@@ -5,7 +5,15 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/go-sql-driver/mysql"
 )
+
+// mysqlErrDupEntry is MySQL's ER_DUP_ENTRY (1062): a unique/primary-key
+// collision. It is the ONLY error InsertDirectGrantIfAbsent treats as "row
+// already exists"; every other driver/DB error propagates so reconcile retains
+// the metadata instead of clearing it on a suppressed failure.
+const mysqlErrDupEntry uint16 = 1062
 
 const (
 	// DocMemberRoleReader is the rich-doc doc_member.role reader encoding
@@ -13,7 +21,7 @@ const (
 	DocMemberRoleReader = 1
 	// DocMemberRoleCommenter can comment/react and edit/delete own comments.
 	DocMemberRoleCommenter = 2
-	// DocMemberRoleWriter can edit (AI/publish/undo) but not manage members.
+	// DocMemberRoleWriter can edit (AI/publish) but not manage members.
 	DocMemberRoleWriter = 3
 	// DocMemberRoleAdmin is the highest tier: full management. bestCred consumes
 	// this to short-circuit CapManage when the caller's owner uid holds an admin
@@ -44,6 +52,12 @@ type DocMember struct {
 type DocMemberMirror interface {
 	DocIDBySlug(ctx context.Context, slug string) (string, bool, error)
 	UpsertDirectGrant(ctx context.Context, docID, uid string, role int, grantedBy string) error
+	// InsertDirectGrantIfAbsent inserts a direct grant only when no row exists
+	// for (docID,uid); it NEVER updates an existing row and bumps
+	// permission_epoch only on an actual insert. inserted=false means a row
+	// already existed (any role) and was left untouched. Used by reconcile so a
+	// gap-migration cannot clobber a concurrently-written authoritative row.
+	InsertDirectGrantIfAbsent(ctx context.Context, docID, uid string, role int, grantedBy string) (inserted bool, err error)
 	DeleteGrant(ctx context.Context, docID, uid string) error
 	RoleByDocUID(ctx context.Context, docID, uid string) (int, bool, error)
 	ListMembers(ctx context.Context, docID string) ([]DocMember, error)
@@ -113,6 +127,46 @@ func (m *MySQLDocMemberMirror) UpsertDirectGrant(ctx context.Context, docID, uid
 		return fmt.Errorf("commit doc_member upsert: %w", err)
 	}
 	return nil
+}
+
+// InsertDirectGrantIfAbsent inserts a direct grant only when no row exists for
+// (docID,uid) and bumps permission_epoch only on an actual insert. It NEVER
+// updates an existing row (any role), so a reconcile gap-migration cannot
+// clobber a concurrently-written authoritative reader/commenter.
+//
+// It uses an ordinary INSERT (not INSERT IGNORE, which would also swallow FK /
+// data-type errors and report RowsAffected=0, causing reconcile to clear the
+// metadata after a real failure). A duplicate-key collision (ER_DUP_ENTRY 1062)
+// is the single "already exists" signal (inserted=false, err=nil); any other
+// error is returned so the caller retains the entry for retry.
+func (m *MySQLDocMemberMirror) InsertDirectGrantIfAbsent(ctx context.Context, docID, uid string, role int, grantedBy string) (bool, error) {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin doc_member insert-if-absent: %w", err)
+	}
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
+		 VALUES (?,?,?,?,1,'')`,
+		docID, uid, role, grantedBy)
+	if err != nil {
+		_ = tx.Rollback()
+		var myErr *mysql.MySQLError
+		if errors.As(err, &myErr) && myErr.Number == mysqlErrDupEntry {
+			// Row already exists: no state change; caller may clear the entry.
+			return false, nil
+		}
+		return false, fmt.Errorf("insert-if-absent doc_member: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE doc_meta SET permission_epoch=permission_epoch+1 WHERE doc_id=?",
+		docID); err != nil {
+		_ = tx.Rollback()
+		return false, fmt.Errorf("bump doc_meta permission_epoch: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit doc_member insert-if-absent: %w", err)
+	}
+	return true, nil
 }
 
 // DeleteGrant removes a doc_member row and bumps permission_epoch.

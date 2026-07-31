@@ -73,6 +73,23 @@ func (f *fakeDocMemberMirror) UpsertDirectGrant(_ context.Context, docID, uid st
 	return nil
 }
 
+func (f *fakeDocMemberMirror) InsertDirectGrantIfAbsent(_ context.Context, docID, uid string, role int, grantedBy string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, mirrorCall{op: "insert_if_absent", docID: docID, uid: uid, role: role, grantedBy: grantedBy})
+	if f.err != nil {
+		return false, f.err
+	}
+	if f.roles == nil {
+		f.roles = map[string]int{}
+	}
+	if _, ok := f.roles[uid]; ok {
+		return false, nil // row exists: never overwrite
+	}
+	f.roles[uid] = role
+	return true, nil
+}
+
 func (f *fakeDocMemberMirror) DeleteGrant(_ context.Context, docID, uid string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -576,6 +593,10 @@ func (unregisteredMirror) UpsertDirectGrant(context.Context, string, string, int
 	panic("unregisteredMirror.UpsertDirectGrant should not be called")
 }
 
+func (unregisteredMirror) InsertDirectGrantIfAbsent(context.Context, string, string, int, string) (bool, error) {
+	panic("unregisteredMirror.InsertDirectGrantIfAbsent should not be called")
+}
+
 func (unregisteredMirror) DeleteGrant(context.Context, string, string) error {
 	panic("unregisteredMirror.DeleteGrant should not be called")
 }
@@ -679,11 +700,13 @@ func TestReconcileMetaGrantsPromotesReaderIntoDocMember(t *testing.T) {
 	if mirror.roles["reader-5"] != service.DocMemberRoleReader {
 		t.Fatalf("reader-5 not promoted into doc_member: roles=%v", mirror.roles)
 	}
-	// meta.grants entry stays put so mirror-unwired deploys keep working.
+	// In wired/registered mode doc_member is authoritative: once the grant is
+	// migrated the consumed meta.grants entry is cleared so no later fallback
+	// transition can resurrect stale privilege.
 	meta, _ := store.GetMeta(context.Background(), slug)
-	grants, _ := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // asserting meta.grants left in place
-	if _, ok := grants["reader-5"]; !ok {
-		t.Fatalf("meta.grants[reader-5] must not be deleted; got %v", grants)
+	grants, _ := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // asserting meta.grants cleared after migration
+	if _, ok := grants["reader-5"]; ok {
+		t.Fatalf("meta.grants[reader-5] must be cleared after successful migration; got %v", grants)
 	}
 }
 
@@ -898,6 +921,9 @@ func (r *raceMirror) DocIDBySlug(context.Context, string) (string, bool, error) 
 }
 func (r *raceMirror) UpsertDirectGrant(context.Context, string, string, int, string) error {
 	panic("raceMirror.UpsertDirectGrant should not be called")
+}
+func (r *raceMirror) InsertDirectGrantIfAbsent(context.Context, string, string, int, string) (bool, error) {
+	panic("raceMirror.InsertDirectGrantIfAbsent should not be called")
 }
 func (r *raceMirror) DeleteGrant(context.Context, string, string) error {
 	if r.delRole == service.DocMemberRoleAdmin {

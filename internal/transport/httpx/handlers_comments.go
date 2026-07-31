@@ -297,7 +297,7 @@ func (s *Server) handlePatchComment(w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
-	if err := s.authorizeOwnCommentMutation(r, slug, body.ID, session); err != nil {
+	if err := s.authorizeOwnCommentMutation(r, slug, body.ID, session, service.CapManage); err != nil {
 		return err
 	}
 	actor := actorLogin(session)
@@ -328,7 +328,7 @@ func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) err
 	if err := s.requireDocCommentSlug(r, slug); err != nil {
 		return err
 	}
-	if err := s.authorizeOwnCommentMutation(r, slug, id, session); err != nil {
+	if err := s.authorizeOwnCommentMutation(r, slug, id, session, service.CapEdit); err != nil {
 		return err
 	}
 	version := parseVersionQuery(r.URL.Query().Get("version"))
@@ -402,38 +402,31 @@ func (s *Server) wipeComments(w http.ResponseWriter, r *http.Request, slug strin
 	return nil
 }
 
-// authorizeOwnCommentMutation enforces ownership for a comment mutation the
-// author performs on their OWN comment (edit-text/reanchor, soft-delete), with a
-// moderation escape for Edit+ callers who may act on any comment (thread
-// resolve/reopen, moderation delete). Rules:
+// authorizeOwnCommentMutation gates a comment mutation to its author, with a
+// moderation escape at the caller-supplied moderationCap. soft-delete passes
+// CapEdit (writers may moderate); reanchor passes CapManage so an ordinary
+// writer cannot move another author's anchor.
 //
-//   - The actor identity comes ONLY from the trusted session (never the body).
-//   - Production auth mode (a login provider fronts us): a missing session fails
-//     closed with 403. Only a stand-alone local-dev deploy with NO login
-//     provider treats a nil session as anonymous/unowned and allows the op
-//     (upstream "local mode is unauthenticated" behaviour).
-//   - Owner/superAdmin may mutate anything.
-//   - A caller with CapEdit or higher may moderate any comment (moderation).
-//   - Otherwise the caller may only mutate a comment whose author login matches
-//     their own session login.
-func (s *Server) authorizeOwnCommentMutation(r *http.Request, slug, id string, session *storage.Session) error {
+// Actor identity comes only from the trusted session. With a login provider a
+// nil session fails closed (403); a stand-alone local-dev deploy treats nil as
+// anonymous/unowned. Owner/superAdmin and callers at/above moderationCap may
+// act on any comment; otherwise the author login must match the session.
+func (s *Server) authorizeOwnCommentMutation(r *http.Request, slug, id string, session *storage.Session, moderationCap service.Capability) error {
 	if session == nil {
 		if s.auth.LoginEnabled() {
-			// A login provider is wired: an unauthenticated caller must not mutate.
 			return apperr.Forbidden("authentication required", "auth_required")
 		}
-		return nil // local-dev anonymous: unowned comments, nothing to authorize
+		return nil // local-dev anonymous: unowned comments
 	}
 	if s.auth.IsOwner(session) {
 		return nil
 	}
-	// Moderation escape: Edit+ may act on any comment (resolve/reopen, moderation
-	// delete). Resolve the caller's capability once.
+	// Moderation escape at moderationCap.
 	cap, err := s.resolveCap(r, slug)
 	if err != nil {
 		return err
 	}
-	if cap.AtLeast(service.CapEdit) {
+	if cap.AtLeast(moderationCap) {
 		return nil
 	}
 	list, err := s.comments.Read(r.Context(), slug)
