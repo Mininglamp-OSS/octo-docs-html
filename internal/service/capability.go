@@ -45,9 +45,12 @@ const (
 // AtLeast reports whether c meets a required minimum capability.
 func (c Capability) AtLeast(required Capability) bool { return c >= required }
 
-// CapabilityForDocRole maps a rich-doc doc_member.role integer to a Capability.
-// 1→Read, 2→Comment, 3→Edit, 4→Manage; any other value (0/negative/unknown)
-// is CapNone (fail closed).
+// CapabilityForDocRole maps a doc_member.role integer to a Capability via an
+// explicit switch on the named constants — never a numeric comparison, so the
+// backend-compatible encoding (reader=1, writer=2, admin=3, commenter=4) is
+// decoupled from the capability order (None<Read<Comment<Edit<Manage). Reader
+// →Read, Commenter→Comment, Writer→Edit, Admin→Manage; any other value
+// (0/negative/unknown) is CapNone (fail closed).
 func CapabilityForDocRole(role int) Capability {
 	switch role {
 	case DocMemberRoleReader:

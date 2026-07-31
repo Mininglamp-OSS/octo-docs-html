@@ -15,18 +15,29 @@ import (
 // the metadata instead of clearing it on a suppressed failure.
 const mysqlErrDupEntry uint16 = 1062
 
+// doc_member.role integer encoding. These MUST match the docs-backend's own
+// doc_member.role values (same MySQL table, same database) so a row this
+// service writes reads back with the same meaning on the backend and vice
+// versa — no recoding or migration marker is involved. The encoding is NOT
+// capability-ordered (admin is 3, not the largest value); capability order
+// (None<Read<Comment<Edit<Manage) is derived only via the explicit
+// CapabilityForDocRole / roleCodeToLabel switches, never by numeric compare on
+// the stored value.
 const (
-	// DocMemberRoleReader is the rich-doc doc_member.role reader encoding
-	// (>= this = at least reader). bestCred maps it via CapabilityForDocRole.
+	// DocMemberRoleReader is the backend's reader encoding → CapRead.
 	DocMemberRoleReader = 1
-	// DocMemberRoleCommenter can comment/react and edit/delete own comments.
-	DocMemberRoleCommenter = 2
-	// DocMemberRoleWriter can edit (AI/publish) but not manage members.
-	DocMemberRoleWriter = 3
-	// DocMemberRoleAdmin is the highest tier: full management. bestCred consumes
-	// this to short-circuit CapManage when the caller's owner uid holds an admin
-	// row — the plan③ A3② tier. The DB-level admin guard binds this constant.
-	DocMemberRoleAdmin = 4
+	// DocMemberRoleWriter is the backend's writer encoding → CapEdit
+	// (AI/publish/draft) but not member management.
+	DocMemberRoleWriter = 2
+	// DocMemberRoleAdmin is the backend's admin encoding → CapManage (full
+	// management). bestCred consumes it to short-circuit CapManage when the
+	// caller's owner uid holds an admin row (plan③ A3②); the DB-level admin
+	// guards bind this constant by equality (never an ordered compare), so the
+	// mid-range value is safe.
+	DocMemberRoleAdmin = 3
+	// DocMemberRoleCommenter is the backend's commenter encoding → CapComment
+	// (comment/react and edit/delete own comments).
+	DocMemberRoleCommenter = 4
 )
 
 // ErrDocMemberAdminGuard is returned by DeleteGrant when the DB-level guard

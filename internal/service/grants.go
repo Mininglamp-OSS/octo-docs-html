@@ -178,11 +178,25 @@ func (s *AuthService) AddGrant(ctx context.Context, slug, uid, role, grantedBy s
 }
 
 // addGrantToDocMember is the plan③ A6 primary path. UpsertDirectGrant is
-// idempotent for the same (docID,uid,role). It probes RoleByDocUID first and
-// refuses grants that would touch the creator uid or an admin (role=4) row.
-// An identical existing role is a no-op (no permission_epoch bump); a different
-// non-admin role is a legitimate change (e.g. reader→commenter, commenter→writer,
-// or a downgrade) and is written through.
+// idempotent for the same (docID,uid,role). It refuses grants that would touch
+// the creator uid or an admin (role=admin, encoded 3) row.
+// An identical existing role skips the doc_member write (no permission_epoch
+// bump); a different non-admin role is a legitimate change (e.g. reader→commenter,
+// commenter→writer, or a downgrade) and is written through. Either way, on a
+// registered doc the (optional) write and a sweep of any stale legacy
+// meta.grants[uid] run under one slug lock (P1) so a later unregistered fallback
+// cannot revive the pre-change role — including the same-role case, where a
+// stale HIGHER meta.grants role must still be cleared even though doc_member is
+// unchanged.
+//
+// P1 (round-7): the RoleByDocUID probe and the resulting skip-upsert decision
+// BOTH run inside the slug lock. An earlier version probed before locking, so a
+// concurrent RemoveGrant that deleted the row after the probe (but before we
+// locked) left a stale unchanged=true: AddGrant then acquired the lock, skipped
+// the upsert as "unchanged", swept meta, and returned success — silently
+// dropping the requested grant (the row was gone). Re-probing under the lock
+// closes that TOCTOU: whatever RemoveGrant/backfill did is now committed before
+// we read, so the skip only fires on a genuinely-current identical role.
 func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid string, roleCode int, grantedBy string) error {
 	// Existence check via meta so we still 404 on a bogus slug (rich-doc
 	// mirror only knows registered docs).
@@ -206,19 +220,42 @@ func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid string,
 		// meta.grants writer so the four operations stay aligned.
 		return s.addGrantToMeta(ctx, slug, uid, roleCodeToLabel(roleCode), grantedBy)
 	}
-	role, ok, err := s.docMembers.RoleByDocUID(ctx, docID, uid)
-	if err != nil {
-		return err
-	}
-	if ok {
-		if role == DocMemberRoleAdmin {
+	// P1 (round-6): serialize the doc_member write and the legacy meta.grants
+	// sweep under one slug lock (same lock reconcile + RemoveGrant take). On a
+	// REGISTERED doc, doc_member is authoritative, so any leftover
+	// meta.grants[uid] from an earlier unregistered/fallback write is stale. Left
+	// behind, a later unmount/soft-delete flipping DocIDBySlug back to ok=false
+	// would let the A4 legacy fallback revive that stale (possibly higher) role —
+	// reverting a downgrade written here, OR reviving a higher role over an
+	// unchanged one. Sweeping on every registered path (change AND no-change)
+	// makes AddGrant symmetric with RemoveGrant, which already sweeps unconditionally.
+	return s.lock.With(ctx, slug, func() error {
+		// Re-probe the CURRENT registered role inside the lock (P1 round-7). A
+		// pre-lock probe could go stale if a concurrent RemoveGrant deleted the
+		// row between probe and lock — skipping the upsert then would drop the
+		// requested grant. Deciding here, after the lock serialises us behind
+		// any concurrent revoke/backfill, keeps the skip honest.
+		role, ok, err := s.docMembers.RoleByDocUID(ctx, docID, uid)
+		if err != nil {
+			return err
+		}
+		if ok && role == DocMemberRoleAdmin {
+			// Creator/admin rows are never mintable/mutable through this API.
 			return ErrGrantProtected
 		}
-		if role == roleCode {
-			return nil // identical role; no-op, no epoch bump
+		// Skip the doc_member write only when a row genuinely still exists with
+		// the identical role (no permission_epoch bump). If the row is now
+		// absent (ok=false, e.g. a concurrent revoke landed first) or holds a
+		// different role, we MUST write it — the grant was requested and must be
+		// (re)applied.
+		if !ok || role != roleCode {
+			if err := s.docMembers.UpsertDirectGrant(ctx, docID, uid, roleCode, grantedBy); err != nil {
+				return err
+			}
 		}
-	}
-	return s.docMembers.UpsertDirectGrant(ctx, docID, uid, roleCode, grantedBy)
+		// Absent entry ⇒ nil (idempotent); never fail the grant on a clean sweep.
+		return s.removeGrantFromMetaLocked(ctx, slug, uid)
+	})
 }
 
 // addGrantToMeta preserves the pre-plan③ meta.grants write path for the
