@@ -225,6 +225,10 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return err
 	}
+	cap, err := s.resolveCap(r, slug)
+	if err != nil {
+		return err
+	}
 	// Draft mode: the overlay shows a Publish affordance (promote) instead of
 	// Share/Fork. Version 0 signals "not yet a committed version".
 	html, err := core.InjectOverlayCfg(data.HTML, s.overlayJS, core.OverlayConfig{
@@ -241,6 +245,7 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return err
 	}
+	html = injectCapMarker(html, cap)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if r.Method == http.MethodHead {
 		w.WriteHeader(200)

@@ -278,6 +278,25 @@ func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	}
 }
 
+func TestDraftRenderInjectsEditorCapabilityMarker(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, http.MethodPut, "/v1/docs/draft-cap/draft", authorHdr(),
+		`{"html":"<html><body><p>draft</p></body></html>"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save draft = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, h, http.MethodGet, "/d/draft-cap/draft", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("draft render = %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{`role: "admin"`, `canManage: true`, `canEdit: true`, `canComment: true`, `canRead: true`} {
+		if !contains(rec.Body.String(), want) {
+			t.Errorf("draft render marker missing %q: %s", want, rec.Body.String())
+		}
+	}
+}
+
 func TestCapMarkerWriterIsNotAuthorManager(t *testing.T) {
 	html := httpx.InjectCapMarkerForTest("<script>window.__ODOC__ = {};</script>", service.CapEdit)
 	for _, want := range []string{`role: "writer"`, `canEdit: true`, `canManage: false`, `isAuthor: false`} {
