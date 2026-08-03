@@ -250,8 +250,8 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 	return nil
 }
 
-// handleShare mints (or rotates) the per-doc share code and returns a coded read
-// URL. Author-only. POST /v1/docs/{slug}/share.
+// handleShare mints (or rotates) the per-doc read-only share code and returns a
+// coded read URL. Manage-only. POST /v1/docs/{slug}/share.
 func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) error {
 	slug, err := requireSlug(chi.URLParam(r, "slug"))
 	if err != nil {
@@ -272,7 +272,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) error {
 }
 
 // handleRevokeShare clears the per-doc share code (existing links stop working).
-// Author-only. DELETE /v1/docs/{slug}/share.
+// Manage-only. DELETE /v1/docs/{slug}/share.
 func (s *Server) handleRevokeShare(w http.ResponseWriter, r *http.Request) error {
 	slug, err := requireSlug(chi.URLParam(r, "slug"))
 	if err != nil {
@@ -361,10 +361,9 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	// Is this viewer the author (write token via Bearer or cookie) or a reader
-	// (share code)? Both reach here through requireDocReadHTML, but only the author
-	// may mint/rotate a share code — so the overlay must hide the Share CTA from a
-	// reader (clicking it would 404). We carry the flag OUTSIDE core.OverlayConfig
+	// Carry the resolved capability OUTSIDE core.OverlayConfig so the overlay can
+	// hide every write affordance from read-only viewers. The server still
+	// re-authorizes every mutation.
 	// (which is byte-frozen) as a separate window.__ODOC_CAP__ marker.
 	cap, err := s.resolveCap(r, slug)
 	if err != nil {
@@ -426,8 +425,8 @@ func (s *Server) resolveVersionParam(ctx context.Context, slug, raw string) (int
 // management, delete) without touching the byte-frozen core.OverlayConfig. It is
 // injected right before the overlay's own <script> so it is defined when the
 // overlay boots. The marker is a UX hint ONLY — every write is re-authorized
-// server-side. isAuthor is retained as an alias for canEdit so a transitional
-// Web build that still reads it keeps working.
+// server-side. isAuthor means the creator/admin management identity; writers
+// use canEdit but must not inherit manager/author UI.
 func injectCapMarker(html string, cap service.Capability) string {
 	role := capRoleLabel(cap)
 	canRead := cap.AtLeast(service.CapRead)
@@ -440,7 +439,7 @@ func injectCapMarker(html string, cap service.Capability) string {
 		`canComment: ` + strconv.FormatBool(canComment) + `, ` +
 		`canEdit: ` + strconv.FormatBool(canEdit) + `, ` +
 		`canManage: ` + strconv.FormatBool(canManage) + `, ` +
-		`isAuthor: ` + strconv.FormatBool(canEdit) + // transitional alias
+		`isAuthor: ` + strconv.FormatBool(canManage) +
 		`};</script>`
 	// The overlay boot is the last "<script>" InjectOverlayCfg wrote; place the
 	// marker before the window.__ODOC__ config script so both precede the overlay.

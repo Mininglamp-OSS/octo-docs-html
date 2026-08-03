@@ -72,8 +72,8 @@ func setSessionCookie(w http.ResponseWriter, sid string, maxAgeSeconds int, secu
 // (30 days). Re-visiting the ?code= link refreshes it.
 const capCookieMaxAge = 60 * 60 * 24 * 30
 
-// setCapCookie stores a validated per-doc share code as an HttpOnly cookie so the
-// browser carries it on later reads AND on the /v1 comment/reaction writes. The
+// setCapCookie stores a validated read-only per-doc share code as an HttpOnly
+// cookie so the browser carries it on later reads. The
 // cookie NAME encodes the slug (octo_cap_<hash>), so Path=/ is safe: the browser
 // may send several cap cookies, but the server only reads the one matching the
 // requested doc — no cross-doc leakage. (A per-doc Path would fail, since /d/<slug>

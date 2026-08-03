@@ -99,3 +99,27 @@ func TestRecovererCatchesMiddlewarePanic(t *testing.T) {
 		t.Fatalf("middleware panic status = %d; want 500", rec.Code)
 	}
 }
+
+func TestRecovererNilLogger(t *testing.T) {
+	srv := buildRecoverTestServer(t)
+	srv.SetLoggerForTest(nil)
+	h := srv.RecovererForTest(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("ordinary") }))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panic", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("nil-logger panic status = %d; want 500", rec.Code)
+	}
+}
+
+func TestRecovererRepanicsErrAbortHandler(t *testing.T) {
+	srv := buildRecoverTestServer(t)
+	h := srv.RecovererForTest(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+	defer func() {
+		if got := recover(); got != http.ErrAbortHandler {
+			t.Fatalf("recovered panic = %v; want http.ErrAbortHandler", got)
+		}
+	}()
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/abort", nil))
+}

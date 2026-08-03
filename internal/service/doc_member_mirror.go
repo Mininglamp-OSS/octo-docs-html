@@ -18,7 +18,8 @@ const mysqlErrDupEntry uint16 = 1062
 // doc_member.role integer encoding. These MUST match the docs-backend's own
 // doc_member.role values (same MySQL table, same database) so a row this
 // service writes reads back with the same meaning on the backend and vice
-// versa — no recoding or migration marker is involved. The encoding is NOT
+// versa. Startup must first verify docs_metadata.role_encoding=append-v1; the verifier is
+// read-only and never recodes role rows. The encoding is NOT
 // capability-ordered (admin is 3, not the largest value); capability order
 // (None<Read<Comment<Edit<Manage) is derived only via the explicit
 // CapabilityForDocRole / roleCodeToLabel switches, never by numeric compare on

@@ -129,8 +129,9 @@ request, ordered `None < Read < Comment < Edit < Manage` (the doc creator /
 commenter = Comment; a per-doc share code or `doc_member` reader = Read; else
 None → **404**, existence hidden). Browsers present the code as `?code=` once and
 it is exchanged for an HttpOnly cookie; agents/CLI send it as
-`Authorization: Bearer`. The four-role `doc_member` encoding and the legacy
-`meta.grants` fallback boundary are in docs/AUTH.md.
+`Authorization: Bearer`. The four-role `doc_member` append-v1 encoding, its
+mandatory runtime marker, and the legacy `meta.grants` fallback boundary are in
+docs/AUTH.md.
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |

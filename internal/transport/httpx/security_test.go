@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-docs-html/assets"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/log"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
@@ -43,7 +44,7 @@ func newTestServerWithHealth(t *testing.T, check func() error) http.Handler {
 
 // TestDocsPrivateByDefault verifies every doc is private by default: a caller
 // with no credential gets 404 (existence hidden) on reads, the author (creator
-// uid via trust headers) gets through, and a valid share code grants read + comment.
+// uid via trust headers) gets through, and a valid share code grants read-only access.
 func TestDocsPrivateByDefault(t *testing.T) {
 	h := newTestServer(t, nil) // default cfg
 	auth := authorHdr()
@@ -238,9 +239,9 @@ func TestFreshCodeBeatsStaleCookie(t *testing.T) {
 }
 
 // TestRenderCapMarkerReflectsViewer asserts the render injects window.__ODOC_CAP__
-// as the four-tier capability object (with the transitional isAuthor=canEdit
-// alias), so the overlay can gate role-scoped UI. The creator resolves to manage
-// (admin); a share-code reader gets read-only.
+// as the four-tier capability object. isAuthor follows canManage (not canEdit),
+// so a writer does not receive creator/admin management UI. The creator
+// resolves to manage (admin); a share-code reader gets read-only.
 func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
@@ -273,6 +274,30 @@ func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	for _, want := range []string{`role: "reader"`, `canRead: true`, `canComment: false`, `canEdit: false`, `canManage: false`, `isAuthor: false`} {
 		if !contains(body, want) {
 			t.Errorf("reader render marker missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestCapMarkerWriterIsNotAuthorManager(t *testing.T) {
+	html := httpx.InjectCapMarkerForTest("<script>window.__ODOC__ = {};</script>", service.CapEdit)
+	for _, want := range []string{`role: "writer"`, `canEdit: true`, `canManage: false`, `isAuthor: false`} {
+		if !contains(html, want) {
+			t.Errorf("writer marker missing %q: %s", want, html)
+		}
+	}
+}
+
+func TestOverlayConsumesCommentCapability(t *testing.T) {
+	for _, want := range []string{
+		"window.__ODOC_CAP__.canComment",
+		"if (!canComment) return; // read-only: no new comments",
+		"canComment ? renderReactInline",
+		"canComment ? `<span class=\"odoc-reply-toggle\"",
+		"canComment ? `<div class=\"odoc-reply-form\"",
+		"canComment ? `<div class=\"odoc-anchor-actions\"",
+	} {
+		if !contains(assets.OverlayJS, want) {
+			t.Errorf("overlay missing read-only capability gate %q", want)
 		}
 	}
 }

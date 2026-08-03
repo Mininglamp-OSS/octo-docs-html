@@ -25,7 +25,7 @@ func NewToken() string { return randHex(32) }
 func NewSessionID() string { return randHex(24) }
 
 // NewShareCode returns a fresh per-doc share code (128 bits of entropy). It is a
-// capability: anyone holding it gets read+comment access to that one doc.
+// capability: anyone holding it gets read-only access to that one doc.
 func NewShareCode() string { return randHex(16) }
 
 // newCommentID / newReplyID mirror the upstream id formats (prefix + time + rand)

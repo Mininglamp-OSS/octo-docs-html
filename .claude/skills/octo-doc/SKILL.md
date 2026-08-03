@@ -9,7 +9,7 @@ description: |
   self-hosted octo-doc server over its /v1 HTTP API, share it with
   text- and artifact-anchored inline commenting, and regenerate new
   versions from those comments. Docs are private by default; a per-doc
-  share code grants read + comment.
+  share code grants read-only access.
 
   Proactively invoke this skill (do NOT answer directly) when the user
   wants to write, draft, create, edit, publish, or share ANY document,
@@ -79,7 +79,7 @@ drives the doc lifecycle over the octo-doc **`/v1` HTTP API**. Authoring is
 and promoting the draft mints an immutable version. Comments anchor to highlighted
 text or to artifacts (images, SVG, canvas, video) and drive the next iteration.
 Docs are **private by default** — the write token is the author; a per-doc share
-**code** grants read + comment.
+**code** grants read-only access.
 
 **The mechanics are just API calls.** `scripts/octo.sh` (bash + curl + jq) wraps
 them so each step is one command; the agent's real job is the creative part —
@@ -96,7 +96,7 @@ The helper and any `curl` you run read three env vars:
 | --- | ------- |
 | `OCTO_BASE_URL` | server to author against, e.g. `https://docs.example.com` (required) |
 | `OCTO_TOKEN` | write token — the **author** credential (`Authorization: Bearer`) |
-| `OCTO_CODE` | a per-doc share **code** — the **reader** credential (pull/comment) |
+| `OCTO_CODE` | a per-doc share **code** — the read-only **reader** credential (pull only) |
 
 ```bash
 export OCTO_BASE_URL="https://docs.example.com"
@@ -111,8 +111,8 @@ belongs in the `Authorization: Bearer` header, never in a URL or a shared log.
 
 - **author** = the write token: read everything incl. drafts; publish, promote,
   delete; mint/rotate share codes; upload assets; post agent replies.
-- **reader** = a per-doc share code: read published versions + comment/react.
-  Never drafts, publishing, or deletion.
+- **reader** = a per-doc share code: read published versions and comments only.
+  Never comment/react, drafts, publishing, or deletion.
 - no credential → the server returns **404** (a private doc never confirms it
   exists). Full model:
   [docs/AUTH.md](https://github.com/Mininglamp-OSS/octo-docs-html/blob/main/docs/AUTH.md).
@@ -192,7 +192,7 @@ If there are zero open comments and no extra prompt, ask the user what to change
 
 ## Share a doc
 
-New docs are private. Mint a read + comment link and hand it out:
+New docs are private. Mint a read-only link and hand it out:
 
 ```bash
 scripts/octo.sh share <slug>       # → { code, url: .../d/<slug>/v/<n>?code=<code> }

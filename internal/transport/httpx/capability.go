@@ -16,7 +16,7 @@ import (
 //   - author = the doc's creator uid matched (real user Login, or bot OwnerUID),
 //     or an octo superAdmin. Full access.
 //   - reader = a valid per-doc share code (Bearer, cookie, or ?code=). Read
-//     published versions + comment/react. Never drafts/publish/promote/delete.
+//     published versions and comments only; never write or access drafts.
 //   - none   → 404 (never confirm the doc exists).
 //
 // Browsers carry the code as ?code= on the first hit, which is exchanged for an

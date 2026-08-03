@@ -40,8 +40,8 @@ sidebar, and push comment events back to Octo IM.
   HTTP API; the doc is real, self-contained HTML — not a proprietary format.
 - **Creator-owned access.** Ownership is by **creator uid** — the real user's Octo
   Login, a bot's owner uid, or an Octo superAdmin. Write tokens are **not** an auth
-  source anymore. A per-doc share **code** grants read + comment; per-uid
-  `doc_grants` add named readers. No credential → `404` (existence hidden). See
+  A per-doc share **code** grants read-only access; per-uid `doc_member` rows grant
+  reader/commenter/writer/admin capabilities.
   [docs/AUTH.md](docs/AUTH.md).
 - **Anchored commenting.** Comments attach to highlighted text *or* to a stamped
   artifact (image, SVG, canvas, chart) by content-hash identity, so they survive
@@ -90,7 +90,7 @@ flips — see [Octo integration](#octo-integration). Going to production:
 | **URL** | `/d/<slug>/v/<version>` (`/v/latest` resolves to the newest published version) |
 | **Comments** | append-only event log; each version renders a folded snapshot |
 | **Artifacts** | every commentable element is stamped `data-odoc-aid="<hash>"` so comments anchor by identity, not DOM position |
-| **Auth** | private by default — **author = creator uid**, per-doc share **code** = read + comment, per-uid `doc_grants` = named readers ([docs/AUTH.md](docs/AUTH.md)) |
+| **Auth** | private by default — **author = creator uid**, per-doc share **code** = read-only, per-uid `doc_member` = reader/commenter/writer/admin ([docs/AUTH.md](docs/AUTH.md)) |
 | **Assets** | inline media served via HMAC-signed sub-resource URLs so native `<img>` loads authorize without a header |
 | **Storage** | PostgreSQL **or** MySQL (metadata) + S3-compatible (blobs), behind `MetadataStore` / `BlobStore` interfaces |
 | **Scaling** | stateless app; concurrent same-slug writes serialize via database advisory locks |
@@ -130,7 +130,7 @@ curl -H "Content-Type: application/json" \
   -d '{"slug":"explainer","html":"<html><body><h1>Hi</h1></body></html>"}' \
   "$BASE/v1/docs"                                    # → /d/explainer/v/1
 
-# Mint a per-doc read + comment share code:
+# Mint a per-doc read-only share code:
 curl -X POST "$BASE/v1/docs/explainer/share"
 #   → { "data": { "code": "…", "url": ".../d/explainer/v/1?code=***" } }
 ```

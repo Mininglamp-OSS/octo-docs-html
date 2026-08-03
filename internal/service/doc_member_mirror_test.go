@@ -12,6 +12,7 @@ package service_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"testing"
 
@@ -31,7 +32,7 @@ func setupDocMemberMirrorTables(t *testing.T, db *sql.DB) {
 		"DROP TABLE IF EXISTS doc_meta",
 		`CREATE TABLE doc_meta (
 			doc_id VARCHAR(64) PRIMARY KEY,
-			octree_doc_slug VARCHAR(255),
+			octo_doc_slug VARCHAR(255),
 			permission_epoch BIGINT NOT NULL DEFAULT 0,
 			status INT NOT NULL DEFAULT 1
 		)`,
@@ -223,5 +224,49 @@ func TestInsertIfAbsentPropagatesForeignKeyError(t *testing.T) {
 	}
 	if inserted {
 		t.Fatal("insert-if-absent(FK violation) inserted = true; want false")
+	}
+}
+
+func TestRequireAppendRoleEncoding(t *testing.T) {
+	db := mysqlMirrorTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE docs_metadata (
+		meta_key VARCHAR(64) PRIMARY KEY, meta_value VARCHAR(64) NOT NULL)`); err != nil {
+		t.Fatalf("create marker table: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS docs_metadata") })
+
+	for _, tc := range []struct {
+		name, value string
+		ok          bool
+	}{
+		{name: "append contract", value: service.DocRoleEncodingAppendV1, ok: true},
+		{name: "ordered v2 rejected", value: "v2"},
+		{name: "unknown rejected", value: "future-v9"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := db.ExecContext(ctx, "DELETE FROM docs_metadata"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, "INSERT INTO docs_metadata(meta_key,meta_value) VALUES (?,?)", service.DocRoleEncodingKey, tc.value); err != nil {
+				t.Fatal(err)
+			}
+			err := service.RequireAppendRoleEncoding(ctx, db)
+			if tc.ok && err != nil {
+				t.Fatalf("append-v1 rejected: %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("unsafe encoding %q accepted", tc.value)
+			}
+		})
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM docs_metadata"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RequireAppendRoleEncoding(ctx, db); err == nil {
+		t.Fatal("missing marker accepted")
+	}
+	if err := service.RequireAppendRoleEncoding(ctx, nil); !errors.Is(err, service.ErrDocRoleEncodingUnverified) {
+		t.Fatalf("nil db error = %v; want ErrDocRoleEncodingUnverified", err)
 	}
 }

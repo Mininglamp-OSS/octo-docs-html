@@ -28,15 +28,13 @@ view published versions, comments, history, source and diff. It does **not** by
 itself grant commenting — commenting requires **Comment** (a `doc_member`
 commenter or higher). A share code never unlocks drafts, publishing, promotion,
 deletion, or member management, so handing out a share link is safe: it cannot
-be escalated into write or manage access. (This tightens the pre-redesign
-read+comment share code to read-only under the four-role model; comment access
-is now an explicit member grant.)
+be escalated into write or manage access. Share-code comment access is not
+supported under the four-role model; comment access is an explicit member grant.
 
 ### HTML four-role members
 
-Direct grants live in the docs-backend `doc_member` table (same MySQL database —
-no separate store, no recoding, no migration marker). The `role` column is a
-plain integer whose values are a **wire contract shared with docs-backend**:
+Direct grants live in the docs-backend `doc_member` table. The `role` column is
+a plain integer whose values are the Backend #147 **append-v1** wire contract:
 
 | Label | `doc_member.role` | Capability |
 | --- | --- | --- |
@@ -50,9 +48,11 @@ value). The capability order is derived **only** through the explicit
 `CapabilityForDocRole` / `roleCodeToLabel` mappings — the code never compares the
 stored `role` integer with `<`/`>`. Admin rows are guarded by **equality**
 (`WHERE role<>3`), which is safe regardless of the numeric value. Because octo-doc
-and docs-backend share the same table in the same database, a row written by
-either side reads back with the same meaning on the other; **no startup gate,
-version marker, or backfill is required** to interoperate.
+and docs-backend share the same table in the same database. Before HTML enables
+`doc_member`, startup verifies
+`docs_metadata.role_encoding=append-v1`. Missing, unknown, and the
+abandoned ordered-v2 marker fail closed. The check is read-only: HTML never
+recodes or backfills role data.
 
 The HTML grants API (`/v1/docs/{slug}/grants`) speaks the string labels
 `reader | commenter | writer`. `admin` is **never** mintable through it — admin

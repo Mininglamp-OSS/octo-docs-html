@@ -28,9 +28,9 @@
   // Draft mode: an author previewing an unpublished doc on the server. The CTA is
   // "Publish" (promote the draft to an immutable version), not Share.
   const isDraft = mode === 'draft';
-  // Author vs reader (carried outside the byte-frozen __ODOC__ config). Only the
-  // author (write token) may mint/rotate a share code, so the Share CTA is shown
-  // only to them — a reader clicking it would 404 on POST /share.
+  // Capabilities are carried outside the byte-frozen __ODOC__ config. Comment
+  // affordances consume canComment; the server remains authoritative for writes.
+  const canComment = !!(window.__ODOC_CAP__ && window.__ODOC_CAP__.canComment);
   const isAuthor = !!(window.__ODOC_CAP__ && window.__ODOC_CAP__.isAuthor);
   // Fork mode renders the doc read-only with comments mirrored from the
   // embedded #odoc-fork-comments JSON. No /api calls, no auth, no publish.
@@ -788,17 +788,17 @@
     }
   }
 
-  // Re-anchor banner — shown while a re-anchor action is in flight. Three
-  // explicit actions to avoid the gesture conflict (clicking empty space
-  // would otherwise be ambiguous with "deselect").
-  const reanchorBanner = document.createElement('div');
-  reanchorBanner.className = 'odoc-reanchor-banner';
-  reanchorBanner.innerHTML = `
-    <span class="label">Select text to move anchor</span>
-    <button type="button" id="odoc-reanchor-remove">Remove anchor</button>
-    <button type="button" id="odoc-reanchor-cancel" class="danger">Cancel</button>
-  `;
-  document.body.appendChild(reanchorBanner);
+  // Re-anchor is a comment write, so readers never receive its banner/actions.
+  if (canComment) {
+    const reanchorBanner = document.createElement('div');
+    reanchorBanner.className = 'odoc-reanchor-banner';
+    reanchorBanner.innerHTML = `
+      <span class="label">Select text to move anchor</span>
+      <button type="button" id="odoc-reanchor-remove">Remove anchor</button>
+      <button type="button" id="odoc-reanchor-cancel" class="danger">Cancel</button>
+    `;
+    document.body.appendChild(reanchorBanner);
+  }
 
   // Toolbar title prefers the injected meta title (cfg.title / window.__ODOC__.title)
   // so it shows the human doc title even when the doc HTML has no <title> element
@@ -1329,13 +1329,13 @@
       const cls = [`odoc-react-chip`, mine ? 'mine' : '', hasAgent ? 'agent' : ''].filter(Boolean).join(' ');
       return `<span class="${cls}" data-emoji="${escapeHtml(emoji)}" data-target-id="${escapeHtml(target.id)}" data-users="${users.map(escapeHtml).join('\n')}">${escapeHtml(emoji)} ${users.length}</span>`;
     }).join('');
-    return `<div class="odoc-reactions" data-target-id="${escapeHtml(target.id)}">${chips}<button class="odoc-react-add" data-target-id="${escapeHtml(target.id)}" title="Add reaction" aria-label="Add reaction">${REACT_ICON_SVG}</button></div>`;
+    return `<div class="odoc-reactions" data-target-id="${escapeHtml(target.id)}">${chips}${canComment ? `<button class="odoc-react-add" data-target-id="${escapeHtml(target.id)}" title="Add reaction" aria-label="Add reaction">${REACT_ICON_SVG}</button>` : ''}</div>`;
   }
   function renderReactInline(target) {
     return `<button class="odoc-react-add inline" data-target-id="${escapeHtml(target.id)}" title="Add reaction" aria-label="Add reaction">${REACT_ICON_SVG}</button>`;
   }
   function renderReply(reply) {
-    const canDelete = !isFork && (!isPublished || (identity && reply.author && identity.login === reply.author.login));
+    const canDelete = canComment && !isFork && (!isPublished || (identity && reply.author && identity.login === reply.author.login));
     const hasReactions = reply.reactions && Object.values(reply.reactions).some(u => u && u.length > 0);
     const isAgent = reply.author?.kind === 'agent';
     // Whitelist the status (it drives a CSS class) instead of interpolating raw.
@@ -1355,7 +1355,7 @@
       <div class="meta">
         <span>${new Date(reply.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span>
         <span class="actions">
-          ${!hasReactions && !isFork ? renderReactInline(reply) : ''}
+          ${!hasReactions && !isFork ? (canComment ? renderReactInline(reply) : '') : ''}
           ${canDelete ? `<span class="del" data-id="${escapeHtml(reply.id)}">delete</span>` : ''}
         </span>
       </div>
@@ -1365,21 +1365,21 @@
     const card = document.createElement('div');
     card.className = 'odoc-margin-comment';
     card.dataset.commentId = comment.id;
-    const canDelete = !isFork && (!isPublished || (identity && comment.author && identity.login === comment.author.login));
+    const canDelete = canComment && !isFork && (!isPublished || (identity && comment.author && identity.login === comment.author.login));
     const replies = Array.isArray(comment.replies) ? comment.replies : [];
     const hasReactions = comment.reactions && Object.values(comment.reactions).some(u => u && u.length > 0);
     card.innerHTML = `
-      ${isFork ? '' : `<div class="odoc-anchor-actions">
+      ${canComment ? `<div class="odoc-anchor-actions">
         <button class="odoc-reanchor-btn" type="button" data-id="${escapeHtml(comment.id)}"><span class="odoc-reanchor-unanchored">unanchored — click to re-anchor</span><span class="odoc-reanchor-anchored">↻ move anchor</span></button>
-      </div>`}
+      </div>` : ''}
       ${renderAuthor(comment.author)}
       <div class="text">${escapeHtml(comment.text)}</div>
       ${hasReactions ? renderReactionsRow(comment) : ''}
       <div class="meta">
         <span>v${comment.version} · ${new Date(comment.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</span>
         <span class="actions">
-          ${!hasReactions && !isFork ? renderReactInline(comment) : ''}
-          ${isFork ? '' : `<span class="odoc-reply-toggle" data-id="${escapeHtml(comment.id)}">Reply</span>`}
+          ${!hasReactions && !isFork ? (canComment ? renderReactInline(comment) : '') : ''}
+          ${canComment ? `<span class="odoc-reply-toggle" data-id="${escapeHtml(comment.id)}">Reply</span>` : ''}
           <span class="copy-md" data-id="${escapeHtml(comment.id)}" title="Copy as Markdown" aria-label="Copy as Markdown"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>
           ${canDelete ? `<span class="del" data-id="${escapeHtml(comment.id)}">delete</span>` : ''}
         </span>
@@ -1391,13 +1391,13 @@
         </div>
         <div class="odoc-replies">${replies.map(r => renderReply(r)).join('')}</div>
       ` : ''}
-      ${isFork ? '' : `<div class="odoc-reply-form" data-parent-id="${escapeHtml(comment.id)}">
+      ${canComment ? `<div class="odoc-reply-form" data-parent-id="${escapeHtml(comment.id)}">
         <textarea placeholder="Reply…"></textarea>
         <div class="odoc-reply-form-foot">
           <span class="hint">⌘+Enter to submit · Esc to cancel</span>
           <button class="odoc-reply-submit">Reply</button>
         </div>
-      </div>`}
+      </div>` : ''}
     `;
 
     const repliesToggle = card.querySelector('.odoc-replies-toggle');
@@ -1471,7 +1471,7 @@
     card.querySelectorAll('.odoc-react-chip').forEach(chip => {
       chip.onclick = async (e) => {
         e.stopPropagation();
-        if (isFork) return; // read-only mode
+        if (!canComment) return;
         if (authConfigured && !identity) { startLogin(); return; }
         await fetch('/v1/reactions', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1483,6 +1483,7 @@
     card.querySelectorAll('.odoc-react-add').forEach(addBtn => {
       addBtn.onclick = (e) => {
         e.stopPropagation();
+        if (!canComment) return;
         if (authConfigured && !identity) { startLogin(); return; }
         openEmojiPicker(addBtn, addBtn.dataset.targetId);
       };
@@ -1496,6 +1497,7 @@
   let emojiPicker = null;
   function closeEmojiPicker() { if (emojiPicker) { emojiPicker.remove(); emojiPicker = null; } }
   function openEmojiPicker(anchorBtn, targetId) {
+    if (!canComment) return;
     closeEmojiPicker();
     emojiPicker = document.createElement('div');
     emojiPicker.className = 'odoc-emoji-picker';
@@ -1899,7 +1901,7 @@
     bg.innerHTML = `
       <div class="odoc-modal" data-state="idle">
         <h3>Publish this doc</h3>
-        <p>We'll publish this to your self-hosted octo-doc server so anyone with the link can read and comment.</p>
+        <p>We'll publish this to your self-hosted octo-doc server. You can then generate a read-only share link.</p>
         <div class="step"><span class="n">·</span><span>Slug: <code id="odoc-pub-slug">${escapeHtml(slug)}</code></span></div>
         <div class="status" id="odoc-pub-status" style="margin-top:10px;display:none;"></div>
         <div id="odoc-pub-result" style="margin-top:10px;display:none;">
@@ -1956,14 +1958,14 @@
     bg.innerHTML = `
       <div class="odoc-modal">
         <h3>Share this doc</h3>
-        <p class="muted" style="margin:0 0 10px;">Generate a link that lets anyone read and comment — no account needed.</p>
+        <p class="muted" style="margin:0 0 10px;">Generate a read-only link — no account needed.</p>
         <div class="status" id="odoc-share-status" style="display:none;margin-bottom:10px;"></div>
         <div id="odoc-share-result" style="display:none;">
           <div class="code" id="odoc-share-url" style="font-size:14px;letter-spacing:0;text-align:left;cursor:copy;"></div>
           <div class="actions" style="justify-content:flex-start;gap:8px;margin-top:0;margin-bottom:10px;">
             <button class="primary" id="odoc-share-copy">Copy link</button>
           </div>
-          <p class="muted" style="font-size:12px;">Anyone with this link can read and comment. Generate a new link to rotate it (old links stop working).</p>
+          <p class="muted" style="font-size:12px;">Anyone with this link can read comments but cannot write. Generate a new link to rotate it (old links stop working).</p>
         </div>
         <div class="actions">
           <button id="odoc-share-close">Close</button>
@@ -2089,7 +2091,7 @@
   }
 
   function openPopup(anchor, rect) {
-    if (isFork) return; // read-only fork view: no new comments
+    if (!canComment) return; // read-only: no new comments
     closePopup();
     hideHoverUI();
     popup = document.createElement('div');
@@ -2525,6 +2527,7 @@
   }
 
   document.addEventListener('mousedown', (e) => {
+    if (!canComment) return;
     if (e.button !== 0) return;
     const t = e.target;
     if (!t || t.nodeType !== 1 || isInUI(t)) return;
@@ -2534,6 +2537,7 @@
   }, true);
 
   document.addEventListener('mousemove', (e) => {
+    if (!canComment) return;
     if (!dragState) return;
     const dx = e.pageX - dragState.x0, dy = e.pageY - dragState.y0;
     if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
@@ -2559,6 +2563,7 @@
   }, true);
 
   document.addEventListener('mouseup', (e) => {
+    if (!canComment) return;
     // Unified mouseup: drag-to-comment branch first, otherwise fall through to
     // text-selection-popup behavior. Single capture-phase listener avoids the
     // race where drag-end outside an artifact would still trigger the bubble-
@@ -2591,12 +2596,14 @@
   // would seem cleaner but fires continuously during a drag — touchend gives
   // us a single "selection finished" signal.
   document.addEventListener('touchend', (e) => {
+    if (!canComment) return;
     const t = e.target || (e.changedTouches?.[0] && document.elementFromPoint(e.changedTouches[0].clientX, e.changedTouches[0].clientY));
     // Touchend fires before the OS finalizes selection — defer one tick.
     setTimeout(() => maybeOpenSelectionPopup(t), 0);
   }, true);
 
   function maybeOpenSelectionPopup(target) {
+    if (!canComment) return;
     // Selected text wins over "comment whole artifact." If there's a real text
     // selection, open the text-selection popup regardless of whether the
     // selection lives inside a commentable artifact. The hover pill remains
@@ -2644,6 +2651,7 @@
   // Begin the re-anchor flow: future text selection on the doc will rebind
   // this comment instead of creating a new one. Toggle off if clicked again.
   function startReanchor(id) {
+    if (!canComment) return;
     if (state.reanchoringId === id) { exitReanchor(); return; }
     state.reanchoringId = id;
     document.body.classList.add('odoc-reanchoring');
@@ -2672,8 +2680,10 @@
   // Wire banner buttons (created once near the bar). The banner is the
   // only place we expose "remove anchor" — keeps cards uncluttered and
   // resolves the gesture conflict you'd hit with "click empty space".
-  document.getElementById('odoc-reanchor-cancel').onclick = (e) => { e.stopPropagation(); exitReanchor(); };
-  document.getElementById('odoc-reanchor-remove').onclick = async (e) => {
+  const reanchorCancel = document.getElementById('odoc-reanchor-cancel');
+  if (reanchorCancel) reanchorCancel.onclick = (e) => { e.stopPropagation(); exitReanchor(); };
+  const reanchorRemove = document.getElementById('odoc-reanchor-remove');
+  if (reanchorRemove) reanchorRemove.onclick = async (e) => {
     e.stopPropagation();
     const id = state.reanchoringId;
     if (!id) return;
@@ -2706,7 +2716,7 @@
   // the button does not move or flicker.
   let commentPill = null, pillTargetEl = null;
   function showHoverUI(el) {
-    if (isFork) return; // read-only: no new-comment affordances
+    if (!canComment) return; // read-only: no new-comment affordances
     if (pillTargetEl === el && commentPill) return; // same section — keep as-is
     hideHoverUI();
     const r = el.getBoundingClientRect();

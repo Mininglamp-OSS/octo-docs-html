@@ -78,7 +78,11 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 		if creator != "" && m.UID == creator {
 			continue // handler synthesises the creator row (P2-B)
 		}
-		out[m.UID] = roleCodeToLabel(m.Role)
+		label := roleCodeToLabel(m.Role)
+		if label == "" {
+			continue // unknown/corrupt stored role: do not expose a synthetic grant
+		}
+		out[m.UID] = label
 	}
 	return out, nil
 }
@@ -109,8 +113,8 @@ func legacyListGrantsFromMeta(meta *storage.DocMeta, creator string) map[string]
 }
 
 // roleCodeToLabel translates rich-doc doc_member.role integers to string labels.
-// Unknown codes fail closed to reader (least privilege) rather than surprise-
-// promoting a stray value.
+// Unknown codes return the empty label so callers do not misrepresent corrupt
+// data as a valid reader grant.
 func roleCodeToLabel(role int) string {
 	switch role {
 	case DocMemberRoleAdmin:
@@ -122,7 +126,7 @@ func roleCodeToLabel(role int) string {
 	case DocMemberRoleReader:
 		return grantRoleReader
 	default:
-		return grantRoleReader
+		return ""
 	}
 }
 
@@ -534,7 +538,7 @@ func (s *AuthService) ReconcileMetaGrantsToDocMember(ctx context.Context, slug s
 			// Atomic insert-if-absent: never overwrites a concurrent authoritative
 			// row. Consume on insert OR when a row already exists; retain on error.
 			if _, err := s.docMembers.InsertDirectGrantIfAbsent(ctx, docID, uid, code, grantedBy); err != nil {
-				logger.Debug("reconcile insert failed", "slug", slug, "uid", uid, "err", err.Error())
+				logger.Error("reconcile insert failed", "slug", slug, "uid", uid, "err", err.Error())
 				continue // leave this entry for a later retry; do not clear
 			}
 			consumed = append(consumed, uid)

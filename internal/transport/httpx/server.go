@@ -99,7 +99,7 @@ func (s *Server) Handler() http.Handler {
 		// strict author-only. Author is accepted via Bearer (CLI) or per-doc cookie.
 		r.With(s.requireDocAuthorOrFirstCreate).Method(http.MethodPut, "/docs/{slug}/draft", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleSaveDraft))))
 		r.With(s.requireDocAuthorOrFirstCreate).Post("/docs/{slug}/draft/promote", s.cors(s.limit(writeLimiter, false, s.wrap(s.handlePromote))))
-		// Share: mint / rotate / revoke the per-doc read+comment code (author-only).
+		// Share: mint / rotate / revoke the per-doc read-only code (manage-only).
 		r.With(s.requireDocManage).Post("/docs/{slug}/share", s.cors(s.wrap(s.handleShare)))
 		r.With(s.requireDocManage).Delete("/docs/{slug}/share", s.cors(s.wrap(s.handleRevokeShare)))
 
@@ -116,9 +116,9 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/docs/{slug}/assets", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleListAssets))))
 		r.With(s.requireDocEdit).Delete("/docs/{slug}/assets/{sha256}", s.cors(s.wrap(s.handleDeleteAsset)))
 
-		// Comments + reactions. Reads and writes require at least a reader
-		// capability (the doc's share code) — enforced per-handler since the slug
-		// arrives in the body on POST/PATCH.
+		// Comments + reactions. Reads require CapRead; writes require CapComment
+		// (a share-code reader is read-only). Body-slug writes enforce this in the
+		// handler after decoding the request.
 		r.Get("/comments", s.cors(s.requireDocReadJSON(slugFromQuery, s.limit(writeLimiter, true, s.wrap(s.handleListComments)))))
 		r.Post("/comments", s.cors(s.limit(writeLimiter, true, s.wrap(s.handleCreateComment))))
 		r.Patch("/comments", s.cors(s.limit(writeLimiter, true, s.wrap(s.handlePatchComment))))
@@ -132,10 +132,8 @@ func (s *Server) Handler() http.Handler {
 		r.Post("/agent/element/replace", s.cors(s.limit(writeLimiter, false, s.wrap(s.handleAgentElementReplace))))
 	})
 
-	// Rendered docs + export/fork. Default-private: a reader needs the doc's share
-	// code (via ?code= → cookie), the author needs the write token. The draft view
-	// is author-only; the write token can arrive as ?code= (browser) and is
-	// exchanged for a cookie the same way a reader code is.
+	// Rendered docs + export/fork. Default-private: a reader may use a read-only
+	// share code (?code= → cookie). The draft view remains author-only.
 	r.Get("/d/{slug}/draft", s.requireDocAuthorHTML(s.secHeaders(s.wrap(s.handleRenderDraft))))
 	r.Head("/d/{slug}/draft", s.requireDocAuthorHTML(s.secHeaders(s.wrap(s.handleRenderDraft))))
 	r.Get("/d/{slug}/v/{version}", s.requireDocReadHTML(s.secHeaders(s.wrap(s.handleRender))))
@@ -169,12 +167,22 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 		rec := &recordingWriter{ResponseWriter: w}
 		defer func() {
 			if p := recover(); p != nil {
-				s.logger.Error("panic recovered",
+				// net/http uses ErrAbortHandler to stop a request without a stack
+				// dump or synthetic response. It must reach net/http's Server so the
+				// connection is aborted rather than turned into a normal response.
+				if p == http.ErrAbortHandler {
+					panic(p)
+				}
+				logger := s.logger
+				if logger == nil {
+					logger = slog.Default()
+				}
+				logger.Error("panic recovered",
 					"method", r.Method, "path", r.URL.Path,
 					"committed", rec.committed,
 					"panic", fmt.Sprint(p), "stack", string(debug.Stack()))
 				if !rec.committed {
-					writeErr(rec, s.logger, fmt.Errorf("panic: %v", p))
+					writeErr(rec, logger, fmt.Errorf("panic: %v", p))
 				}
 				// If already committed, the response is mid-flight: do not append
 				// a second status/body (would corrupt it). Log-only above.
