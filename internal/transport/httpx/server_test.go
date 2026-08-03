@@ -1034,6 +1034,30 @@ func TestVersionDiffReturnsLocalChangesWithoutWholeDocuments(t *testing.T) {
 	}
 }
 
+func TestVersionDiffReportsDuplicateAttributeWhitespaceChange(t *testing.T) {
+	h := newTestServer(t, nil)
+	for _, source := range []string{
+		`<html><body><input value="A B" value="same"></body></html>`,
+		`<html><body><input value="A  B" value="same"></body></html>`,
+	} {
+		payload, err := json.Marshal(map[string]string{"slug": "duplicate-attr-diff", "html": source})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), string(payload))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	rec := do(t, h, http.MethodGet, "/v1/docs/duplicate-attr-diff/diff?from=1&to=2", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("diff = %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"changes":[],"code_hunks":[]`) {
+		t.Fatalf("browser-visible change was lost: %s", rec.Body.String())
+	}
+}
+
 func TestVersionDiffHandlesManyOrdinaryEdits(t *testing.T) {
 	h := newTestServer(t, nil)
 	var before, after strings.Builder

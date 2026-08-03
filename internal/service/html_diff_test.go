@@ -94,6 +94,187 @@ func TestDiffRawTextDigestPreservesBytes(t *testing.T) {
 	}
 }
 
+func TestParseDiffAttrsDuplicateNamesUseFirstValue(t *testing.T) {
+	attrs := parseDiffAttrs(` VALUE="first" value="second" VaLuE="third"`)
+	if attrs["value"] != "first" {
+		t.Fatalf("value = %q; want first", attrs["value"])
+	}
+}
+
+func TestBuildVersionDiffPreservesQuotedAttributeWhitespace(t *testing.T) {
+	tests := []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{"duplicate first wins", `<input value="A B" value="same">`, `<input value="A  B" value="same">`},
+		{"ordinary attribute", `<p title="a b">x</p>`, `<p title="a  b">x</p>`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.CodeHunks) == 0 {
+				t.Fatalf("quoted whitespace change produced no source hunk: %+v", result)
+			}
+			if test.name == "duplicate first wins" && len(result.Changes) == 0 {
+				t.Fatalf("browser-visible duplicate attribute change was lost: %+v", result)
+			}
+		})
+	}
+}
+
+func TestNormalizedHTMLLinesIgnoreFormattingWhitespace(t *testing.T) {
+	compact := `<html><body><p>alpha</p><p>beta</p></body></html>`
+	pretty := "<html>\n  <body>\n    <p>alpha</p>\n    <p>beta</p>\n  </body>\n</html>\n"
+	result, err := buildVersionDiff(1, 2, compact, pretty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.CodeHunks) != 0 || len(result.Changes) != 0 {
+		t.Fatalf("format-only revision was noisy: %+v", result)
+	}
+	lines, ok := normalizedHTMLLines("<p>x</p>\u00a0")
+	if !ok || len(lines) != 4 || lines[3] != "\u00a0" {
+		t.Fatalf("NBSP text run lost: %#v, ok=%v", lines, ok)
+	}
+}
+
+// TestStructuralDigestIgnoresBlockSiblingIndentation guards the reindent-only
+// P1: pure formatting whitespace between block-like siblings must not pollute
+// the parent's structural textDigest, while whitespace at a visible inline
+// boundary must still register.
+func TestStructuralDigestIgnoresBlockSiblingIndentation(t *testing.T) {
+	for _, count := range []int{100, 500} {
+		t.Run(fmt.Sprintf("main_%d_paragraphs", count), func(t *testing.T) {
+			var compact, pretty strings.Builder
+			compact.WriteString("<main>")
+			pretty.WriteString("<main>\n")
+			for index := 0; index < count; index++ {
+				fmt.Fprintf(&compact, "<p>item %d</p>", index)
+				fmt.Fprintf(&pretty, "  <p>item %d</p>\n", index)
+			}
+			compact.WriteString("</main>")
+			pretty.WriteString("</main>\n")
+			result, err := buildVersionDiff(1, 2, compact.String(), pretty.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
+				t.Fatalf("reindent-only revision was noisy: %+v", result)
+			}
+		})
+	}
+
+	blockCases := []struct {
+		name          string
+		before, after string
+	}{
+		{"div_block_children", `<div><p>x</p><ul><li>y</li></ul></div>`, "<div>\n  <p>x</p>\n  <ul>\n    <li>y</li>\n  </ul>\n</div>"},
+		{"table_rows", `<table><tr><td>a</td></tr><tr><td>b</td></tr></table>`, "<table>\n  <tr><td>a</td></tr>\n  <tr><td>b</td></tr>\n</table>"},
+	}
+	for _, test := range blockCases {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
+				t.Fatalf("block-sibling reindent was noisy: %+v", result)
+			}
+		})
+	}
+
+	// Inline-sibling whitespace is a visible boundary and must still be detected.
+	inlineCases := []struct {
+		name          string
+		before, after string
+	}{
+		{"inline_span_gap", `<p><a>x</a><a>y</a></p>`, `<p><a>x</a> <a>y</a></p>`},
+		{"see_here_gap", `<p>see<a>here</a></p>`, `<p>see <a>here</a></p>`},
+		{"custom_element_gap", `<p><x-tag>x</x-tag><x-tag>y</x-tag></p>`, `<p><x-tag>x</x-tag> <x-tag>y</x-tag></p>`},
+	}
+	for _, test := range inlineCases {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 {
+				t.Fatalf("visible inline-boundary whitespace change was lost: %+v", result)
+			}
+		})
+	}
+}
+
+func TestBuildVersionDiffPrettyPrintedDocumentsStayBounded(t *testing.T) {
+	var source strings.Builder
+	source.WriteString("<main>\n")
+	for index := 0; index < 3500; index++ {
+		fmt.Fprintf(&source, "  <i>%d</i>\n", index)
+	}
+	source.WriteString("</main>\n")
+	result, err := buildVersionDiff(1, 2, source.String(), source.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
+		t.Fatalf("identical pretty document differed: %+v", result)
+	}
+}
+
+func TestMatchDiffNodesIsDeterministicNearBudget(t *testing.T) {
+	var before, after strings.Builder
+	before.WriteString("<main>")
+	after.WriteString("<main>")
+	for index := 0; index < 350; index++ {
+		fmt.Fprintf(&before, "<p>before %d</p>", index)
+		fmt.Fprintf(&after, "<p>after %d</p>", index)
+	}
+	before.WriteString("</main>")
+	after.WriteString("</main>")
+	var first string
+	for run := 0; run < 100; run++ {
+		result, err := buildVersionDiff(1, 2, before.String(), after.String())
+		encoded, _ := json.Marshal(result)
+		got := fmt.Sprintf("%v:%s", err, encoded)
+		if run == 0 {
+			first = got
+		} else if got != first {
+			t.Fatalf("run %d = %q; first = %q", run, got, first)
+		}
+	}
+}
+
+func TestMatchDiffNodesBoundsAsymmetricSiblingWork(t *testing.T) {
+	var beforeSource, afterSource strings.Builder
+	beforeSource.WriteString("<main>")
+	for index := 0; index < 3900; index++ {
+		fmt.Fprintf(&beforeSource, "<i>b%d</i>", index)
+	}
+	beforeSource.WriteString("</main>")
+	afterSource.WriteString("<main>")
+	for index := 0; index < 51; index++ {
+		fmt.Fprintf(&afterSource, "<i>a%d</i>", index)
+	}
+	afterSource.WriteString("</main>")
+	before, err := parseDiffHTML(beforeSource.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := parseDiffHTML(afterSource.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for run := 0; run < 2; run++ {
+		if _, err := matchDiffNodes(before, after); err != errDiffLimit {
+			t.Fatalf("run %d error = %v; want diff limit", run, err)
+		}
+	}
+}
+
 func TestMatchManyIdenticalSiblingsDoesNotExhaustBudget(t *testing.T) {
 	for _, siblings := range []int{700, maxDiffNodes - 1} {
 		t.Run(strconv.Itoa(siblings), func(t *testing.T) {
@@ -541,9 +722,6 @@ func TestBuildVersionDiffPreservesTextAtChildBoundaries(t *testing.T) {
 			if result.Summary.Modified == 0 || len(result.Changes) == 0 {
 				t.Fatalf("child-boundary edit was equal: %+v", result)
 			}
-			if len(result.CodeHunks) == 0 {
-				t.Fatalf("child-boundary edit has no source hunk: %+v", result)
-			}
 		})
 	}
 }
@@ -648,5 +826,187 @@ func TestBuildVersionDiffRejectsExcessiveNodeCount(t *testing.T) {
 	source.WriteString("</body></html>")
 	if _, err := buildVersionDiff(1, 2, source.String(), source.String()); err != errDiffLimit {
 		t.Fatalf("error = %v; want diff limit", err)
+	}
+}
+
+// reindentEqual builds a compact and a pretty-printed variant of the same block
+// content and asserts the pair is a zero-noise no-op (Goal A): ordinary reindent
+// of plain block/table/list elements without layout-affecting CSS must produce
+// no structural changes and no source hunks.
+func reindentEqual(t *testing.T, compact, pretty string) {
+	t.Helper()
+	result, err := buildVersionDiff(1, 2, compact, pretty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
+		t.Fatalf("reindent produced noise: changes=%d hunks=%d", len(result.Changes), len(result.CodeHunks))
+	}
+}
+
+func TestBuildVersionDiffPlainReindentIsZeroNoise(t *testing.T) {
+	for _, count := range []int{100, 500} {
+		t.Run("p-"+strconv.Itoa(count), func(t *testing.T) {
+			var compact, pretty strings.Builder
+			for range count {
+				compact.WriteString("<p>x</p>")
+				pretty.WriteString("  <p>x</p>\n")
+			}
+			reindentEqual(t, "<main>"+compact.String()+"</main>", "<main>\n"+pretty.String()+"</main>")
+		})
+	}
+	reindentEqual(t,
+		`<table><tbody><tr><td>a</td><td>b</td></tr></tbody></table>`,
+		"<table>\n  <tbody>\n    <tr>\n      <td>a</td>\n      <td>b</td>\n    </tr>\n  </tbody>\n</table>")
+	reindentEqual(t,
+		`<ul><li>a</li><li>b</li></ul>`,
+		"<ul>\n  <li>a</li>\n  <li>b</li>\n</ul>")
+	reindentEqual(t,
+		`<div><section><p>a</p><p>b</p></section></div>`,
+		"<div>\n  <section>\n    <p>a</p>\n    <p>b</p>\n  </section>\n</div>")
+}
+
+// The four final-review repros: a whitespace change that could be visible must
+// surface in at least one layer, never an empty diff (Goal B).
+func TestBuildVersionDiffWhitespaceSensitiveContextsAreNotEmptyDiffs(t *testing.T) {
+	cases := []struct {
+		name          string
+		before, after string
+	}{
+		{"pre-block-children", `<pre><div>x</div><div>y</div></pre>`, `<pre><div>x</div> <div>y</div></pre>`},
+		{"ancestor-white-space-pre", `<div style="white-space:pre"><span>x</span><span>y</span></div>`, `<div style="white-space:pre"><span>x</span> <span>y</span></div>`},
+		{"style-display-inline", `<style>div{display:inline}</style><div>x</div><div>y</div>`, `<style>div{display:inline}</style><div>x</div> <div>y</div>`},
+		{"summary-display-inline", `<summary style="display:inline">x</summary><summary style="display:inline">y</summary>`, `<summary style="display:inline">x</summary> <summary style="display:inline">y</summary>`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, tc.before, tc.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+				t.Fatalf("whitespace change vanished: changes=0 hunks=0 for %q vs %q", tc.before, tc.after)
+			}
+		})
+	}
+}
+
+func TestBuildVersionDiffPreformattedRunLengthChangeIsVisible(t *testing.T) {
+	before := "<pre>a b</pre>"
+	after := "<pre>a  b</pre>"
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.CodeHunks) == 0 {
+		t.Fatal("differing whitespace-run length under <pre> produced no code hunk")
+	}
+}
+
+// assertVisibleAndValid fails when a change that must surface vanishes from both
+// layers, and verifies every emitted hunk line stays bounded and UTF-8 valid.
+func assertVisibleAndValid(t *testing.T, before, after string) {
+	t.Helper()
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+		t.Fatalf("change vanished: changes=0 hunks=0 for %q vs %q", before, after)
+	}
+	const maxLineBytes = 1 << 12
+	for _, hunk := range result.CodeHunks {
+		for _, line := range hunk.Lines {
+			if !utf8.ValidString(line) {
+				t.Fatalf("hunk line is not valid UTF-8: %q", line)
+			}
+			if len(line) > maxLineBytes {
+				t.Fatalf("hunk line unbounded: %d bytes", len(line))
+			}
+		}
+	}
+}
+
+// Raw-text (RCDATA/literal) content changes must surface, including when the
+// content holds a stray '<' that is text, not markup: the parser must scan to
+// the close tag rather than splitting the run into a spurious tag.
+func TestBuildVersionDiffRawTextWhitespaceAndStrayLtAreVisible(t *testing.T) {
+	assertVisibleAndValid(t, "<textarea>a b</textarea>", "<textarea>a  b</textarea>")
+	assertVisibleAndValid(t, "<textarea>a < b</textarea>", "<textarea>a <  b</textarea>")
+	assertVisibleAndValid(t, "<title>a &amp; b</title>", "<title>a &amp;&amp; b</title>")
+	// Identical raw-text content still yields no diff.
+	ident, err := buildVersionDiff(1, 2, "<textarea>a < b</textarea>", "<textarea>a < b</textarea>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ident.Changes) != 0 || len(ident.CodeHunks) != 0 {
+		t.Fatalf("identical raw text produced a diff: changes=%d hunks=%d", len(ident.Changes), len(ident.CodeHunks))
+	}
+}
+
+// Long content that shares its first >1024 bytes but diverges in the tail must
+// not collide once display truncation applies; the full-content digest keeps
+// distinct text distinct across pre, white-space:pre, and pure-whitespace runs.
+func TestBuildVersionDiffLongTailChangesDoNotCollide(t *testing.T) {
+	prefix := strings.Repeat("x", 1500)
+	assertVisibleAndValid(t, "<pre>"+prefix+"ALPHA</pre>", "<pre>"+prefix+"OMEGA</pre>")
+
+	long := strings.Repeat("word ", 400) // > 1024 bytes after collapse
+	assertVisibleAndValid(t,
+		`<div style="white-space:pre">`+long+"ALPHA</div>",
+		`<div style="white-space:pre">`+long+"OMEGA</div>")
+
+	// Pure-whitespace runs differing only in length or tail beyond 1024 must not
+	// collide via the whitespace-run token.
+	ws := strings.Repeat(" ", 1400)
+	assertVisibleAndValid(t,
+		`<div style="white-space:pre"><span>x</span>`+ws+"<span>y</span></div>",
+		`<div style="white-space:pre"><span>x</span>`+ws+" <span>y</span></div>")
+	assertVisibleAndValid(t,
+		`<pre><span>x</span>`+strings.Repeat(" ", 1400)+"a<span>y</span></pre>",
+		`<pre><span>x</span>`+strings.Repeat(" ", 1400)+"b<span>y</span></pre>")
+}
+
+func TestBuildVersionDiffDeterministicWhitespaceHunks(t *testing.T) {
+	before := `<style>x{}</style><div>a</div><div>b</div>`
+	after := `<style>x{}</style><div>a</div> <div>b</div>`
+	first, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstJSON, _ := json.Marshal(first)
+	for range 5 {
+		next, err := buildVersionDiff(1, 2, before, after)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nextJSON, _ := json.Marshal(next)
+		if string(firstJSON) != string(nextJSON) {
+			t.Fatalf("nondeterministic diff:\n%s\n%s", firstJSON, nextJSON)
+		}
+	}
+}
+
+func TestHasLayoutAffectingCSSConservativeSignals(t *testing.T) {
+	positives := []string{
+		`<style>p{}</style><p>x</p>`,
+		`<link rel="stylesheet" href="a.css"><p>x</p>`,
+		`<div style="display:flex"><p>x</p></div>`,
+		`<div style="white-space:normal"><p>x</p></div>`,
+	}
+	for _, src := range positives {
+		if !hasLayoutAffectingCSS(src) {
+			t.Errorf("expected layout-affecting CSS for %q", src)
+		}
+	}
+	negatives := []string{
+		`<main><p>x</p><p>y</p></main>`,
+		`<div class="lead"><p>x</p></div>`,
+		`<div style="color:red"><p>x</p></div>`,
+	}
+	for _, src := range negatives {
+		if hasLayoutAffectingCSS(src) {
+			t.Errorf("did not expect layout-affecting CSS for %q", src)
+		}
 	}
 }

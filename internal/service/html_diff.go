@@ -84,6 +84,7 @@ type htmlDiffNode struct {
 	outer       string
 	parent      int
 	children    []int
+	childTags   []string
 	siblingPos  int
 	order       int
 }
@@ -282,6 +283,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		if parent >= 0 {
 			nodes[parent].textBounds = append(nodes[parent].textBounds, len(nodes[parent].textParts))
 			nodes[parent].children = append(nodes[parent].children, index)
+			nodes[parent].childTags = append(nodes[parent].childTags, tag)
 		}
 		selfClosing := strings.HasSuffix(strings.TrimSpace(raw), "/") || isDiffVoidTag(tag)
 		if selfClosing {
@@ -337,6 +339,14 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				if normalizedSegment == "" {
 					continue
 				}
+				// Pure ASCII-whitespace between block-like siblings (or against a
+				// block edge) is reindent/pretty-print noise with no visible inline
+				// boundary, so it must not perturb the digest. Whitespace touching an
+				// inline (or unknown/custom, treated inline) neighbor stays framed so
+				// "see <a>here</a>" keeps its visible space.
+				if isOnlyHTMLASCIIWhitespace(segment) && !diffSlotWhitespaceVisible(nodes[index], slot) {
+					continue
+				}
 				// Frame each non-empty segment with its boundary slot so text at
 				// different child boundaries cannot collide, while a purely
 				// structural child insertion (all-empty slots) leaves the digest
@@ -348,6 +358,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		}
 		nodes[index].textParts = nil
 		nodes[index].textBounds = nil
+		nodes[index].childTags = nil
 		nodes[index].compareText = normalizeCompareText(fullText)
 		nodes[index].textDigest = fmt.Sprintf("%x", textDigest.Sum(nil))
 		nodes[index].text = fullText
@@ -457,7 +468,9 @@ func parseDiffAttrs(raw string) map[string]string {
 				value = raw[start:cursor]
 			}
 		}
-		attrs[name] = html.UnescapeString(value)
+		if _, exists := attrs[name]; !exists {
+			attrs[name] = html.UnescapeString(value)
+		}
 	}
 	return attrs
 }
@@ -477,6 +490,43 @@ func appendDiffNodeText(node *htmlDiffNode, text string) {
 	// Keep chunks separate so entity decoding cannot cross comments or tags.
 	// Finalization joins once, avoiding quadratic repeated concatenation.
 	node.textParts = append(node.textParts, text)
+}
+
+// isBlockLevelDiffTag reports whether tag renders as a block-like box whose
+// surrounding ASCII whitespace collapses away visually (block, table, list,
+// section, form, headings). Unknown/custom elements are conservatively treated
+// as inline (returns false) so their surrounding whitespace stays significant.
+func isBlockLevelDiffTag(tag string) bool {
+	switch tag {
+	case "address", "article", "aside", "blockquote", "details", "dialog", "dd", "div",
+		"dl", "dt", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2",
+		"h3", "h4", "h5", "h6", "header", "hgroup", "hr", "li", "main", "menu", "nav",
+		"ol", "p", "pre", "search", "section", "summary", "ul",
+		"table", "caption", "colgroup", "thead", "tbody", "tfoot", "tr", "td", "th",
+		"optgroup", "option":
+		return true
+	default:
+		return false
+	}
+}
+
+// diffSlotWhitespaceVisible reports whether a pure-whitespace text segment at
+// boundary slot renders as a visible inline space. Slot s sits between child
+// s-1 (left) and child s (right); a missing side is the parent's own edge,
+// which is a block context. Whitespace is invisible reindent/pretty-print noise
+// only when both neighbors are block-level, so it must not enter the digest.
+// Any inline (or unknown/custom, treated inline) or void neighbor keeps it.
+func diffSlotWhitespaceVisible(node htmlDiffNode, slot int) bool {
+	return !diffBoundarySideIsBlock(node, slot-1) || !diffBoundarySideIsBlock(node, slot)
+}
+
+// diffBoundarySideIsBlock reports whether the child at childPos is block-level.
+// An out-of-range position denotes the parent's own edge, which is block-like.
+func diffBoundarySideIsBlock(node htmlDiffNode, childPos int) bool {
+	if childPos < 0 || childPos >= len(node.children) {
+		return true
+	}
+	return isBlockLevelDiffTag(node.childTags[childPos])
 }
 
 func normalizeDiffTextSegment(value string) string {
@@ -598,7 +648,8 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 	matchRootNodes(before, after, matches, used)
 	for changed := true; changed; {
 		changed = false
-		for beforeParent, afterParent := range matches {
+		for _, pair := range sortedDiffMatches(matches) {
+			beforeParent, afterParent := pair[0], pair[1]
 			if matchAIDChildren(before, after, beforeParent, afterParent, matches, used) {
 				changed = true
 			}
@@ -629,11 +680,15 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 			continue
 		}
 		bestIndex, bestScore := -1, 0.0
+		if !budget.addComparisons(len(before) + len(after)) {
+			return nil, errDiffLimit
+		}
+		bounds := newSiblingOrderBounds(before, after, matches)
 		for afterIndex, afterNode := range after {
 			if used[afterIndex] || beforeNode.tag != afterNode.tag || !parentsMatch(beforeNode, afterNode, matches) {
 				continue
 			}
-			compatible := siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches)
+			compatible := bounds.compatible(before, after, beforeIndex, afterIndex)
 			if !compatible {
 				continue
 			}
@@ -651,6 +706,20 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 		}
 	}
 	return matches, nil
+}
+
+func sortedDiffMatches(matches map[int]int) [][2]int {
+	pairs := make([][2]int, 0, len(matches))
+	for beforeIndex, afterIndex := range matches {
+		pairs = append(pairs, [2]int{beforeIndex, afterIndex})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i][0] == pairs[j][0] {
+			return pairs[i][1] < pairs[j][1]
+		}
+		return pairs[i][0] < pairs[j][0]
+	})
+	return pairs
 }
 
 func matchAIDChildren(before, after []htmlDiffNode, beforeParent, afterParent int, matches map[int]int, used map[int]bool) bool {
@@ -682,7 +751,15 @@ type diffMatchBudget struct {
 }
 
 func (budget *diffMatchBudget) add(bytes int) bool {
-	budget.comparisons++
+	return budget.addComparisonsAndBytes(1, bytes)
+}
+
+func (budget *diffMatchBudget) addComparisons(comparisons int) bool {
+	return budget.addComparisonsAndBytes(comparisons, 0)
+}
+
+func (budget *diffMatchBudget) addComparisonsAndBytes(comparisons, bytes int) bool {
+	budget.comparisons += comparisons
 	budget.bytes += bytes
 	return budget.comparisons <= maxDiffComparisons && budget.bytes <= maxDiffCompareBytes
 }
@@ -709,13 +786,17 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 		return false, nil
 	}
 	changed := false
+	if !budget.addComparisons(len(before) + len(after)) {
+		return false, errDiffLimit
+	}
+	bounds := newSiblingOrderBounds(before, after, matches)
 	beforeStart, afterStart := 0, 0
 	for beforeStart < len(beforeChildren) && afterStart < len(afterChildren) {
 		equal, err := diffSignaturesEqual(before[beforeChildren[beforeStart]], after[afterChildren[afterStart]], budget)
 		if err != nil {
 			return false, err
 		}
-		compatible := siblingOrderCompatible(before, after, beforeChildren[beforeStart], afterChildren[afterStart], matches)
+		compatible := bounds.compatible(before, after, beforeChildren[beforeStart], afterChildren[afterStart])
 		if !equal || !compatible {
 			break
 		}
@@ -732,7 +813,7 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 		if err != nil {
 			return false, err
 		}
-		compatible := siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches)
+		compatible := bounds.compatible(before, after, beforeIndex, afterIndex)
 		if !equal || !compatible {
 			break
 		}
@@ -752,6 +833,10 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 	}
 	width := len(afterChildren) + 1
 	cells := make([]uint16, (len(beforeChildren)+1)*width)
+	if !budget.addComparisons(len(before) + len(after)) {
+		return false, errDiffLimit
+	}
+	bounds = newSiblingOrderBounds(before, after, matches)
 	for beforePos := len(beforeChildren) - 1; beforePos >= 0; beforePos-- {
 		for afterPos := len(afterChildren) - 1; afterPos >= 0; afterPos-- {
 			beforeIndex, afterIndex := beforeChildren[beforePos], afterChildren[afterPos]
@@ -760,7 +845,7 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 				return false, err
 			}
 			cell := beforePos*width + afterPos
-			compatible := siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches)
+			compatible := bounds.compatible(before, after, beforeIndex, afterIndex)
 			if equal && compatible {
 				cells[cell] = cells[(beforePos+1)*width+afterPos+1] + 1
 			} else {
@@ -776,7 +861,7 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 	}
 	for beforePos, afterPos := 0, 0; beforePos < len(beforeChildren) && afterPos < len(afterChildren); {
 		beforeIndex, afterIndex := beforeChildren[beforePos], afterChildren[afterPos]
-		compatible := siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches)
+		compatible := bounds.compatible(before, after, beforeIndex, afterIndex)
 		if diffNodeSignature(before[beforeIndex]) == diffNodeSignature(after[afterIndex]) && compatible && cells[beforePos*width+afterPos] == cells[(beforePos+1)*width+afterPos+1]+1 {
 			matches[beforeIndex] = afterIndex
 			used[afterIndex] = true
@@ -824,27 +909,48 @@ func parentsMatch(before, after htmlDiffNode, matches map[int]int) bool {
 	return ok && matchedParent == after.parent
 }
 
-func siblingOrderCompatible(before, after []htmlDiffNode, beforeIndex, afterIndex int, matches map[int]int) bool {
+type siblingOrderBounds struct {
+	lower []int
+	upper []int
+}
+
+func newSiblingOrderBounds(before, after []htmlDiffNode, matches map[int]int) siblingOrderBounds {
+	bounds := siblingOrderBounds{lower: make([]int, len(before)), upper: make([]int, len(before))}
+	for index := range bounds.lower {
+		bounds.lower[index] = -1
+		bounds.upper[index] = len(after)
+	}
+	for parentIndex := range before {
+		children := before[parentIndex].children
+		anchor := -1
+		for _, child := range children {
+			bounds.lower[child] = anchor
+			if matched, ok := matches[child]; ok {
+				anchor = matched
+			}
+		}
+		anchor = -1
+		for pos := len(children) - 1; pos >= 0; pos-- {
+			child := children[pos]
+			bounds.upper[child] = anchor
+			if matched, ok := matches[child]; ok {
+				anchor = matched
+			}
+		}
+	}
+	return bounds
+}
+
+func (bounds siblingOrderBounds) compatible(before, after []htmlDiffNode, beforeIndex, afterIndex int) bool {
 	beforeNode, afterNode := before[beforeIndex], after[afterIndex]
 	if beforeNode.parent < 0 || afterNode.parent < 0 {
 		return true
 	}
-	beforeSiblings := before[beforeNode.parent].children
-	for pos := beforeNode.siblingPos - 1; pos >= 0; pos-- {
-		if anchor, ok := matches[beforeSiblings[pos]]; ok {
-			if after[anchor].parent == afterNode.parent && after[anchor].siblingPos >= afterNode.siblingPos {
-				return false
-			}
-			break
-		}
+	if anchor := bounds.lower[beforeIndex]; anchor >= 0 && after[anchor].parent == afterNode.parent && after[anchor].siblingPos >= afterNode.siblingPos {
+		return false
 	}
-	for pos := beforeNode.siblingPos + 1; pos < len(beforeSiblings); pos++ {
-		if anchor, ok := matches[beforeSiblings[pos]]; ok {
-			if after[anchor].parent == afterNode.parent && after[anchor].siblingPos <= afterNode.siblingPos {
-				return false
-			}
-			break
-		}
+	if anchor := bounds.upper[beforeIndex]; anchor >= 0 && after[anchor].parent == afterNode.parent && after[anchor].siblingPos <= afterNode.siblingPos {
+		return false
 	}
 	return true
 }
@@ -966,7 +1072,39 @@ func diffNodeSnippet(node htmlDiffNode) string {
 }
 
 func normalizeDiffHTML(value string) string {
-	return strings.Join(strings.Fields(value), " ")
+	var builder strings.Builder
+	builder.Grow(len(value))
+	var quote byte
+	pendingSpace := false
+	for index := 0; index < len(value); index++ {
+		byteValue := value[index]
+		if quote != 0 {
+			builder.WriteByte(byteValue)
+			if byteValue == quote {
+				quote = 0
+			}
+			continue
+		}
+		if byteValue == '\'' || byteValue == '"' {
+			if pendingSpace && builder.Len() > 0 {
+				builder.WriteByte(' ')
+			}
+			pendingSpace = false
+			quote = byteValue
+			builder.WriteByte(byteValue)
+			continue
+		}
+		if isHTMLASCIIWhitespace(byteValue) {
+			pendingSpace = builder.Len() > 0
+			continue
+		}
+		if pendingSpace {
+			builder.WriteByte(' ')
+			pendingSpace = false
+		}
+		builder.WriteByte(byteValue)
+	}
+	return builder.String()
 }
 
 func diffCodeHunks(before, after string) ([]CodeHunk, error) {
@@ -1102,6 +1240,18 @@ func diffLineOps(oldLines, newLines []string) ([]diffLineOp, bool) {
 
 func normalizedHTMLLines(source string) ([]string, bool) {
 	lines := make([]string, 0, 256)
+	// Whitespace between tags is treated as ignorable reindent noise only when we
+	// can prove nothing in the document can make it significant. layoutCSS is a
+	// bounded, conservative document-level signal (a <style> block, a stylesheet
+	// link, or an inline style touching display/white-space) that some rule could
+	// change layout so inter-tag whitespace may be visible. preStack tracks a
+	// per-node preformatted / white-space:pre* ancestry so text nested inside such
+	// contexts is preserved verbatim. When neither holds, whitespace-only runs
+	// collapse away, keeping ordinary block reindent a zero-noise no-op.
+	layoutCSS := hasLayoutAffectingCSS(source)
+	preStack := make([]string, 0, 16)
+	whitespaceSensitive := func() bool { return layoutCSS || len(preStack) > 0 }
+	preformatted := func() bool { return len(preStack) > 0 }
 	for cursor := 0; cursor < len(source); {
 		if len(lines) >= maxDiffInputLines {
 			return nil, false
@@ -1111,49 +1261,70 @@ func normalizedHTMLLines(source string) ([]string, bool) {
 			if end < 0 {
 				// Unclosed '<' tail (no closing '>'): treat the remainder as plain
 				// text and terminate; do not slice an invalid tag range.
-				if !appendNormalizedDiffText(&lines, source[cursor:], false) {
+				if !appendNormalizedDiffText(&lines, source[cursor:], false, whitespaceSensitive(), preformatted()) {
 					return nil, false
 				}
 				break
 			}
 			rawTag := source[cursor+1 : end]
 			trimmed := strings.TrimSpace(rawTag)
-			lines = append(lines, normalizeDiffHTML(source[cursor:end+1]))
+			lines = append(lines, limitDiffLine(normalizeDiffHTML(source[cursor:end+1])))
 			cursor = end + 1
-			if trimmed == "" || trimmed[0] == '/' || trimmed[0] == '!' || trimmed[0] == '?' || strings.HasSuffix(strings.TrimSpace(rawTag), "/") {
+			if trimmed == "" || trimmed[0] == '!' || trimmed[0] == '?' {
 				continue
 			}
+			if trimmed[0] == '/' {
+				if closeTag, ok := diffTagName(trimmed[1:]); ok {
+					popPreformatted(&preStack, closeTag)
+				}
+				continue
+			}
+			selfClosing := strings.HasSuffix(strings.TrimSpace(rawTag), "/")
 			tag, ok := diffTagName(trimmed)
 			if !ok {
 				return nil, false
 			}
-			if !isDiffLiteralRawTextTag(tag) {
+			if !selfClosing && !isDiffVoidTag(tag) && isPreformattedContext(tag, trimmed[len(tag):]) {
+				preStack = append(preStack, tag)
+			}
+			if !isDiffRawTextTag(tag) {
 				continue
 			}
+			// Raw-text elements hold text, not markup: their content must be scanned
+			// to the matching close tag so an inner '<' is never split as a spurious
+			// tag (the double-blind that hid textarea/title content changes). script
+			// and style are literal (no entity decode); textarea and title are RCDATA
+			// (entities decode). textarea preserves whitespace (it is on preStack);
+			// title/script/style collapse it, matching how each renders.
+			literalRaw := isDiffLiteralRawTextTag(tag)
+			rawPreformatted := preformatted()
 			closeStart, _ := indexDiffRawClose(source, cursor, tag)
 			if closeStart < 0 {
-				if !appendNormalizedDiffText(&lines, source[cursor:], true) {
+				if !appendNormalizedDiffText(&lines, source[cursor:], literalRaw, rawPreformatted, rawPreformatted) {
 					return nil, false
 				}
 				cursor = len(source)
 				continue
 			}
-			if !appendNormalizedDiffText(&lines, source[cursor:closeStart], true) || len(lines) >= maxDiffInputLines {
+			if !appendNormalizedDiffText(&lines, source[cursor:closeStart], literalRaw, rawPreformatted, rawPreformatted) || len(lines) >= maxDiffInputLines {
 				return nil, false
 			}
 			closeEnd := diffTagEnd(source, closeStart)
 			if closeEnd < 0 {
 				closeEnd = len(source) - 1
 			}
-			lines = append(lines, normalizeDiffHTML(source[closeStart:closeEnd+1]))
+			lines = append(lines, limitDiffLine(normalizeDiffHTML(source[closeStart:closeEnd+1])))
 			cursor = closeEnd + 1
+			if rawPreformatted {
+				popPreformatted(&preStack, tag)
+			}
 			continue
 		}
 		end := strings.IndexByte(source[cursor:], '<')
 		if end < 0 {
 			end = len(source) - cursor
 		}
-		if !appendNormalizedDiffText(&lines, source[cursor:cursor+end], false) {
+		if !appendNormalizedDiffText(&lines, source[cursor:cursor+end], false, whitespaceSensitive(), preformatted()) {
 			return nil, false
 		}
 		cursor += end
@@ -1161,17 +1332,160 @@ func normalizedHTMLLines(source string) ([]string, bool) {
 	return lines, true
 }
 
-func appendNormalizedDiffText(lines *[]string, text string, literal bool) bool {
+func appendNormalizedDiffText(lines *[]string, text string, literal, whitespaceSensitive, preformatted bool) bool {
+	raw := text
 	if !literal {
 		text = html.UnescapeString(text)
 	}
-	if text == "" {
+	if preformatted {
+		// Inside a preformatted / white-space:pre* context every space, tab, and
+		// newline is significant, so preserve the run verbatim (bounded) instead of
+		// collapsing; an empty run still emits nothing.
+		if text == "" {
+			return true
+		}
+		if len(*lines) >= maxDiffInputLines {
+			return false
+		}
+		*lines = append(*lines, limitDiffLine(text))
+		return true
+	}
+	collapsed := collapseHTMLASCIIWhitespace(text)
+	if collapsed == "" {
+		// Pure whitespace. In a whitespace-sensitive context the exact run can be
+		// visible, so emit a distinct token that differs when the run differs and
+		// vanishes when the run is absent; elsewhere it is safe reindent noise.
+		if !whitespaceSensitive || text == "" {
+			return true
+		}
+		collapsed = whitespaceRunToken(raw)
+		if len(*lines) >= maxDiffInputLines {
+			return false
+		}
+		// whitespaceRunToken is already bounded and collision-free; do not re-bound.
+		*lines = append(*lines, collapsed)
 		return true
 	}
 	if len(*lines) >= maxDiffInputLines {
 		return false
 	}
-	*lines = append(*lines, text)
+	*lines = append(*lines, limitDiffLine(collapsed))
+	return true
+}
+
+// whitespaceRunToken encodes a preserved pure-whitespace run so that runs which
+// differ byte-for-byte produce different lines (e.g. under a <pre> ancestor)
+// while an absent run emits no line at all. The token is self-bounded: a short
+// quoted prefix for readability plus run length and the full-run SHA-256, so
+// runs differing only in length or tail beyond the prefix never collide.
+func whitespaceRunToken(run string) string {
+	const prefixBytes = 64
+	prefix := run
+	if len(prefix) > prefixBytes {
+		prefix = prefix[:prefixBytes]
+	}
+	digest := sha256.Sum256([]byte(run))
+	return fmt.Sprintf("\u2408ws:%s#%d#%x", strconv.Quote(prefix), len(run), digest)
+}
+
+// isPreformattedContext reports whether an open tag establishes a
+// whitespace-preserving context for its descendants: the native pre/textarea
+// elements, or any element whose inline style sets white-space to a preserving
+// value. attrRaw is the tag text after the name.
+func isPreformattedContext(tag, attrRaw string) bool {
+	if tag == "pre" || tag == "textarea" {
+		return true
+	}
+	style := parseDiffAttrs(attrRaw)["style"]
+	if style == "" {
+		return false
+	}
+	return styleHasPreservedWhitespace(style)
+}
+
+func styleHasPreservedWhitespace(style string) bool {
+	style = strings.ToLower(style)
+	idx := strings.Index(style, "white-space")
+	for idx >= 0 {
+		value := style[idx+len("white-space"):]
+		if colon := strings.IndexByte(value, ':'); colon >= 0 {
+			value = value[colon+1:]
+			if semi := strings.IndexByte(value, ';'); semi >= 0 {
+				value = value[:semi]
+			}
+			if strings.Contains(value, "pre") || strings.Contains(value, "break-spaces") {
+				return true
+			}
+		}
+		next := strings.Index(style[idx+len("white-space"):], "white-space")
+		if next < 0 {
+			break
+		}
+		idx += len("white-space") + next
+	}
+	return false
+}
+
+func popPreformatted(preStack *[]string, closeTag string) {
+	for pos := len(*preStack) - 1; pos >= 0; pos-- {
+		if (*preStack)[pos] == closeTag {
+			*preStack = (*preStack)[:pos]
+			return
+		}
+	}
+}
+
+// hasLayoutAffectingCSS is a bounded, conservative scan for anything that could
+// make inter-tag whitespace visible: a <style> element, a stylesheet <link>, or
+// an inline style declaring display/white-space. It never parses CSS; it only
+// decides whether whitespace changes must stay provable rather than assumed
+// safe. False positives merely keep whitespace noise in the source hunk; a
+// false negative would risk an empty diff, so the checks stay generous.
+func hasLayoutAffectingCSS(source string) bool {
+	scan := source
+	if len(scan) > maxDiffRawScanBytes {
+		scan = scan[:maxDiffRawScanBytes]
+	}
+	lower := strings.ToLower(scan)
+	if strings.Contains(lower, "<style") {
+		return true
+	}
+	// A rel="stylesheet" link (or a rel token containing it) can restyle layout.
+	if strings.Contains(lower, "stylesheet") {
+		return true
+	}
+	for idx := strings.Index(lower, "style="); idx >= 0; {
+		tail := lower[idx+len("style="):]
+		// Scope the display/white-space probe to this style attribute's own value so
+		// a later unrelated "display" elsewhere in the document is not a false
+		// positive. A quoted value ends at its matching quote; an unquoted one ends
+		// at whitespace or the tag's '>'.
+		value := tail
+		if len(tail) > 0 && (tail[0] == '"' || tail[0] == '\'') {
+			if end := strings.IndexByte(tail[1:], tail[0]); end >= 0 {
+				value = tail[1 : 1+end]
+			}
+		} else if end := strings.IndexAny(tail, " \t\r\n>"); end >= 0 {
+			value = tail[:end]
+		}
+		if strings.Contains(value, "display") || strings.Contains(value, "white-space") {
+			return true
+		}
+		next := strings.Index(tail, "style=")
+		if next < 0 {
+			break
+		}
+		idx += len("style=") + next
+	}
+	return false
+}
+
+func isOnlyHTMLASCIIWhitespace(value string) bool {
+	for index := 0; index < len(value); index++ {
+		if !isHTMLASCIIWhitespace(value[index]) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -1180,7 +1494,13 @@ func limitDiffLine(line string) string {
 	if len(line) <= maxLine {
 		return line
 	}
-	return truncateUTF8(line, maxLine) + "…"
+	// A truncated prefix alone would let two long lines that share their first
+	// maxLine bytes but differ later collide, silently dropping the change from
+	// the line diff. Append the full-content SHA-256 so distinct complete text
+	// never compares equal, while the string stays bounded. The digest is part of
+	// the line identity used for equality, so equal content still matches.
+	digest := sha256.Sum256([]byte(line))
+	return truncateUTF8(line, maxLine) + fmt.Sprintf("\u2026\u2408sha256:%x", digest)
 }
 
 func diffOutputSize(result *VersionDiff) int {
