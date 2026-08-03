@@ -91,7 +91,7 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/docs/{slug}", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleGetDoc))))
 		r.Get("/docs/{slug}/versions", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleVersions))))
 		r.Get("/docs/{slug}/versions/{version}/source", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleVersionSource))))
-		r.Get("/docs/{slug}/diff", s.cors(s.requireDocReadJSON(slugFromPath, s.wrap(s.handleVersionDiff))))
+		r.Get("/docs/{slug}/diff", s.cors(s.requireDocReadJSON(slugFromPath, s.limit(writeLimiter, false, s.wrap(s.handleVersionDiff)))))
 		r.With(s.requireDocAuthor).Delete("/docs/{slug}", s.cors(s.wrap(s.handleDeleteDoc)))
 		// Draft slot. Draft-first creation must work before any version exists, so
 		// these use requireDocAuthorOrFirstCreate: any authenticated session may

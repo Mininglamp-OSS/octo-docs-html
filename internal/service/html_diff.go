@@ -71,21 +71,20 @@ type CodeHunk struct {
 }
 
 type htmlDiffNode struct {
-	tag          string
-	aid          string
-	attrs        map[string]string
-	text         string
-	textParts    []string
-	textBoundary bool
-	textDigest   string
-	compareText  string
-	signature    string
-	path         string
-	outer        string
-	parent       int
-	children     []int
-	siblingPos   int
-	order        int
+	tag         string
+	aid         string
+	attrs       map[string]string
+	text        string
+	textParts   []string
+	textDigest  string
+	compareText string
+	signature   string
+	path        string
+	outer       string
+	parent      int
+	children    []int
+	siblingPos  int
+	order       int
 }
 
 type diffOpenNode struct {
@@ -280,7 +279,6 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		nodes = append(nodes, node)
 		index := len(nodes) - 1
 		if parent >= 0 {
-			nodes[parent].textBoundary = true
 			nodes[parent].children = append(nodes[parent].children, index)
 		}
 		selfClosing := strings.HasSuffix(strings.TrimSpace(raw), "/") || isDiffVoidTag(tag)
@@ -322,12 +320,9 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		} else {
 			parts := make([]string, 0, len(nodes[index].textParts))
 			for _, rawText := range nodes[index].textParts {
-				normalized := strings.Join(strings.Fields(html.UnescapeString(rawText)), " ")
-				if normalized != "" {
-					parts = append(parts, normalized)
-				}
+				parts = append(parts, html.UnescapeString(rawText))
 			}
-			fullText = strings.Join(parts, " ")
+			fullText = strings.Join(strings.Fields(strings.Join(parts, "")), " ")
 		}
 		nodes[index].textParts = nil
 		nodes[index].compareText = normalizeCompareText(fullText)
@@ -457,15 +452,9 @@ func appendDiffNodeText(node *htmlDiffNode, text string) {
 	if text == "" {
 		return
 	}
-	// Keep the complete direct text until finalization. Its aggregate size is
-	// bounded by the input, and finalizing whole chunks ensures entities are
-	// decoded before comparison and hashing. Literal raw text remains byte exact.
-	if !node.textBoundary && len(node.textParts) > 0 {
-		node.textParts[len(node.textParts)-1] += text
-	} else {
-		node.textParts = append(node.textParts, text)
-	}
-	node.textBoundary = false
+	// Keep chunks separate so entity decoding cannot cross comments or tags.
+	// Finalization joins once, avoiding quadratic repeated concatenation.
+	node.textParts = append(node.textParts, text)
 }
 
 func impliedDiffEndTag(open, next string) bool {
@@ -963,7 +952,7 @@ func diffCodeHunks(before, after string) ([]CodeHunk, error) {
 		}
 		hunk := CodeHunk{OldStart: oldStart, NewStart: newStart}
 		for _, op := range ops[interval.start:interval.end] {
-			hunk.Lines = append(hunk.Lines, string(op.kind)+op.text)
+			hunk.Lines = append(hunk.Lines, string(op.kind)+limitDiffLine(op.text))
 			if op.kind != '+' {
 				hunk.OldLines++
 			}
@@ -1046,7 +1035,7 @@ func normalizedHTMLLines(source string) ([]string, bool) {
 			}
 			rawTag := source[cursor+1 : end]
 			trimmed := strings.TrimSpace(rawTag)
-			lines = append(lines, limitDiffLine(normalizeDiffHTML(source[cursor:end+1])))
+			lines = append(lines, normalizeDiffHTML(source[cursor:end+1]))
 			cursor = end + 1
 			if trimmed == "" || trimmed[0] == '/' || trimmed[0] == '!' || trimmed[0] == '?' || strings.HasSuffix(strings.TrimSpace(rawTag), "/") {
 				continue
@@ -1073,7 +1062,7 @@ func normalizedHTMLLines(source string) ([]string, bool) {
 			if closeEnd < 0 {
 				closeEnd = len(source) - 1
 			}
-			lines = append(lines, limitDiffLine(normalizeDiffHTML(source[closeStart:closeEnd+1])))
+			lines = append(lines, normalizeDiffHTML(source[closeStart:closeEnd+1]))
 			cursor = closeEnd + 1
 			continue
 		}
@@ -1100,7 +1089,7 @@ func appendNormalizedDiffText(lines *[]string, text string, literal bool) bool {
 	if len(*lines) >= maxDiffInputLines {
 		return false
 	}
-	*lines = append(*lines, limitDiffLine(text))
+	*lines = append(*lines, text)
 	return true
 }
 

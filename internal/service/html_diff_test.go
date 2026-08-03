@@ -438,6 +438,84 @@ func TestParseDiffHTMLBoundsCommentSeparatedTextStorage(t *testing.T) {
 	}
 }
 
+func TestParseDiffHTMLCommentSeparatedTextAllocationsStayLinear(t *testing.T) {
+	var source strings.Builder
+	source.Grow(1 << 20)
+	source.WriteString("<main>")
+	for source.Len() < 1<<20 {
+		source.WriteString("x<!-- separator -->")
+	}
+	source.WriteString("</main>")
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := parseDiffHTML(source.String()); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+		t.Fatalf("parse allocated %d bytes for %d-byte input", allocated, source.Len())
+	}
+}
+
+func TestBuildVersionDiffDetectsCommentChangePastDisplayLimit(t *testing.T) {
+	prefix := strings.Repeat("z", 4000)
+	before := "<html><body><p>hi</p><!-- " + prefix + "ALPHA --></body></html>"
+	after := "<html><body><p>hi</p><!-- " + prefix + "OMEGA --></body></html>"
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.CodeHunks) == 0 {
+		t.Fatal("comment-only change produced no code hunk")
+	}
+}
+
+func TestBuildVersionDiffCodeHunksDetectLongTextTailChange(t *testing.T) {
+	prefix := strings.Repeat("a", 6000)
+	before := "<html><body><p>" + prefix + "ALPHA</p></body></html>"
+	after := "<html><body><p>" + prefix + "OMEGA</p></body></html>"
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified != 1 || len(result.CodeHunks) == 0 {
+		t.Fatalf("summary = %+v; code hunks = %+v", result.Summary, result.CodeHunks)
+	}
+}
+
+func TestBuildVersionDiffCommentDoesNotChangeVisibleText(t *testing.T) {
+	before := `<html><body><p>ab</p></body></html>`
+	after := `<html><body><p>a<!-- comment -->b</p></body></html>`
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) != 0 {
+		t.Fatalf("comment changed structural text: %+v", result.Changes)
+	}
+	if len(result.CodeHunks) == 0 {
+		t.Fatal("comment source change produced no code hunk")
+	}
+}
+
+func TestBuildVersionDiffDoesNotJoinEntityAcrossComment(t *testing.T) {
+	before := `<html><body><p>&am<!--x-->p;</p></body></html>`
+	after := `<html><body><p>&amp;</p></body></html>`
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 {
+		t.Fatalf("split entity was treated as equal: %+v", result)
+	}
+}
+
 func TestParseDiffHTMLBoundsMultipleRawTextElements(t *testing.T) {
 	payload := strings.Repeat("A", 256<<10)
 	var source strings.Builder
