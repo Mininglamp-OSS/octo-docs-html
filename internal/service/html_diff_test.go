@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html"
 	"runtime"
 	"strconv"
@@ -513,6 +514,82 @@ func TestBuildVersionDiffDoesNotJoinEntityAcrossComment(t *testing.T) {
 	}
 	if len(result.Changes) == 0 {
 		t.Fatalf("split entity was treated as equal: %+v", result)
+	}
+}
+
+func TestBuildVersionDiffPreservesTextAtChildBoundaries(t *testing.T) {
+	tests := []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{"visible whitespace", `<p>see <a>here</a></p>`, `<p>see<a>here</a></p>`},
+		{"redistributed text", `<p>abc<b>X</b>def</p>`, `<p>ab<b>X</b>cdef</p>`},
+		{"leading first child", `<p>a<b>x</b></p>`, `<p><b>x</b>a</p>`},
+		{"trailing last child", `<p><b>x</b>a</p>`, `<p><b>x</b></p>a`},
+		{"adjacent children boundary", `<p><b>x</b><i>y</i></p>`, `<p>z<b>x</b><i>y</i></p>`},
+		{"void child boundary", `<p>a<br>b</p>`, `<p>ab<br></p>`},
+		{"reviewer repro one", `<p>a<b>x</b><i>y</i>b</p>`, `<p><b>x</b>a<i>y</i>b</p>`},
+		{"reviewer repro two", `<p>a<b>x</b>b<i>y</i></p>`, `<p>a<b>x</b><i>y</i>b</p>`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Summary.Modified == 0 || len(result.Changes) == 0 {
+				t.Fatalf("child-boundary edit was equal: %+v", result)
+			}
+			if len(result.CodeHunks) == 0 {
+				t.Fatalf("child-boundary edit has no source hunk: %+v", result)
+			}
+		})
+	}
+}
+
+func TestBuildVersionDiffTreatsLiteralNBSPAsDistinctFromASCIISpace(t *testing.T) {
+	// HTML only folds ASCII whitespace, so a literal U+00A0 must not compare
+	// equal to a plain space in the text summary; the edit is a real change.
+	before := "<html><body><p>a\u00a0b</p></body></html>"
+	after := "<html><body><p>a b</p></body></html>"
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified == 0 || len(result.Changes) == 0 {
+		t.Fatalf("NBSP vs ASCII space was treated as equal: %+v", result)
+	}
+
+	// The same visible NBSP text must stay equal to itself (no spurious change).
+	same := "<html><body><p>a\u00a0b</p></body></html>"
+	result, err = buildVersionDiff(1, 2, same, same)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified != 0 || len(result.Changes) != 0 {
+		t.Fatalf("identical NBSP text reported a change: %+v", result)
+	}
+}
+
+func TestBuildVersionDiffAllowsManyOrdinaryEdits(t *testing.T) {
+	var before, after strings.Builder
+	before.WriteString("<html><body>")
+	after.WriteString("<html><body>")
+	for index := range 100 {
+		fmt.Fprintf(&before, "<p>paragraph %03d has the original ordinary text.</p>", index)
+		fmt.Fprintf(&after, "<p>paragraph %03d has the revised ordinary text.</p>", index)
+	}
+	before.WriteString("</body></html>")
+	after.WriteString("</body></html>")
+
+	result, err := buildVersionDiff(1, 2, before.String(), after.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified != 100 || len(result.CodeHunks) == 0 {
+		t.Fatalf("unexpected diff: summary=%+v hunks=%d", result.Summary, len(result.CodeHunks))
 	}
 }
 

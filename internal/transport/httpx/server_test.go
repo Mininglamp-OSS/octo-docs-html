@@ -1034,6 +1034,36 @@ func TestVersionDiffReturnsLocalChangesWithoutWholeDocuments(t *testing.T) {
 	}
 }
 
+func TestVersionDiffHandlesManyOrdinaryEdits(t *testing.T) {
+	h := newTestServer(t, nil)
+	var before, after strings.Builder
+	before.WriteString("<html><body>")
+	after.WriteString("<html><body>")
+	for index := range 100 {
+		fmt.Fprintf(&before, "<p>paragraph %03d has the original ordinary text.</p>", index)
+		fmt.Fprintf(&after, "<p>paragraph %03d has the revised ordinary text.</p>", index)
+	}
+	before.WriteString("</body></html>")
+	after.WriteString("</body></html>")
+	for _, source := range []string{before.String(), after.String()} {
+		payload, err := json.Marshal(map[string]string{"slug": "many-edits", "html": source})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), string(payload))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	rec := do(t, h, http.MethodGet, "/v1/docs/many-edits/diff?from=1&to=2", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("diff = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"modified":100`) {
+		t.Fatalf("unexpected diff: %s", rec.Body.String())
+	}
+}
+
 func TestVersionDiffStrictVersionValidation(t *testing.T) {
 	h := newTestServer(t, nil)
 	_ = do(t, h, http.MethodPost, "/v1/docs", authorHdr(),

@@ -76,6 +76,7 @@ type htmlDiffNode struct {
 	attrs       map[string]string
 	text        string
 	textParts   []string
+	textBounds  []int
 	textDigest  string
 	compareText string
 	signature   string
@@ -279,6 +280,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		nodes = append(nodes, node)
 		index := len(nodes) - 1
 		if parent >= 0 {
+			nodes[parent].textBounds = append(nodes[parent].textBounds, len(nodes[parent].textParts))
 			nodes[parent].children = append(nodes[parent].children, index)
 		}
 		selfClosing := strings.HasSuffix(strings.TrimSpace(raw), "/") || isDiffVoidTag(tag)
@@ -315,19 +317,39 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 	for index := range nodes {
 		literalRawText := isDiffLiteralRawTextTag(nodes[index].tag)
 		fullText := ""
+		textDigest := sha256.New()
 		if literalRawText {
 			fullText = strings.Join(nodes[index].textParts, "")
+			writeDiffFrame(textDigest, fullText)
 		} else {
 			parts := make([]string, 0, len(nodes[index].textParts))
 			for _, rawText := range nodes[index].textParts {
 				parts = append(parts, html.UnescapeString(rawText))
 			}
-			fullText = strings.Join(strings.Fields(strings.Join(parts, "")), " ")
+			bounds := append(append([]int(nil), nodes[index].textBounds...), len(parts))
+			start := 0
+			var fullTextBuilder strings.Builder
+			for slot, end := range bounds {
+				segment := strings.Join(parts[start:end], "")
+				start = end
+				fullTextBuilder.WriteString(segment)
+				normalizedSegment := normalizeDiffTextSegment(segment)
+				if normalizedSegment == "" {
+					continue
+				}
+				// Frame each non-empty segment with its boundary slot so text at
+				// different child boundaries cannot collide, while a purely
+				// structural child insertion (all-empty slots) leaves the digest
+				// unchanged.
+				writeDiffFrame(textDigest, strconv.Itoa(slot))
+				writeDiffFrame(textDigest, normalizedSegment)
+			}
+			fullText = collapseHTMLASCIIWhitespace(fullTextBuilder.String())
 		}
 		nodes[index].textParts = nil
+		nodes[index].textBounds = nil
 		nodes[index].compareText = normalizeCompareText(fullText)
-		digest := sha256.Sum256([]byte(fullText))
-		nodes[index].textDigest = fmt.Sprintf("%x", digest)
+		nodes[index].textDigest = fmt.Sprintf("%x", textDigest.Sum(nil))
 		nodes[index].text = fullText
 		if len(nodes[index].text) > maxDiffCompareText {
 			nodes[index].text = truncateUTF8(nodes[index].text, maxDiffCompareText)
@@ -455,6 +477,65 @@ func appendDiffNodeText(node *htmlDiffNode, text string) {
 	// Keep chunks separate so entity decoding cannot cross comments or tags.
 	// Finalization joins once, avoiding quadratic repeated concatenation.
 	node.textParts = append(node.textParts, text)
+}
+
+func normalizeDiffTextSegment(value string) string {
+	if value == "" {
+		return ""
+	}
+	// HTML only folds ASCII whitespace; a leading/trailing ASCII-whitespace
+	// boundary is preserved as a single space so adjacent segments do not merge.
+	leading := isHTMLASCIIWhitespace(value[0])
+	trailing := isHTMLASCIIWhitespace(value[len(value)-1])
+	value = collapseHTMLASCIIWhitespace(value)
+	if leading {
+		value = " " + value
+	}
+	if trailing {
+		value += " "
+	}
+	return value
+}
+
+// isHTMLASCIIWhitespace reports whether b is one of the HTML collapsible ASCII
+// whitespace bytes (tab, LF, FF, CR, space). Visible Unicode whitespace such as
+// NBSP (U+00A0) is intentionally excluded.
+func isHTMLASCIIWhitespace(b byte) bool {
+	switch b {
+	case '\t', '\n', '\f', '\r', ' ':
+		return true
+	default:
+		return false
+	}
+}
+
+// collapseHTMLASCIIWhitespace folds runs of HTML ASCII whitespace to a single
+// space and trims leading/trailing runs. It is linear and UTF-8 safe: multibyte
+// runes (whose continuation bytes never match an ASCII whitespace byte) pass
+// through untouched, so a literal U+00A0 never equals a plain space.
+func collapseHTMLASCIIWhitespace(value string) string {
+	var builder strings.Builder
+	builder.Grow(len(value))
+	pendingSpace := false
+	for i := 0; i < len(value); i++ {
+		if isHTMLASCIIWhitespace(value[i]) {
+			pendingSpace = builder.Len() > 0
+			continue
+		}
+		if pendingSpace {
+			builder.WriteByte(' ')
+			pendingSpace = false
+		}
+		builder.WriteByte(value[i])
+	}
+	return builder.String()
+}
+
+func writeDiffFrame(builder interface{ Write([]byte) (int, error) }, value string) {
+	length := strconv.AppendInt(nil, int64(len(value)), 10)
+	_, _ = builder.Write(length)
+	_, _ = builder.Write([]byte{':'})
+	_, _ = builder.Write([]byte(value))
 }
 
 func impliedDiffEndTag(open, next string) bool {
@@ -713,7 +794,7 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 
 func diffSignaturesEqual(before, after htmlDiffNode, budget *diffMatchBudget) (bool, error) {
 	beforeSignature, afterSignature := diffNodeSignature(before), diffNodeSignature(after)
-	if !budget.add(len(beforeSignature) + len(afterSignature)) {
+	if !budget.add(0) {
 		return false, errDiffLimit
 	}
 	return beforeSignature == afterSignature, nil
@@ -852,17 +933,13 @@ func computeDiffNodeSignature(node htmlDiffNode) string {
 	}
 	sort.Strings(keys)
 	var builder strings.Builder
-	builder.WriteString(node.tag)
+	writeDiffFrame(&builder, node.tag)
 	for _, key := range keys {
-		builder.WriteByte('|')
-		builder.WriteString(key)
-		builder.WriteByte('=')
-		builder.WriteString(node.attrs[key])
+		writeDiffFrame(&builder, key)
+		writeDiffFrame(&builder, node.attrs[key])
 	}
-	builder.WriteByte('|')
-	builder.WriteString(node.compareText)
-	builder.WriteByte('|')
-	builder.WriteString(node.textDigest)
+	writeDiffFrame(&builder, node.compareText)
+	writeDiffFrame(&builder, node.textDigest)
 	return builder.String()
 }
 
@@ -870,7 +947,7 @@ func normalizeCompareText(value string) string {
 	if len(value) > maxDiffCompareText {
 		value = truncateUTF8(value, maxDiffCompareText)
 	}
-	return strings.ToLower(strings.Join(strings.Fields(value), " "))
+	return strings.ToLower(collapseHTMLASCIIWhitespace(value))
 }
 
 func diffNodeSnippet(node htmlDiffNode) string {
@@ -973,6 +1050,7 @@ type diffLineOp struct {
 
 func diffLineOps(oldLines, newLines []string) ([]diffLineOp, bool) {
 	const syncWindow = 64
+	const maxLineComparisons = maxDiffInputLines * 128
 	ops := make([]diffLineOp, 0, len(oldLines)+len(newLines))
 	oldIndex, newIndex, comparisons := 0, 0, 0
 	for oldIndex < len(oldLines) || newIndex < len(newLines) {
@@ -982,7 +1060,7 @@ func diffLineOps(oldLines, newLines []string) ([]diffLineOp, bool) {
 			newIndex++
 			continue
 		}
-		bestOld, bestNew, bestDistance := -1, -1, syncWindow*2+1
+		bestOld, bestNew := -1, -1
 		oldLimit, newLimit := oldIndex+syncWindow, newIndex+syncWindow
 		if oldLimit > len(oldLines) {
 			oldLimit = len(oldLines)
@@ -990,15 +1068,20 @@ func diffLineOps(oldLines, newLines []string) ([]diffLineOp, bool) {
 		if newLimit > len(newLines) {
 			newLimit = len(newLines)
 		}
-		for candidateOld := oldIndex; candidateOld < oldLimit; candidateOld++ {
-			for candidateNew := newIndex; candidateNew < newLimit; candidateNew++ {
+		for distance := 1; distance < syncWindow*2 && bestOld < 0; distance++ {
+			for oldOffset := 0; oldOffset <= distance; oldOffset++ {
+				newOffset := distance - oldOffset
+				candidateOld, candidateNew := oldIndex+oldOffset, newIndex+newOffset
+				if candidateOld >= oldLimit || candidateNew >= newLimit {
+					continue
+				}
 				comparisons++
-				if comparisons > maxDiffComparisons {
+				if comparisons > maxLineComparisons {
 					return nil, false
 				}
-				if oldLines[candidateOld] == newLines[candidateNew] && candidateOld-oldIndex+candidateNew-newIndex < bestDistance {
+				if oldLines[candidateOld] == newLines[candidateNew] {
 					bestOld, bestNew = candidateOld, candidateNew
-					bestDistance = candidateOld - oldIndex + candidateNew - newIndex
+					break
 				}
 			}
 		}
@@ -1082,7 +1165,6 @@ func appendNormalizedDiffText(lines *[]string, text string, literal bool) bool {
 	if !literal {
 		text = html.UnescapeString(text)
 	}
-	text = strings.Join(strings.Fields(text), " ")
 	if text == "" {
 		return true
 	}
