@@ -1,6 +1,8 @@
 package service
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -69,19 +71,21 @@ type CodeHunk struct {
 }
 
 type htmlDiffNode struct {
-	tag         string
-	aid         string
-	attrs       map[string]string
-	text        string
-	textParts   []string
-	textBytes   int
-	compareText string
-	signature   string
-	path        string
-	outer       string
-	parent      int
-	children    []int
-	order       int
+	tag          string
+	aid          string
+	attrs        map[string]string
+	text         string
+	textParts    []string
+	textBoundary bool
+	textDigest   string
+	compareText  string
+	signature    string
+	path         string
+	outer        string
+	parent       int
+	children     []int
+	siblingPos   int
+	order        int
 }
 
 type diffOpenNode struct {
@@ -216,6 +220,10 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				if nodes[entry.index].tag != tag {
 					continue
 				}
+				for popped := len(stack) - 1; popped > pos; popped-- {
+					open := stack[popped]
+					nodes[open.index].outer = source[open.start:lt]
+				}
 				nodes[entry.index].outer = source[entry.start : end+1]
 				stack = stack[:pos]
 				break
@@ -230,6 +238,11 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		if tag == "" {
 			cursor = end + 1
 			continue
+		}
+		for len(stack) > 0 && impliedDiffEndTag(nodes[stack[len(stack)-1].index].tag, tag) {
+			entry := stack[len(stack)-1]
+			nodes[entry.index].outer = source[entry.start:lt]
+			stack = stack[:len(stack)-1]
 		}
 		if len(nodes) >= maxDiffNodes || len(stack) >= maxDiffDepth {
 			return nil, errDiffLimit
@@ -259,10 +272,15 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		}
 		pathBytes += pathLen
 		attrs := parseDiffAttrs(trimmed[len(tag):])
-		node := htmlDiffNode{tag: tag, aid: attrs["data-odoc-aid"], attrs: attrs, path: path, parent: parent, order: len(nodes)}
+		siblingPos := counts[tag] - 1
+		if parent >= 0 {
+			siblingPos = len(nodes[parent].children)
+		}
+		node := htmlDiffNode{tag: tag, aid: attrs["data-odoc-aid"], attrs: attrs, path: path, parent: parent, siblingPos: siblingPos, order: len(nodes)}
 		nodes = append(nodes, node)
 		index := len(nodes) - 1
 		if parent >= 0 {
+			nodes[parent].textBoundary = true
 			nodes[parent].children = append(nodes[parent].children, index)
 		}
 		selfClosing := strings.HasSuffix(strings.TrimSpace(raw), "/") || isDiffVoidTag(tag)
@@ -275,7 +293,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				return nil, errDiffLimit
 			}
 			if closeStart < 0 {
-				appendDiffNodeText(&nodes[index], source[end+1:], isDiffLiteralRawTextTag(tag))
+				appendDiffNodeText(&nodes[index], source[end+1:])
 				nodes[index].outer = source[lt:]
 				cursor = len(source)
 				continue
@@ -284,7 +302,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			if closeEnd < 0 {
 				closeEnd = len(source) - 1
 			}
-			appendDiffNodeText(&nodes[index], source[end+1:closeStart], isDiffLiteralRawTextTag(tag))
+			appendDiffNodeText(&nodes[index], source[end+1:closeStart])
 			nodes[index].outer = source[lt : closeEnd+1]
 			cursor = closeEnd + 1
 			continue
@@ -297,9 +315,28 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		nodes[entry.index].outer = source[entry.start:]
 	}
 	for index := range nodes {
-		nodes[index].text = strings.Join(nodes[index].textParts, " ")
+		literalRawText := isDiffLiteralRawTextTag(nodes[index].tag)
+		fullText := ""
+		if literalRawText {
+			fullText = strings.Join(nodes[index].textParts, "")
+		} else {
+			parts := make([]string, 0, len(nodes[index].textParts))
+			for _, rawText := range nodes[index].textParts {
+				normalized := strings.Join(strings.Fields(html.UnescapeString(rawText)), " ")
+				if normalized != "" {
+					parts = append(parts, normalized)
+				}
+			}
+			fullText = strings.Join(parts, " ")
+		}
 		nodes[index].textParts = nil
-		nodes[index].compareText = normalizeCompareText(nodes[index].text)
+		nodes[index].compareText = normalizeCompareText(fullText)
+		digest := sha256.Sum256([]byte(fullText))
+		nodes[index].textDigest = fmt.Sprintf("%x", digest)
+		nodes[index].text = fullText
+		if len(nodes[index].text) > maxDiffCompareText {
+			nodes[index].text = truncateUTF8(nodes[index].text, maxDiffCompareText)
+		}
 		nodes[index].signature = computeDiffNodeSignature(nodes[index])
 	}
 	return nodes, nil
@@ -413,35 +450,49 @@ func appendDiffText(nodes []htmlDiffNode, stack []diffOpenNode, text string) {
 		return
 	}
 	index := stack[len(stack)-1].index
-	appendDiffNodeText(&nodes[index], text, false)
+	appendDiffNodeText(&nodes[index], text)
 }
 
-func appendDiffNodeText(node *htmlDiffNode, text string, literalRawText bool) {
-	remaining := maxDiffCompareText - node.textBytes
-	separatorBytes := 0
-	if len(node.textParts) > 0 {
-		separatorBytes = 1
-	}
-	if remaining <= separatorBytes || text == "" {
+func appendDiffNodeText(node *htmlDiffNode, text string) {
+	if text == "" {
 		return
 	}
-	remaining -= separatorBytes
-	limit := remaining * 8
-	if len(text) > limit {
-		text = text[:limit]
+	// Keep the complete direct text until finalization. Its aggregate size is
+	// bounded by the input, and finalizing whole chunks ensures entities are
+	// decoded before comparison and hashing. Literal raw text remains byte exact.
+	if !node.textBoundary && len(node.textParts) > 0 {
+		node.textParts[len(node.textParts)-1] += text
+	} else {
+		node.textParts = append(node.textParts, text)
 	}
-	if !literalRawText {
-		text = html.UnescapeString(text)
+	node.textBoundary = false
+}
+
+func impliedDiffEndTag(open, next string) bool {
+	switch open {
+	case "p":
+		switch next {
+		case "address", "article", "aside", "blockquote", "div", "dl", "fieldset", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "main", "menu", "nav", "ol", "p", "pre", "search", "section", "table", "ul":
+			return true
+		}
+	case "li":
+		return next == "li"
+	case "dt", "dd":
+		return next == "dt" || next == "dd"
+	case "option":
+		return next == "option" || next == "optgroup"
+	case "thead":
+		return next == "tbody" || next == "tfoot"
+	case "tbody":
+		return next == "tbody" || next == "tfoot"
+	case "tfoot":
+		return next == "tbody"
+	case "tr":
+		return next == "tr" || next == "thead" || next == "tbody" || next == "tfoot"
+	case "td", "th":
+		return next == "td" || next == "th" || next == "tr" || next == "thead" || next == "tbody" || next == "tfoot"
 	}
-	normalized := strings.Join(strings.Fields(text), " ")
-	if normalized == "" {
-		return
-	}
-	if len(normalized) > remaining {
-		normalized = normalized[:remaining]
-	}
-	node.textParts = append(node.textParts, normalized)
-	node.textBytes += separatorBytes + len(normalized)
+	return false
 }
 
 func isDiffVoidTag(tag string) bool {
@@ -509,7 +560,11 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 		}
 		bestIndex, bestScore := -1, 0.0
 		for afterIndex, afterNode := range after {
-			if used[afterIndex] || beforeNode.tag != afterNode.tag || !parentsMatch(beforeNode, afterNode, matches) || !siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches) {
+			if used[afterIndex] || beforeNode.tag != afterNode.tag || !parentsMatch(beforeNode, afterNode, matches) {
+				continue
+			}
+			compatible := siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches)
+			if !compatible {
 				continue
 			}
 			if !budget.add(len(beforeNode.compareText) + len(afterNode.compareText)) {
@@ -590,7 +645,8 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 		if err != nil {
 			return false, err
 		}
-		if !equal || !siblingOrderCompatible(before, after, beforeChildren[beforeStart], afterChildren[afterStart], matches) {
+		compatible := siblingOrderCompatible(before, after, beforeChildren[beforeStart], afterChildren[afterStart], matches)
+		if !equal || !compatible {
 			break
 		}
 		matches[beforeChildren[beforeStart]] = afterChildren[afterStart]
@@ -606,7 +662,8 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 		if err != nil {
 			return false, err
 		}
-		if !equal || !siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches) {
+		compatible := siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches)
+		if !equal || !compatible {
 			break
 		}
 		beforeEnd--
@@ -633,7 +690,8 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 				return false, err
 			}
 			cell := beforePos*width + afterPos
-			if equal && siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches) {
+			compatible := siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches)
+			if equal && compatible {
 				cells[cell] = cells[(beforePos+1)*width+afterPos+1] + 1
 			} else {
 				skipBefore := cells[(beforePos+1)*width+afterPos]
@@ -648,7 +706,8 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 	}
 	for beforePos, afterPos := 0, 0; beforePos < len(beforeChildren) && afterPos < len(afterChildren); {
 		beforeIndex, afterIndex := beforeChildren[beforePos], afterChildren[afterPos]
-		if diffNodeSignature(before[beforeIndex]) == diffNodeSignature(after[afterIndex]) && siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches) && cells[beforePos*width+afterPos] == cells[(beforePos+1)*width+afterPos+1]+1 {
+		compatible := siblingOrderCompatible(before, after, beforeIndex, afterIndex, matches)
+		if diffNodeSignature(before[beforeIndex]) == diffNodeSignature(after[afterIndex]) && compatible && cells[beforePos*width+afterPos] == cells[(beforePos+1)*width+afterPos+1]+1 {
 			matches[beforeIndex] = afterIndex
 			used[afterIndex] = true
 			changed = true
@@ -696,12 +755,25 @@ func parentsMatch(before, after htmlDiffNode, matches map[int]int) bool {
 }
 
 func siblingOrderCompatible(before, after []htmlDiffNode, beforeIndex, afterIndex int, matches map[int]int) bool {
-	for matchedBefore, matchedAfter := range matches {
-		if before[matchedBefore].parent != before[beforeIndex].parent || after[matchedAfter].parent != after[afterIndex].parent {
-			continue
+	beforeNode, afterNode := before[beforeIndex], after[afterIndex]
+	if beforeNode.parent < 0 || afterNode.parent < 0 {
+		return true
+	}
+	beforeSiblings := before[beforeNode.parent].children
+	for pos := beforeNode.siblingPos - 1; pos >= 0; pos-- {
+		if anchor, ok := matches[beforeSiblings[pos]]; ok {
+			if after[anchor].parent == afterNode.parent && after[anchor].siblingPos >= afterNode.siblingPos {
+				return false
+			}
+			break
 		}
-		if matchedBefore < beforeIndex && matchedAfter > afterIndex || matchedBefore > beforeIndex && matchedAfter < afterIndex {
-			return false
+	}
+	for pos := beforeNode.siblingPos + 1; pos < len(beforeSiblings); pos++ {
+		if anchor, ok := matches[beforeSiblings[pos]]; ok {
+			if after[anchor].parent == afterNode.parent && after[anchor].siblingPos <= afterNode.siblingPos {
+				return false
+			}
+			break
 		}
 	}
 	return true
@@ -800,12 +872,14 @@ func computeDiffNodeSignature(node htmlDiffNode) string {
 	}
 	builder.WriteByte('|')
 	builder.WriteString(node.compareText)
+	builder.WriteByte('|')
+	builder.WriteString(node.textDigest)
 	return builder.String()
 }
 
 func normalizeCompareText(value string) string {
 	if len(value) > maxDiffCompareText {
-		value = value[:maxDiffCompareText]
+		value = truncateUTF8(value, maxDiffCompareText)
 	}
 	return strings.ToLower(strings.Join(strings.Fields(value), " "))
 }
@@ -868,11 +942,14 @@ func diffCodeHunks(before, after string) ([]CodeHunk, error) {
 		}
 	}
 	hunks := make([]CodeHunk, 0, len(ranges))
-	lineBudget := maxDiffHunkLines
+	totalLines := 0
 	for _, interval := range ranges {
-		if lineBudget == 0 {
-			break
-		}
+		totalLines += interval.end - interval.start
+	}
+	if totalLines > maxDiffHunkLines {
+		return nil, errDiffLimit
+	}
+	for _, interval := range ranges {
 		oldStart, newStart := 1, 1
 		if interval.start > 0 {
 			oldStart = ops[interval.start].oldLine
@@ -886,9 +963,6 @@ func diffCodeHunks(before, after string) ([]CodeHunk, error) {
 		}
 		hunk := CodeHunk{OldStart: oldStart, NewStart: newStart}
 		for _, op := range ops[interval.start:interval.end] {
-			if len(hunk.Lines) >= lineBudget {
-				break
-			}
 			hunk.Lines = append(hunk.Lines, string(op.kind)+op.text)
 			if op.kind != '+' {
 				hunk.OldLines++
@@ -897,7 +971,6 @@ func diffCodeHunks(before, after string) ([]CodeHunk, error) {
 				hunk.NewLines++
 			}
 		}
-		lineBudget -= len(hunk.Lines)
 		hunks = append(hunks, hunk)
 	}
 	return hunks, nil
@@ -1036,19 +1109,23 @@ func limitDiffLine(line string) string {
 	if len(line) <= maxLine {
 		return line
 	}
-	return line[:maxLine] + "…"
+	return truncateUTF8(line, maxLine) + "…"
 }
 
 func diffOutputSize(result *VersionDiff) int {
-	size := 0
-	for _, change := range result.Changes {
-		size += len(change.Kind) + len(change.BeforeAID) + len(change.AfterAID) + len(change.DOMPath)
-		size += len(change.BeforePath) + len(change.AfterPath) + len(change.BeforeHTML) + len(change.AfterHTML)
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return maxDiffOutputBytes + 1
 	}
-	for _, hunk := range result.CodeHunks {
-		for _, line := range hunk.Lines {
-			size += len(line)
-		}
+	return len(encoded)
+}
+
+func truncateUTF8(value string, limit int) string {
+	if len(value) <= limit {
+		return value
 	}
-	return size
+	for limit > 0 && value[limit]&0xc0 == 0x80 {
+		limit--
+	}
+	return value[:limit]
 }

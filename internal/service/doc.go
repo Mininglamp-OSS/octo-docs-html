@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"maps"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 
@@ -127,10 +126,6 @@ type PublishInput struct {
 	// Empty ⇒ the registrar falls back to its process-configured token.
 	PublisherToken string
 
-	ChangeSource string
-	BaseVersion  int
-	TargetAID    string
-
 	mountContextKnown bool
 	pinnedAID         string
 	pinnedTag         string
@@ -149,14 +144,9 @@ type PublishResult struct {
 	Size           int64  `json:"size"`
 	AIDs           int    `json:"aids"`
 	MergedComments int    `json:"merged_comments"`
-	ChangeSource   string `json:"change_source,omitempty"`
-	BaseVersion    int    `json:"base_version,omitempty"`
-	NewVersion     int    `json:"new_version,omitempty"`
-	TargetAID      string `json:"target_aid,omitempty"`
-
-	title        string
-	hadMeta      bool
-	titleChanged bool
+	title          string
+	hadMeta        bool
+	titleChanged   bool
 
 	// Mount info carried through the synchronous post-publish registration step.
 	mountType         string
@@ -267,18 +257,12 @@ func (s *DocService) publishLocked(ctx context.Context, in PublishInput, stamped
 		Size:              size,
 		AIDs:              len(stamped.AIDs),
 		MergedComments:    merged,
-		ChangeSource:      in.ChangeSource,
-		BaseVersion:       in.BaseVersion,
-		TargetAID:         in.TargetAID,
 		title:             metaResult.title,
 		hadMeta:           metaResult.hadMeta,
 		titleChanged:      metaResult.titleChanged,
 		mountType:         in.MountType,
 		mountContextKnown: in.mountContextKnown,
 		publisherToken:    in.PublisherToken,
-	}
-	if in.ChangeSource != "" {
-		result.NewVersion = version
 	}
 	return result, nil
 }
@@ -434,9 +418,6 @@ func (s *DocService) ReplaceElement(ctx context.Context, slug string, baseVersio
 		in.pinnedAID = aid
 		in.pinnedTag, _ = core.SingleTopLevelTag(newHTML)
 		in.anchorMigrations = map[string]string{aid: canonicalAID}
-		in.ChangeSource = "element_replace"
-		in.BaseVersion = v
-		in.TargetAID = aid
 		r, perr := s.publishLocked(ctx, in, stamped)
 		if perr != nil {
 			return perr
@@ -1044,7 +1025,7 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	// Stamp creator_uid on first create only: ownership is set once and a later
 	// republish (possibly by a different caller) must never reassign it.
 	extra := prev.Extra
-	if in.mountContextKnown || (in.CreatorUID != "" && prev.CreatorUID() == "") || in.ChangeSource != "" {
+	if in.mountContextKnown || (in.CreatorUID != "" && prev.CreatorUID() == "") {
 		extra = map[string]any{}
 		maps.Copy(extra, prev.Extra)
 	}
@@ -1053,21 +1034,6 @@ func (s *DocService) upsertMeta(ctx context.Context, in PublishInput, version in
 	}
 	if in.CreatorUID != "" && prev.CreatorUID() == "" {
 		extra[storage.CreatorUIDExtraKey] = in.CreatorUID
-	}
-	if in.ChangeSource != "" {
-		changes, ok := extra[storage.VersionChangesExtraKey].(map[string]any)
-		if !ok {
-			changes, _ = extra[storage.LegacyVersionChangesExtraKey].(map[string]any)
-		}
-		copyChanges := map[string]any{}
-		maps.Copy(copyChanges, changes)
-		copyChanges[strconv.Itoa(version)] = map[string]any{
-			"change_source": in.ChangeSource,
-			"base_version":  in.BaseVersion,
-			"new_version":   version,
-			"target_aid":    in.TargetAID,
-		}
-		extra[storage.VersionChangesExtraKey] = copyChanges
 	}
 	if err := s.meta.PutMeta(ctx, in.Slug, storage.DocMeta{
 		Slug:     in.Slug,

@@ -2,16 +2,145 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"html"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/apperr"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
 )
+
+func TestBuildVersionDiffDetectsTextChangePastDisplayLimit(t *testing.T) {
+	prefix := strings.Repeat("a", maxDiffCompareText+100)
+	before := "<main><p>" + prefix + " before</p></main>"
+	after := "<main><p>" + prefix + " after</p></main>"
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified == 0 || len(result.Changes) == 0 {
+		t.Fatalf("change past comparison display limit was lost: %+v", result)
+	}
+}
+
+func TestParseDiffHTMLImpliedEndTagsHavePathsAndSnippets(t *testing.T) {
+	source := `<p>one<main>two</main><p>three<hgroup>head</hgroup><p>four<search>find</search><ul><li>a<li>b</ul><dl><dt>term<dd>value</dl><select><option>a<option>b</select><table><thead><tr><th>h<tbody><tr><td>x<td>y</table>`
+	nodes, err := parseDiffHTML(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"/p[1]":                          "<p>one",
+		"/p[2]":                          "<p>three",
+		"/p[3]":                          "<p>four",
+		"/ul[1]/li[1]":                   "<li>a",
+		"/dl[1]/dt[1]":                   "<dt>term",
+		"/dl[1]/dd[1]":                   "<dd>value",
+		"/select[1]/option[1]":           "<option>a",
+		"/table[1]/thead[1]":             "<thead><tr><th>h",
+		"/table[1]/tbody[1]/tr[1]/td[1]": "<td>x",
+	}
+	for _, node := range nodes {
+		if expected, ok := want[node.path]; ok {
+			if node.outer != expected {
+				t.Errorf("%s outer = %q; want %q", node.path, node.outer, expected)
+			}
+			delete(want, node.path)
+		}
+		if node.outer == "" {
+			t.Errorf("%s has no outer snippet", node.path)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing paths: %v", want)
+	}
+}
+
+func TestDiffTextDigestUsesCompleteCanonicalSemantics(t *testing.T) {
+	before, err := parseDiffHTML(`<p>A &amp; B   &#x63;` + strings.Repeat(" ", 20) + `tail</p>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := parseDiffHTML(`<p>A &#38; B c tail</p>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before[0].textDigest != after[0].textDigest || diffNodeSignature(before[0]) != diffNodeSignature(after[0]) {
+		t.Fatalf("semantically equivalent text differs: %q / %q", before[0].text, after[0].text)
+	}
+
+	var split htmlDiffNode
+	appendDiffNodeText(&split, "A &am")
+	appendDiffNodeText(&split, "p; B")
+	if got := strings.Join(strings.Fields(html.UnescapeString(strings.Join(split.textParts, ""))), " "); got != "A & B" {
+		t.Fatalf("entity split across chunks = %q", got)
+	}
+}
+
+func TestDiffRawTextDigestPreservesBytes(t *testing.T) {
+	before, _ := parseDiffHTML(`<script>let x = 1</script>`)
+	after, _ := parseDiffHTML(`<script>let  x = 1</script>`)
+	if before[0].textDigest == after[0].textDigest {
+		t.Fatal("script whitespace change was lost")
+	}
+}
+
+func TestMatchManyIdenticalSiblingsDoesNotExhaustBudget(t *testing.T) {
+	for _, siblings := range []int{700, maxDiffNodes - 1} {
+		t.Run(strconv.Itoa(siblings), func(t *testing.T) {
+			source := `<main>` + strings.Repeat(`<span>same</span>`, siblings) + `</main>`
+			before, err := parseDiffHTML(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			after, err := parseDiffHTML(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			matches, err := matchDiffNodes(before, after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(matches) != siblings+1 {
+				t.Fatalf("matches = %d; want %d", len(matches), siblings+1)
+			}
+		})
+	}
+}
+
+func TestDiffCodeHunksRejectsHunkLineOverflow(t *testing.T) {
+	before := strings.Repeat("<br>", maxDiffHunkLines/2+1)
+	after := strings.Repeat("<hr>", maxDiffHunkLines/2+1)
+	if _, err := diffCodeHunks(before, after); err != errDiffLimit {
+		t.Fatalf("error = %v; want diff limit", err)
+	}
+}
+
+func TestDiffOutputSizeIsEncodedJSONSize(t *testing.T) {
+	result := &VersionDiff{Changes: []ElementChange{{Kind: "modified", BeforeHTML: strings.Repeat(`"`, 100)}}}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := diffOutputSize(result); got != len(encoded) {
+		t.Fatalf("size = %d; want %d", got, len(encoded))
+	}
+}
+
+func TestDiffTruncationPreservesUTF8(t *testing.T) {
+	line := strings.Repeat("界", 400)
+	if got := limitDiffLine(line); !utf8.ValidString(got) {
+		t.Fatalf("invalid UTF-8: %q", got)
+	}
+}
 
 // TestDiffUnclosedTagTailIsPlainTextAndTerminates covers the malformed-input
 // hardening for the diff parser: an unclosed '<' tail (no closing '>' exists)
@@ -355,123 +484,6 @@ func TestBuildVersionDiffParsesAfterRawTextCloseSlash(t *testing.T) {
 	}
 }
 
-func TestReplaceElementPersistsCompatibleVersionChangeMetadata(t *testing.T) {
-	ctx := context.Background()
-	store := memory.New()
-	locker := sluglock.NewMemory()
-	comments := NewCommentService(store, locker)
-	docs := NewDocService(store, store, comments, locker, "", 5<<20)
-
-	published, err := docs.Publish(ctx, PublishInput{Slug: "tracked", HTML: `<html><body><section><p>before</p></section></body></html>`})
-	if err != nil {
-		t.Fatal(err)
-	}
-	view, err := docs.Render(ctx, "tracked", published.Version)
-	if err != nil {
-		t.Fatal(err)
-	}
-	aid := firstAID(t, view.HTML)
-
-	result, err := docs.ReplaceElement(ctx, "tracked", 1, aid, `<section><p>after</p></section>`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.ChangeSource != "element_replace" || result.BaseVersion != 1 || result.NewVersion != 2 || result.TargetAID != aid {
-		t.Fatalf("replace result metadata = %+v", result)
-	}
-	meta, err := store.GetMeta(ctx, "tracked")
-	if err != nil {
-		t.Fatal(err)
-	}
-	changes, ok := meta.Extra[storage.VersionChangesExtraKey].(map[string]any)
-	if !ok {
-		t.Fatalf("version changes = %#v", meta.Extra[storage.VersionChangesExtraKey])
-	}
-	entry, ok := changes["2"].(map[string]any)
-	if !ok || entry["change_source"] != "element_replace" || entry["base_version"] != float64(1) || entry["new_version"] != float64(2) || entry["target_aid"] != aid {
-		t.Fatalf("version 2 metadata = %#v", changes["2"])
-	}
-}
-
-func TestReplaceElementPreservesConflictingOpenMetadata(t *testing.T) {
-	ctx := context.Background()
-	store := memory.New()
-	locker := sluglock.NewMemory()
-	comments := NewCommentService(store, locker)
-	docs := NewDocService(store, store, comments, locker, "", 5<<20)
-
-	published, err := docs.Publish(ctx, PublishInput{Slug: "metadata-conflict", HTML: `<html><body><section><p>before</p></section></body></html>`})
-	if err != nil {
-		t.Fatal(err)
-	}
-	meta, err := store.GetMeta(ctx, "metadata-conflict")
-	if err != nil {
-		t.Fatal(err)
-	}
-	meta.Extra = map[string]any{storage.LegacyVersionChangesExtraKey: "caller-owned"}
-	if err := store.PutMeta(ctx, meta.Slug, *meta); err != nil {
-		t.Fatal(err)
-	}
-	view, err := docs.Render(ctx, meta.Slug, published.Version)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := docs.ReplaceElement(ctx, meta.Slug, 1, firstAID(t, view.HTML), `<section><p>after</p></section>`); err != nil {
-		t.Fatal(err)
-	}
-	meta, err = store.GetMeta(ctx, meta.Slug)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if meta.Extra[storage.LegacyVersionChangesExtraKey] != "caller-owned" {
-		t.Fatalf("legacy metadata overwritten: %#v", meta.Extra)
-	}
-	changes, ok := meta.Extra[storage.VersionChangesExtraKey].(map[string]any)
-	if !ok || changes["2"] == nil {
-		t.Fatalf("namespaced changes = %#v", meta.Extra[storage.VersionChangesExtraKey])
-	}
-}
-
-func TestReplaceElementMigratesCompatibleLegacyVersionChanges(t *testing.T) {
-	ctx := context.Background()
-	store := memory.New()
-	locker := sluglock.NewMemory()
-	comments := NewCommentService(store, locker)
-	docs := NewDocService(store, store, comments, locker, "", 5<<20)
-
-	published, err := docs.Publish(ctx, PublishInput{Slug: "metadata-legacy", HTML: `<html><body><section><p>before</p></section></body></html>`})
-	if err != nil {
-		t.Fatal(err)
-	}
-	meta, err := store.GetMeta(ctx, "metadata-legacy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy := map[string]any{"1": map[string]any{"change_source": "legacy"}}
-	meta.Extra = map[string]any{storage.LegacyVersionChangesExtraKey: legacy}
-	if err := store.PutMeta(ctx, meta.Slug, *meta); err != nil {
-		t.Fatal(err)
-	}
-	view, err := docs.Render(ctx, meta.Slug, published.Version)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := docs.ReplaceElement(ctx, meta.Slug, 1, firstAID(t, view.HTML), `<section><p>after</p></section>`); err != nil {
-		t.Fatal(err)
-	}
-	meta, err = store.GetMeta(ctx, meta.Slug)
-	if err != nil {
-		t.Fatal(err)
-	}
-	changes, ok := meta.Extra[storage.VersionChangesExtraKey].(map[string]any)
-	if !ok || changes["1"] == nil || changes["2"] == nil {
-		t.Fatalf("migrated changes = %#v", meta.Extra[storage.VersionChangesExtraKey])
-	}
-	if _, ok := meta.Extra[storage.LegacyVersionChangesExtraKey].(map[string]any); !ok {
-		t.Fatalf("legacy map not preserved: %#v", meta.Extra)
-	}
-}
-
 func TestBuildVersionDiffRejectsExcessiveNodeCount(t *testing.T) {
 	var source strings.Builder
 	source.WriteString("<html><body>")
@@ -482,19 +494,4 @@ func TestBuildVersionDiffRejectsExcessiveNodeCount(t *testing.T) {
 	if _, err := buildVersionDiff(1, 2, source.String(), source.String()); err != errDiffLimit {
 		t.Fatalf("error = %v; want diff limit", err)
 	}
-}
-
-func firstAID(t *testing.T, source string) string {
-	t.Helper()
-	const marker = `data-odoc-aid="`
-	start := strings.Index(source, marker)
-	if start < 0 {
-		t.Fatal("no aid in stamped source")
-	}
-	start += len(marker)
-	end := strings.IndexByte(source[start:], '"')
-	if end < 0 {
-		t.Fatal("unterminated aid")
-	}
-	return source[start : start+end]
 }
