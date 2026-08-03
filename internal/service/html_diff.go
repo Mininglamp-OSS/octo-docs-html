@@ -2,10 +2,13 @@ package service
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"html"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -95,6 +98,9 @@ type diffOpenNode struct {
 }
 
 func buildVersionDiff(fromVersion, toVersion int, before, after string) (*VersionDiff, error) {
+	if before == after {
+		return &VersionDiff{From: fromVersion, To: toVersion, Changes: []ElementChange{}, CodeHunks: []CodeHunk{}}, nil
+	}
 	beforeNodes, err := parseDiffHTML(before)
 	if err != nil {
 		return nil, err
@@ -503,11 +509,150 @@ func isBlockLevelDiffTag(tag string) bool {
 		"h3", "h4", "h5", "h6", "header", "hgroup", "hr", "li", "main", "menu", "nav",
 		"ol", "p", "pre", "search", "section", "summary", "ul",
 		"table", "caption", "colgroup", "thead", "tbody", "tfoot", "tr", "td", "th",
-		"optgroup", "option":
+		"optgroup", "option", "html", "head", "body":
 		return true
 	default:
 		return false
 	}
+}
+
+// boundaryInline reports whether an element boundary is inline-level for
+// inter-tag whitespace visibility in the source-hunk view: a non-block tag
+// (default-inline, or unknown/custom treated as inline for safety) or a
+// default-block tag carrying an inline display override. It shares
+// isBlockLevelDiffTag with the structural-digest side so both layers classify
+// boundaries identically. It does NOT consult document-global CSS: a
+// document-wide <style>/stylesheet is not a per-boundary inline signal (that
+// global gate would force every reindented block boundary visible and overflow
+// the hunk budget); the global case is handled for newline-free runs in
+// whitespaceRunVisible. attrRaw is the tag text after the name.
+func boundaryInline(tag, attrRaw string) bool {
+	if !isBlockLevelDiffTag(tag) {
+		return true
+	}
+	if attrRaw == "" {
+		return false
+	}
+	return styleHasInlineDisplay(parseDiffAttrs(attrRaw)["style"])
+}
+
+// nextBoundaryInline peeks at the tag opening or closing immediately after a
+// text/whitespace run to classify the run's trailing neighbour. rest begins at
+// the '<' following the run (or is empty at document end, an inline/unknown
+// boundary).
+func nextBoundaryInline(rest string) bool {
+	if len(rest) == 0 {
+		// Document end is a clean block edge (like the parent's own edge), not an
+		// inline neighbour; trailing formatting whitespace is not visible.
+		return false
+	}
+	if rest[0] != '<' {
+		return true
+	}
+	end := diffTagEnd(rest, 0)
+	if end < 0 {
+		return true
+	}
+	trimmed := strings.TrimSpace(rest[1:end])
+	if trimmed == "" || trimmed[0] == '!' || trimmed[0] == '?' {
+		return true
+	}
+	name := trimmed
+	if name[0] == '/' {
+		name = name[1:]
+	}
+	tag, ok := diffTagName(name)
+	if !ok {
+		return true
+	}
+	if trimmed[0] == '/' {
+		return boundaryInline(tag, "")
+	}
+	return boundaryInline(tag, trimmed[len(tag):])
+}
+
+// whitespaceRunVisible reports whether an inter-tag whitespace run can render as
+// a visible space and therefore must surface in the source hunk. A run is
+// visible when either neighbouring boundary is inline, regardless of the run's
+// bytes. When only global layout CSS is present (a stylesheet could flip a
+// block boundary inline) a run is visible only if it carries no newline: a
+// deliberately inserted space between otherwise-block tags is significant,
+// whereas a newline-bearing reindent run is the common pretty-print no-op and
+// stays ignorable so large reindents do not overflow the hunk budget.
+func whitespaceRunVisible(run string, prevInline, nextInline, layoutCSS bool) bool {
+	if prevInline || nextInline {
+		return true
+	}
+	if layoutCSS && !strings.ContainsAny(run, "\r\n") {
+		return true
+	}
+	return false
+}
+
+// styleHasInlineDisplay reports whether an inline style sets display to an
+// inline-level value (inline, inline-block, ...). It never parses full CSS; it
+// scans display declarations conservatively.
+func styleHasInlineDisplay(style string) bool {
+	if style == "" {
+		return false
+	}
+	style = strings.ToLower(style)
+	for idx := strings.Index(style, "display"); idx >= 0; {
+		value := style[idx+len("display"):]
+		if colon := strings.IndexByte(value, ':'); colon >= 0 {
+			value = value[colon+1:]
+			if semi := strings.IndexByte(value, ';'); semi >= 0 {
+				value = value[:semi]
+			}
+			if strings.Contains(value, "inline") {
+				return true
+			}
+		}
+		next := strings.Index(style[idx+len("display"):], "display")
+		if next < 0 {
+			break
+		}
+		idx += len("display") + next
+	}
+	return false
+}
+
+// hasLayoutAffectingCSS is a bounded, conservative scan for anything that could
+// make inter-tag whitespace visible: a <style> element, a stylesheet <link>, or
+// an inline style declaring display/white-space. It never parses CSS; it only
+// decides whether newline-free block-boundary whitespace must stay provable
+// rather than assumed safe. False positives merely keep such whitespace in the
+// source hunk; a false negative would risk an empty diff, so the checks stay
+// generous.
+func hasLayoutAffectingCSS(source string) bool {
+	scan := source
+	if len(scan) > maxDiffRawScanBytes {
+		scan = scan[:maxDiffRawScanBytes]
+	}
+	lower := strings.ToLower(scan)
+	if strings.Contains(lower, "<style") || strings.Contains(lower, "stylesheet") {
+		return true
+	}
+	for idx := strings.Index(lower, "style="); idx >= 0; {
+		tail := lower[idx+len("style="):]
+		value := tail
+		if len(tail) > 0 && (tail[0] == '"' || tail[0] == '\'') {
+			if end := strings.IndexByte(tail[1:], tail[0]); end >= 0 {
+				value = tail[1 : 1+end]
+			}
+		} else if end := strings.IndexAny(tail, " \t\r\n>"); end >= 0 {
+			value = tail[:end]
+		}
+		if strings.Contains(value, "display") || strings.Contains(value, "white-space") {
+			return true
+		}
+		next := strings.Index(tail, "style=")
+		if next < 0 {
+			break
+		}
+		idx += len("style=") + next
+	}
+	return false
 }
 
 // diffSlotWhitespaceVisible reports whether a pure-whitespace text segment at
@@ -648,20 +793,32 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 	matchRootNodes(before, after, matches, used)
 	for changed := true; changed; {
 		changed = false
+		if !budget.addComparisons(len(before) + len(after)) {
+			return nil, errDiffLimit
+		}
+		bounds := newSiblingOrderBounds(before, after, matches)
 		for _, pair := range sortedDiffMatches(matches) {
 			beforeParent, afterParent := pair[0], pair[1]
 			if matchAIDChildren(before, after, beforeParent, afterParent, matches, used) {
 				changed = true
+				// New AID anchors under this parent must be visible to the exact-match
+				// pass below (and to later parents) so no match crosses them.
+				bounds.refreshParent(before, beforeParent, matches)
 			}
-			exactChanged, err := matchExactChildSequence(before, after, beforeParent, afterParent, matches, used, &budget)
+			exactChanged, err := matchExactChildSequence(before, after, beforeParent, afterParent, matches, used, bounds, &budget)
 			if err != nil {
 				return nil, err
 			}
 			if exactChanged {
 				changed = true
+				bounds.refreshParent(before, beforeParent, matches)
 			}
 		}
 	}
+	if !budget.addComparisons(len(before) + len(after)) {
+		return nil, errDiffLimit
+	}
+	bounds := newSiblingOrderBounds(before, after, matches)
 	for beforeIndex, beforeNode := range before {
 		if _, ok := matches[beforeIndex]; ok {
 			continue
@@ -680,10 +837,6 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 			continue
 		}
 		bestIndex, bestScore := -1, 0.0
-		if !budget.addComparisons(len(before) + len(after)) {
-			return nil, errDiffLimit
-		}
-		bounds := newSiblingOrderBounds(before, after, matches)
 		for afterIndex, afterNode := range after {
 			if used[afterIndex] || beforeNode.tag != afterNode.tag || !parentsMatch(beforeNode, afterNode, matches) {
 				continue
@@ -779,17 +932,13 @@ func matchRootNodes(before, after []htmlDiffNode, matches map[int]int, used map[
 	}
 }
 
-func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterParent int, matches map[int]int, used map[int]bool, budget *diffMatchBudget) (bool, error) {
+func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterParent int, matches map[int]int, used map[int]bool, bounds siblingOrderBounds, budget *diffMatchBudget) (bool, error) {
 	beforeChildren := unmatchedDiffChildren(before[beforeParent].children, matches, nil)
 	afterChildren := unmatchedDiffChildren(after[afterParent].children, nil, used)
 	if len(beforeChildren) == 0 || len(afterChildren) == 0 {
 		return false, nil
 	}
 	changed := false
-	if !budget.addComparisons(len(before) + len(after)) {
-		return false, errDiffLimit
-	}
-	bounds := newSiblingOrderBounds(before, after, matches)
 	beforeStart, afterStart := 0, 0
 	for beforeStart < len(beforeChildren) && afterStart < len(afterChildren) {
 		equal, err := diffSignaturesEqual(before[beforeChildren[beforeStart]], after[afterChildren[afterStart]], budget)
@@ -833,10 +982,6 @@ func matchExactChildSequence(before, after []htmlDiffNode, beforeParent, afterPa
 	}
 	width := len(afterChildren) + 1
 	cells := make([]uint16, (len(beforeChildren)+1)*width)
-	if !budget.addComparisons(len(before) + len(after)) {
-		return false, errDiffLimit
-	}
-	bounds = newSiblingOrderBounds(before, after, matches)
 	for beforePos := len(beforeChildren) - 1; beforePos >= 0; beforePos-- {
 		for afterPos := len(afterChildren) - 1; afterPos >= 0; afterPos-- {
 			beforeIndex, afterIndex := beforeChildren[beforePos], afterChildren[afterPos]
@@ -921,24 +1066,37 @@ func newSiblingOrderBounds(before, after []htmlDiffNode, matches map[int]int) si
 		bounds.upper[index] = len(after)
 	}
 	for parentIndex := range before {
-		children := before[parentIndex].children
-		anchor := -1
-		for _, child := range children {
-			bounds.lower[child] = anchor
-			if matched, ok := matches[child]; ok {
-				anchor = matched
-			}
-		}
-		anchor = -1
-		for pos := len(children) - 1; pos >= 0; pos-- {
-			child := children[pos]
-			bounds.upper[child] = anchor
-			if matched, ok := matches[child]; ok {
-				anchor = matched
-			}
-		}
+		bounds.refreshParent(before, parentIndex, matches)
 	}
 	return bounds
+}
+
+// refreshParent recomputes the sibling-order anchor bounds for one parent's
+// children from the current matches. It is O(children) and touches only that
+// parent, so it can be called after new matches are committed under a parent
+// without the O(nodes×parents) cost of rebuilding the whole document. Keeping the
+// bounds current is required for correctness: a stale snapshot could let a later
+// match cross an anchor established earlier in the same fixpoint pass.
+func (bounds siblingOrderBounds) refreshParent(before []htmlDiffNode, parentIndex int, matches map[int]int) {
+	if parentIndex < 0 || parentIndex >= len(before) {
+		return
+	}
+	children := before[parentIndex].children
+	anchor := -1
+	for _, child := range children {
+		bounds.lower[child] = anchor
+		if matched, ok := matches[child]; ok {
+			anchor = matched
+		}
+	}
+	anchor = -1
+	for pos := len(children) - 1; pos >= 0; pos-- {
+		child := children[pos]
+		bounds.upper[child] = anchor
+		if matched, ok := matches[child]; ok {
+			anchor = matched
+		}
+	}
 }
 
 func (bounds siblingOrderBounds) compatible(before, after []htmlDiffNode, beforeIndex, afterIndex int) bool {
@@ -1167,7 +1325,7 @@ func diffCodeHunks(before, after string) ([]CodeHunk, error) {
 		}
 		hunk := CodeHunk{OldStart: oldStart, NewStart: newStart}
 		for _, op := range ops[interval.start:interval.end] {
-			hunk.Lines = append(hunk.Lines, string(op.kind)+limitDiffLine(op.text))
+			hunk.Lines = append(hunk.Lines, string(op.kind)+op.line.display)
 			if op.kind != '+' {
 				hunk.OldLines++
 			}
@@ -1182,18 +1340,37 @@ func diffCodeHunks(before, after string) ([]CodeHunk, error) {
 
 type diffLineOp struct {
 	kind             byte
-	text             string
+	line             diffSourceLine
 	oldLine, newLine int
 }
 
-func diffLineOps(oldLines, newLines []string) ([]diffLineOp, bool) {
+type diffSourceLine struct {
+	identity string
+	display  string
+}
+
+// newDiffSourceLine builds a source line whose diff identity is a small
+// fixed-width key — the kind tag plus the canonical byte length plus the
+// canonical SHA-256 — never the canonical text itself, so line-diff equality and
+// LCS memory stay O(lines) with a low constant regardless of line length while
+// distinct canonical content never collides. display is the human-readable
+// text, separately bounded by displayDiffLine.
+func newDiffSourceLine(kind, canonical, display string) diffSourceLine {
+	digest := sha256.Sum256([]byte(canonical))
+	return diffSourceLine{
+		identity: kind + ":" + strconv.Itoa(len(canonical)) + ":" + fmt.Sprintf("%x", digest),
+		display:  displayDiffLine(display),
+	}
+}
+
+func diffLineOps(oldLines, newLines []diffSourceLine) ([]diffLineOp, bool) {
 	const syncWindow = 64
 	const maxLineComparisons = maxDiffInputLines * 128
 	ops := make([]diffLineOp, 0, len(oldLines)+len(newLines))
 	oldIndex, newIndex, comparisons := 0, 0, 0
 	for oldIndex < len(oldLines) || newIndex < len(newLines) {
-		if oldIndex < len(oldLines) && newIndex < len(newLines) && oldLines[oldIndex] == newLines[newIndex] {
-			ops = append(ops, diffLineOp{kind: ' ', text: oldLines[oldIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
+		if oldIndex < len(oldLines) && newIndex < len(newLines) && oldLines[oldIndex].identity == newLines[newIndex].identity {
+			ops = append(ops, diffLineOp{kind: ' ', line: oldLines[oldIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
 			oldIndex++
 			newIndex++
 			continue
@@ -1217,7 +1394,7 @@ func diffLineOps(oldLines, newLines []string) ([]diffLineOp, bool) {
 				if comparisons > maxLineComparisons {
 					return nil, false
 				}
-				if oldLines[candidateOld] == newLines[candidateNew] {
+				if oldLines[candidateOld].identity == newLines[candidateNew].identity {
 					bestOld, bestNew = candidateOld, candidateNew
 					break
 				}
@@ -1227,31 +1404,221 @@ func diffLineOps(oldLines, newLines []string) ([]diffLineOp, bool) {
 			bestOld, bestNew = oldLimit, newLimit
 		}
 		for oldIndex < bestOld {
-			ops = append(ops, diffLineOp{kind: '-', text: oldLines[oldIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
+			ops = append(ops, diffLineOp{kind: '-', line: oldLines[oldIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
 			oldIndex++
 		}
 		for newIndex < bestNew {
-			ops = append(ops, diffLineOp{kind: '+', text: newLines[newIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
+			ops = append(ops, diffLineOp{kind: '+', line: newLines[newIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
 			newIndex++
 		}
 	}
 	return ops, true
 }
 
-func normalizedHTMLLines(source string) ([]string, bool) {
-	lines := make([]string, 0, 256)
-	// Whitespace between tags is treated as ignorable reindent noise only when we
-	// can prove nothing in the document can make it significant. layoutCSS is a
-	// bounded, conservative document-level signal (a <style> block, a stylesheet
-	// link, or an inline style touching display/white-space) that some rule could
-	// change layout so inter-tag whitespace may be visible. preStack tracks a
-	// per-node preformatted / white-space:pre* ancestry so text nested inside such
-	// contexts is preserved verbatim. When neither holds, whitespace-only runs
-	// collapse away, keeping ordinary block reindent a zero-noise no-op.
-	layoutCSS := hasLayoutAffectingCSS(source)
+// wsFingerprint is a streaming, fixed-memory digest of a document's inter-tag
+// whitespace layout. It records only *whitespace events* — inter-tag gaps that
+// carry actual whitespace bytes (a whitespace-only run, or a content run with
+// leading/trailing whitespace). Gaps with no whitespace at all (two adjacent
+// boundaries, or a pure-content run) are NOT recorded and contribute no hash
+// bytes and no event index, so a purely structural edit that inserts or removes
+// elements/comments/raw blocks without touching any whitespace leaves the
+// fingerprint identical: structural change is reported by the regular tag/text
+// line diff, never as a spurious "[formatting whitespace changed]" hunk. The
+// fingerprint represents ONLY inter-token whitespace layout.
+//
+// The digest is exactly the sequence of whitespace events in document order.
+// Each event contributes its document-order event index, the exact byte length
+// of its whitespace-layout signature, and those exact bytes. Deliberately absent
+// are any boundary tokens, occurrence counters, or leading/trailing anchors:
+// earlier attempts keyed each event to the surrounding element-boundary tag pair
+// plus an occurrence index (v2 leading, then trailing), but ANY structural
+// insert/removal that introduced (or deleted) another boundary of a shared tag
+// pair on the counted side of an event shifted that index and forged a spurious
+// whitespace change (a trailing index still shifts for an insert placed AFTER
+// the event; full structural invariance plus anchor-based move localization is
+// provably unachievable). Fingerprinting only the ordered whitespace-event byte
+// sequence makes ANY purely structural edit (insert/remove element, comment,
+// raw block, PI/doctype, attribute or text change) a no-op for the fingerprint,
+// regardless of where it sits relative to existing whitespace events, while a
+// real whitespace add/remove/byte change still alters the event sequence and is
+// detected.
+//
+// The accepted trade-off: whitespace whose exact bytes and document-order event
+// sequence are both unchanged but that "moved position" without changing the
+// event sequence is not distinguished by the fingerprint. Common visible moves
+// still surface through the per-slot inline/unknown source lines and the
+// structural line diff; this avoids an unbounded game of patching anchor false
+// positives.
+//
+// It is built unconditionally for every document (never gated on a CSS
+// heuristic), so no external/dynamic style, preload, or script can double-blind
+// a whitespace-layout change. It buffers only the current inter-boundary gap and
+// a small running event counter, so memory stays O(1) in run bytes beyond the
+// bounded whitespace edges each signature keeps.
+//
+// Framing sequence, made explicit so the contract is testable:
+//   - A fresh framer starts at the document's leading edge.
+//   - text(run) accumulates the run into the currently pending inter-boundary
+//     gap. Consecutive text runs (rare; the scanner coalesces) concatenate.
+//   - boundary() closes the pending gap at an ELEMENT boundary: only if the
+//     pending gap carried actual whitespace does it fold one event into the
+//     digest (its document-order index and exact whitespace bytes); it then
+//     clears the pending gap. No anchor is kept.
+//   - transparent() marks a comment/PI/doctype/raw-text emit: it is NOT an
+//     element boundary, so it neither closes the pending gap nor advances the
+//     event counter. Whitespace on either side of it stays in the pending gap
+//     and coalesces into the surrounding event, so a real whitespace run next to
+//     a comment is still one event while a whitespace-free comment/raw insert is
+//     fully invisible to the fingerprint.
+//   - sum() closes the final trailing edge (an element boundary) so a trailing
+//     whitespace gap before EOF is recorded, then returns the digest.
+type wsFingerprint struct {
+	hasher  hash.Hash
+	frame   [8]byte
+	pending strings.Builder
+	// events counts how many whitespace events have been folded into the hash so
+	// far; it is each event's document-order index. Whitespace-free boundaries do
+	// not advance it, so structural inserts/removals never shift an event's index.
+	events uint64
+}
+
+func newWSFingerprint() *wsFingerprint {
+	fp := &wsFingerprint{hasher: sha256.New()}
+	// Domain-separate the stream so it can never coincide with any other digest.
+	// v3: ordered whitespace-event byte sequence (v2 anchor-keyed each gap by a
+	// surrounding element-boundary tag pair + occurrence index, which structural
+	// inserts on the counted side shifted; v1 framed every boundary by absolute
+	// slot).
+	fp.hasher.Write([]byte("odoc-ws-fingerprint-v3\x00"))
+	return fp
+}
+
+// text accumulates an inter-tag text run into the currently pending gap. The run
+// is kept verbatim until the next boundary reduces it to its
+// whitespaceLayoutSignature, so the digest reacts to inter-tag whitespace while
+// staying independent of the content bytes (which already surface in the line
+// diff).
+func (fp *wsFingerprint) text(run string) {
+	if run != "" {
+		fp.pending.WriteString(run)
+	}
+}
+
+// boundary closes the pending inter-boundary gap at an ELEMENT boundary. Only a
+// gap carrying actual whitespace folds one event into the digest — its
+// document-order event index, the exact byte length of its whitespace signature,
+// and those exact bytes — after which the pending gap is cleared. The digest
+// keeps no anchor, so a structural insert/removal anywhere adds no event and
+// leaves the digest identical.
+func (fp *wsFingerprint) boundary() {
+	run := fp.pending.String()
+	fp.pending.Reset()
+	sig := whitespaceLayoutSignature(run)
+	if !signatureHasWhitespace(sig) {
+		return
+	}
+	binary.BigEndian.PutUint64(fp.frame[0:8], fp.events)
+	_, _ = fp.hasher.Write(fp.frame[:8])
+	fp.events++
+	fp.writeField(sig)
+}
+
+// transparent marks a comment, processing instruction, doctype, or raw-text
+// element emit. Such a node is NOT an element boundary for whitespace layout: it
+// does not close the pending gap or advance the event counter. Whitespace
+// sitting on either side of it therefore stays in the pending gap and coalesces
+// into the surrounding whitespace event, so a genuine whitespace run next to a
+// comment is still detected while a whitespace-free comment/raw insert or removal
+// leaves the fingerprint identical. Raw-text CONTENT must not be fed into the
+// pending gap (it is content, not inter-tag whitespace); callers simply skip
+// text() for it and call transparent() for the element as a whole.
+func (fp *wsFingerprint) transparent() {}
+
+// writeField hashes one length-prefixed field so adjacent fields can never be
+// confused by concatenation (e.g. "a"+"bc" vs "ab"+"c").
+func (fp *wsFingerprint) writeField(s string) {
+	binary.BigEndian.PutUint64(fp.frame[0:8], uint64(len(s)))
+	_, _ = fp.hasher.Write(fp.frame[:8])
+	if len(s) > 0 {
+		// hash.Hash.Write is documented never to return an error.
+		_, _ = io.WriteString(fp.hasher, s)
+	}
+}
+
+// sum closes the final trailing-edge element boundary (so a trailing whitespace
+// gap before EOF is recorded as an event) and returns the hex digest of the
+// accumulated ordered whitespace-event sequence.
+func (fp *wsFingerprint) sum() string {
+	fp.boundary()
+	return fmt.Sprintf("%x", fp.hasher.Sum(nil))
+}
+
+// whitespaceLayoutSignature reduces an inter-tag text run to just its
+// whitespace-layout contribution: the exact leading and trailing whitespace,
+// with a one-byte sentinel marking whether any non-whitespace content sat
+// between them. This lets the document fingerprint react to inserted/removed
+// inter-tag whitespace (and to surrounding whitespace on a content run) while
+// staying independent of the content bytes themselves, which already surface in
+// the regular line diff. It never allocates more than the two whitespace edges.
+func whitespaceLayoutSignature(run string) string {
+	lead := run[:len(run)-len(strings.TrimLeft(run, " \t\r\n\f"))]
+	if len(lead) == len(run) {
+		// Whitespace-only run: no content, no separate trailing edge.
+		return lead
+	}
+	trail := run[len(strings.TrimRight(run, " \t\r\n\f")):]
+	return lead + "\x01\x02\x01" + trail
+}
+
+// signatureHasWhitespace reports whether a whitespaceLayoutSignature carries any
+// actual whitespace — i.e. this run is a whitespace *event* the fingerprint must
+// record. A pure-content run signature is exactly the sentinel with no bytes on
+// either edge ("\x01\x02\x01"); the empty string is a truly empty run. Both
+// carry no whitespace, so the fingerprint skips them and a structural-only edit
+// never shifts an occurrence index or perturbs the digest.
+func signatureHasWhitespace(sig string) bool {
+	return sig != "" && sig != "\x01\x02\x01"
+}
+
+// newWhitespaceFingerprintLine builds the single document-level whitespace
+// record. The identity uses a dedicated "ws-doc" kind (distinct from the real
+// "tag"/"pre"/"ws"/"text" kinds) so no literal user content can forge or collide
+// with it; equal whitespace layout compares equal and any change differs. The
+// display is a bounded, user-readable marker with no digest or internal token,
+// so a changed fingerprint surfaces as exactly one comprehensible hunk line.
+func newWhitespaceFingerprintLine(digest string) diffSourceLine {
+	return diffSourceLine{
+		identity: "ws-doc:" + digest,
+		display:  "[formatting whitespace changed]",
+	}
+}
+
+func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
+	lines := make([]diffSourceLine, 0, 256)
 	preStack := make([]string, 0, 16)
-	whitespaceSensitive := func() bool { return layoutCSS || len(preStack) > 0 }
 	preformatted := func() bool { return len(preStack) > 0 }
+	// layoutCSS is a bounded, conservative document-level signal that a stylesheet
+	// rule could turn a block boundary inline, making newline-free inter-tag
+	// whitespace visible. prevInline tracks the inline-ness of the boundary just
+	// before a whitespace run; the document start is a clean block edge (false).
+	// Together with the peeked trailing boundary this decides run significance
+	// without a per-run line explosion (see whitespaceRunVisible).
+	layoutCSS := hasLayoutAffectingCSS(source)
+	// The document-level whitespace fingerprint is built unconditionally for every
+	// document, never gated on a CSS heuristic. whitespaceRunVisible deliberately
+	// drops a newline-bearing block-boundary run so plain reindents stay
+	// zero-noise and bounded; that trade-off would otherwise double-blind a
+	// whitespace-only change (e.g. a newline inserted between two block <p>
+	// elements that some stylesheet — possibly external, dynamically injected, or
+	// added via <link>/preload/JS after load — renders inline). Because the
+	// fingerprint streams every inter-tag whitespace slot into one fixed-memory
+	// digest regardless of any CSS guess, no such unknown/dynamic style can hide a
+	// whitespace-layout change: it always surfaces as a single synthetic record at
+	// document end — one bounded hunk, no per-slot lines, no line-count growth, and
+	// no digest leaked. hasLayoutAffectingCSS is retained only as a per-slot
+	// display signal (whitespaceRunVisible), never as a correctness gate.
+	fingerprint := newWSFingerprint()
+	prevInline := false
 	for cursor := 0; cursor < len(source); {
 		if len(lines) >= maxDiffInputLines {
 			return nil, false
@@ -1261,22 +1628,33 @@ func normalizedHTMLLines(source string) ([]string, bool) {
 			if end < 0 {
 				// Unclosed '<' tail (no closing '>'): treat the remainder as plain
 				// text and terminate; do not slice an invalid tag range.
-				if !appendNormalizedDiffText(&lines, source[cursor:], false, whitespaceSensitive(), preformatted()) {
+				if !appendNormalizedDiffText(&lines, source[cursor:], false, false, preformatted()) {
 					return nil, false
 				}
+				// Trailing text run feeds the pending gap; sum() closes it at the edge.
+				fingerprint.text(source[cursor:])
 				break
 			}
 			rawTag := source[cursor+1 : end]
 			trimmed := strings.TrimSpace(rawTag)
-			lines = append(lines, limitDiffLine(normalizeDiffHTML(source[cursor:end+1])))
+			canonical := normalizeDiffHTML(source[cursor : end+1])
+			lines = append(lines, newDiffSourceLine("tag", canonical, canonical))
 			cursor = end + 1
 			if trimmed == "" || trimmed[0] == '!' || trimmed[0] == '?' {
+				// Comment/PI/doctype: transparent for whitespace anchoring — not an
+				// element boundary, so it neither closes the pending gap nor shifts an
+				// anchor. A whitespace-free comment insert/removal is invisible to the
+				// fingerprint; whitespace beside it stays attributed to the surrounding
+				// element boundaries.
+				fingerprint.transparent()
 				continue
 			}
 			if trimmed[0] == '/' {
 				if closeTag, ok := diffTagName(trimmed[1:]); ok {
 					popPreformatted(&preStack, closeTag)
+					prevInline = boundaryInline(closeTag, "")
 				}
+				fingerprint.boundary()
 				continue
 			}
 			selfClosing := strings.HasSuffix(strings.TrimSpace(rawTag), "/")
@@ -1284,39 +1662,56 @@ func normalizedHTMLLines(source string) ([]string, bool) {
 			if !ok {
 				return nil, false
 			}
-			if !selfClosing && !isDiffVoidTag(tag) && isPreformattedContext(tag, trimmed[len(tag):]) {
-				preStack = append(preStack, tag)
-			}
-			if !isDiffRawTextTag(tag) {
-				continue
-			}
-			// Raw-text elements hold text, not markup: their content must be scanned
-			// to the matching close tag so an inner '<' is never split as a spurious
-			// tag (the double-blind that hid textarea/title content changes). script
-			// and style are literal (no entity decode); textarea and title are RCDATA
-			// (entities decode). textarea preserves whitespace (it is on preStack);
-			// title/script/style collapse it, matching how each renders.
-			literalRaw := isDiffLiteralRawTextTag(tag)
-			rawPreformatted := preformatted()
-			closeStart, _ := indexDiffRawClose(source, cursor, tag)
-			if closeStart < 0 {
-				if !appendNormalizedDiffText(&lines, source[cursor:], literalRaw, rawPreformatted, rawPreformatted) {
+			attrRaw := trimmed[len(tag):]
+			if isDiffRawTextTag(tag) {
+				// Raw-text elements (script/style/textarea/title) hold text, not
+				// markup, and are transparent for whitespace anchoring: neither their
+				// open/close tags nor their content are element boundaries or
+				// inter-tag whitespace, so inserting or removing a whitespace-free raw
+				// block leaves the fingerprint identical while whitespace beside it
+				// stays attributed to the surrounding element boundaries. Their
+				// content is scanned to the matching close tag so an inner '<' is
+				// never split as a spurious tag (the double-blind that hid
+				// textarea/title content changes); it is emitted to the line diff but
+				// never fed into the whitespace gap.
+				if !selfClosing && !isDiffVoidTag(tag) && isPreformattedContext(tag, attrRaw) {
+					preStack = append(preStack, tag)
+				}
+				prevInline = boundaryInline(tag, attrRaw)
+				literalRaw := isDiffLiteralRawTextTag(tag)
+				rawPreformatted := preformatted()
+				fingerprint.transparent()
+				closeStart, _ := indexDiffRawClose(source, cursor, tag)
+				if closeStart < 0 {
+					if !appendNormalizedDiffText(&lines, source[cursor:], literalRaw, false, rawPreformatted) {
+						return nil, false
+					}
+					cursor = len(source)
+					continue
+				}
+				if !appendNormalizedDiffText(&lines, source[cursor:closeStart], literalRaw, false, rawPreformatted) || len(lines) >= maxDiffInputLines {
 					return nil, false
 				}
-				cursor = len(source)
+				closeEnd := diffTagEnd(source, closeStart)
+				if closeEnd < 0 {
+					closeEnd = len(source) - 1
+				}
+				canonical = normalizeDiffHTML(source[closeStart : closeEnd+1])
+				lines = append(lines, newDiffSourceLine("tag", canonical, canonical))
+				fingerprint.transparent()
+				cursor = closeEnd + 1
+				if rawPreformatted {
+					popPreformatted(&preStack, tag)
+				}
+				prevInline = boundaryInline(tag, "")
 				continue
 			}
-			if !appendNormalizedDiffText(&lines, source[cursor:closeStart], literalRaw, rawPreformatted, rawPreformatted) || len(lines) >= maxDiffInputLines {
-				return nil, false
-			}
-			closeEnd := diffTagEnd(source, closeStart)
-			if closeEnd < 0 {
-				closeEnd = len(source) - 1
-			}
-			lines = append(lines, limitDiffLine(normalizeDiffHTML(source[closeStart:closeEnd+1])))
-			cursor = closeEnd + 1
-			if rawPreformatted {
-				popPreformatted(&preStack, tag)
+			// A tag is a structural element boundary that closes the pending inter-tag
+			// gap; only a gap carrying actual whitespace becomes a fingerprint event.
+			fingerprint.boundary()
+			prevInline = boundaryInline(tag, attrRaw)
+			if !selfClosing && !isDiffVoidTag(tag) && isPreformattedContext(tag, attrRaw) {
+				preStack = append(preStack, tag)
 			}
 			continue
 		}
@@ -1324,15 +1719,30 @@ func normalizedHTMLLines(source string) ([]string, bool) {
 		if end < 0 {
 			end = len(source) - cursor
 		}
-		if !appendNormalizedDiffText(&lines, source[cursor:cursor+end], false, whitespaceSensitive(), preformatted()) {
+		run := source[cursor : cursor+end]
+		// Inter-tag text run: feed the pending slot. Whitespace-only runs contribute
+		// their exact bytes; content runs contribute only their whitespace edges (via
+		// whitespaceLayoutSignature), keeping the fingerprint content-independent.
+		fingerprint.text(run)
+		visible := whitespaceRunVisible(run, prevInline, nextBoundaryInline(source[cursor+end:]), layoutCSS)
+		if !appendNormalizedDiffText(&lines, run, false, visible, preformatted()) {
 			return nil, false
 		}
 		cursor += end
 	}
+	// One synthetic record at document end carries the whole-document whitespace
+	// layout so any whitespace-only change surfaces without adding a line per
+	// event (see wsFingerprint). It is built unconditionally so no unknown or
+	// dynamic CSS can double-blind a whitespace-layout change, and structural-only
+	// edits leave it identical. It is skipped only if the line budget is already
+	// exhausted. sum() closes the final trailing-edge boundary.
+	if len(lines) < maxDiffInputLines {
+		lines = append(lines, newWhitespaceFingerprintLine(fingerprint.sum()))
+	}
 	return lines, true
 }
 
-func appendNormalizedDiffText(lines *[]string, text string, literal, whitespaceSensitive, preformatted bool) bool {
+func appendNormalizedDiffText(lines *[]diffSourceLine, text string, literal, visible, preformatted bool) bool {
 	raw := text
 	if !literal {
 		text = html.UnescapeString(text)
@@ -1347,45 +1757,29 @@ func appendNormalizedDiffText(lines *[]string, text string, literal, whitespaceS
 		if len(*lines) >= maxDiffInputLines {
 			return false
 		}
-		*lines = append(*lines, limitDiffLine(text))
+		*lines = append(*lines, newDiffSourceLine("pre", text, text))
 		return true
 	}
 	collapsed := collapseHTMLASCIIWhitespace(text)
 	if collapsed == "" {
-		// Pure whitespace. In a whitespace-sensitive context the exact run can be
-		// visible, so emit a distinct token that differs when the run differs and
-		// vanishes when the run is absent; elsewhere it is safe reindent noise.
-		if !whitespaceSensitive || text == "" {
+		// Pure inter-tag whitespace. It is preserved only when it could render as a
+		// visible space (an inline neighbour, or a newline-free run under global
+		// layout CSS); otherwise it is reindent/pretty-print noise and is dropped so
+		// ordinary block reindent stays a zero-noise no-op.
+		if text == "" || !visible {
 			return true
 		}
-		collapsed = whitespaceRunToken(raw)
 		if len(*lines) >= maxDiffInputLines {
 			return false
 		}
-		// whitespaceRunToken is already bounded and collision-free; do not re-bound.
-		*lines = append(*lines, collapsed)
+		*lines = append(*lines, newDiffSourceLine("ws", raw, visibleWhitespace(raw)))
 		return true
 	}
 	if len(*lines) >= maxDiffInputLines {
 		return false
 	}
-	*lines = append(*lines, limitDiffLine(collapsed))
+	*lines = append(*lines, newDiffSourceLine("text", collapsed, collapsed))
 	return true
-}
-
-// whitespaceRunToken encodes a preserved pure-whitespace run so that runs which
-// differ byte-for-byte produce different lines (e.g. under a <pre> ancestor)
-// while an absent run emits no line at all. The token is self-bounded: a short
-// quoted prefix for readability plus run length and the full-run SHA-256, so
-// runs differing only in length or tail beyond the prefix never collide.
-func whitespaceRunToken(run string) string {
-	const prefixBytes = 64
-	prefix := run
-	if len(prefix) > prefixBytes {
-		prefix = prefix[:prefixBytes]
-	}
-	digest := sha256.Sum256([]byte(run))
-	return fmt.Sprintf("\u2408ws:%s#%d#%x", strconv.Quote(prefix), len(run), digest)
 }
 
 // isPreformattedContext reports whether an open tag establishes a
@@ -1435,51 +1829,6 @@ func popPreformatted(preStack *[]string, closeTag string) {
 	}
 }
 
-// hasLayoutAffectingCSS is a bounded, conservative scan for anything that could
-// make inter-tag whitespace visible: a <style> element, a stylesheet <link>, or
-// an inline style declaring display/white-space. It never parses CSS; it only
-// decides whether whitespace changes must stay provable rather than assumed
-// safe. False positives merely keep whitespace noise in the source hunk; a
-// false negative would risk an empty diff, so the checks stay generous.
-func hasLayoutAffectingCSS(source string) bool {
-	scan := source
-	if len(scan) > maxDiffRawScanBytes {
-		scan = scan[:maxDiffRawScanBytes]
-	}
-	lower := strings.ToLower(scan)
-	if strings.Contains(lower, "<style") {
-		return true
-	}
-	// A rel="stylesheet" link (or a rel token containing it) can restyle layout.
-	if strings.Contains(lower, "stylesheet") {
-		return true
-	}
-	for idx := strings.Index(lower, "style="); idx >= 0; {
-		tail := lower[idx+len("style="):]
-		// Scope the display/white-space probe to this style attribute's own value so
-		// a later unrelated "display" elsewhere in the document is not a false
-		// positive. A quoted value ends at its matching quote; an unquoted one ends
-		// at whitespace or the tag's '>'.
-		value := tail
-		if len(tail) > 0 && (tail[0] == '"' || tail[0] == '\'') {
-			if end := strings.IndexByte(tail[1:], tail[0]); end >= 0 {
-				value = tail[1 : 1+end]
-			}
-		} else if end := strings.IndexAny(tail, " \t\r\n>"); end >= 0 {
-			value = tail[:end]
-		}
-		if strings.Contains(value, "display") || strings.Contains(value, "white-space") {
-			return true
-		}
-		next := strings.Index(tail, "style=")
-		if next < 0 {
-			break
-		}
-		idx += len("style=") + next
-	}
-	return false
-}
-
 func isOnlyHTMLASCIIWhitespace(value string) bool {
 	for index := 0; index < len(value); index++ {
 		if !isHTMLASCIIWhitespace(value[index]) {
@@ -1489,18 +1838,25 @@ func isOnlyHTMLASCIIWhitespace(value string) bool {
 	return true
 }
 
-func limitDiffLine(line string) string {
+func displayDiffLine(line string) string {
 	const maxLine = 1024
 	if len(line) <= maxLine {
 		return line
 	}
-	// A truncated prefix alone would let two long lines that share their first
-	// maxLine bytes but differ later collide, silently dropping the change from
-	// the line diff. Append the full-content SHA-256 so distinct complete text
-	// never compares equal, while the string stays bounded. The digest is part of
-	// the line identity used for equality, so equal content still matches.
-	digest := sha256.Sum256([]byte(line))
-	return truncateUTF8(line, maxLine) + fmt.Sprintf("\u2026\u2408sha256:%x", digest)
+	return truncateUTF8(line, maxLine) + "…"
+}
+
+func visibleWhitespace(run string) string {
+	const preview = 64
+	value := run
+	if len(value) > preview {
+		value = value[:preview]
+	}
+	value = strings.NewReplacer(" ", "·", "\t", "→", "\r", "\\r", "\n", "\\n").Replace(value)
+	if len(run) > preview {
+		value += "…"
+	}
+	return value
 }
 
 func diffOutputSize(result *VersionDiff) int {

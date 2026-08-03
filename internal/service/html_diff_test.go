@@ -133,11 +133,27 @@ func TestNormalizedHTMLLinesIgnoreFormattingWhitespace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.CodeHunks) != 0 || len(result.Changes) != 0 {
-		t.Fatalf("format-only revision was noisy: %+v", result)
+	// The whitespace fingerprint is now unconditional, so a format-only reindent
+	// surfaces as exactly one bounded synthetic whitespace record and no structural
+	// changes (the old zero-hunk contract is superseded).
+	if len(result.Changes) != 0 {
+		t.Fatalf("format-only revision produced structural changes: %+v", result)
 	}
+	total := 0
+	for _, h := range result.CodeHunks {
+		total += len(h.Lines)
+	}
+	if total > reindentMaxHunkLines {
+		t.Fatalf("format-only revision produced %d hunk lines; want a small bounded hunk", total)
+	}
+	if total > 0 && !strings.Contains(hunksBody(result.CodeHunks), "[formatting whitespace changed]") {
+		t.Fatalf("format-only hunk is not the whitespace record: %+v", result)
+	}
+	assertNoLeakedInternals(t, result.CodeHunks)
 	lines, ok := normalizedHTMLLines("<p>x</p>\u00a0")
-	if !ok || len(lines) != 4 || lines[3] != "\u00a0" {
+	// One trailing NBSP text run plus the unconditional ws-doc record: <p> tag,
+	// x text, </p> tag, NBSP text, ws-doc.
+	if !ok || len(lines) != 5 || lines[3].display != "\u00a0" {
 		t.Fatalf("NBSP text run lost: %#v, ok=%v", lines, ok)
 	}
 }
@@ -162,8 +178,8 @@ func TestStructuralDigestIgnoresBlockSiblingIndentation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
-				t.Fatalf("reindent-only revision was noisy: %+v", result)
+			if len(result.Changes) != 0 {
+				t.Fatalf("reindent-only revision polluted the structural digest: %+v", result)
 			}
 		})
 	}
@@ -181,8 +197,8 @@ func TestStructuralDigestIgnoresBlockSiblingIndentation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
-				t.Fatalf("block-sibling reindent was noisy: %+v", result)
+			if len(result.Changes) != 0 {
+				t.Fatalf("block-sibling reindent polluted the structural digest: %+v", result)
 			}
 		})
 	}
@@ -319,7 +335,7 @@ func TestDiffOutputSizeIsEncodedJSONSize(t *testing.T) {
 
 func TestDiffTruncationPreservesUTF8(t *testing.T) {
 	line := strings.Repeat("界", 400)
-	if got := limitDiffLine(line); !utf8.ValidString(got) {
+	if got := displayDiffLine(line); !utf8.ValidString(got) {
 		t.Fatalf("invalid UTF-8: %q", got)
 	}
 }
@@ -413,7 +429,7 @@ func TestBuildVersionDiffRejectsExcessiveDepth(t *testing.T) {
 	for range maxDiffDepth + 1 {
 		source.WriteString("</div>")
 	}
-	if _, err := buildVersionDiff(1, 2, source.String(), source.String()); err != errDiffLimit {
+	if _, err := buildVersionDiff(1, 2, source.String(), source.String()+"x"); err != errDiffLimit {
 		t.Fatalf("error = %v; want diff limit", err)
 	}
 }
@@ -473,7 +489,11 @@ func TestDiffMapsPathLimitToPayloadTooLarge(t *testing.T) {
 		source.WriteByte('>')
 	}
 	for version := 1; version <= 2; version++ {
-		if _, err := store.PutDoc(ctx, "path-limit", version, source.String()); err != nil {
+		value := source.String()
+		if version == 2 {
+			value += "x"
+		}
+		if _, err := store.PutDoc(ctx, "path-limit", version, value); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -824,25 +844,49 @@ func TestBuildVersionDiffRejectsExcessiveNodeCount(t *testing.T) {
 		source.WriteString("<i></i>")
 	}
 	source.WriteString("</body></html>")
-	if _, err := buildVersionDiff(1, 2, source.String(), source.String()); err != errDiffLimit {
+	if _, err := buildVersionDiff(1, 2, source.String(), source.String()+"x"); err != errDiffLimit {
 		t.Fatalf("error = %v; want diff limit", err)
 	}
 }
 
 // reindentEqual builds a compact and a pretty-printed variant of the same block
-// content and asserts the pair is a zero-noise no-op (Goal A): ordinary reindent
-// of plain block/table/list elements without layout-affecting CSS must produce
-// no structural changes and no source hunks.
+// content and asserts the pair stays a bounded reindent: ordinary reindent of
+// plain block/table/list elements produces no structural changes. Since the
+// document-level whitespace fingerprint is now built for every document (it is
+// no longer gated on a CSS heuristic, so no unknown/dynamic style can
+// double-blind a whitespace-layout change), a compact-vs-pretty reindent whose
+// inter-tag whitespace layout differs surfaces as exactly one bounded synthetic
+// "[formatting whitespace changed]" hunk line. That single record is accepted
+// (the old zero-hunk contract is superseded); it must never 413, never grow with
+// document size, and never leak the internal digest/token.
 func reindentEqual(t *testing.T, compact, pretty string) {
 	t.Helper()
 	result, err := buildVersionDiff(1, 2, compact, pretty)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("reindent returned error (413?): %v", err)
 	}
-	if len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
-		t.Fatalf("reindent produced noise: changes=%d hunks=%d", len(result.Changes), len(result.CodeHunks))
+	if len(result.Changes) != 0 {
+		t.Fatalf("reindent produced structural changes: %d", len(result.Changes))
+	}
+	total := 0
+	for _, h := range result.CodeHunks {
+		total += len(h.Lines)
+	}
+	if total > reindentMaxHunkLines {
+		t.Fatalf("reindent produced %d hunk lines; want a small bounded hunk", total)
+	}
+	if total > 0 {
+		body := hunksBody(result.CodeHunks)
+		if !strings.Contains(body, "[formatting whitespace changed]") {
+			t.Fatalf("reindent hunk is not the whitespace record:\n%s", body)
+		}
+		assertNoLeakedInternals(t, result.CodeHunks)
 	}
 }
+
+// reindentMaxHunkLines bounds the synthetic whitespace hunk a reindent may emit;
+// it is a small fixed constant that does not grow with document size.
+const reindentMaxHunkLines = 16
 
 func TestBuildVersionDiffPlainReindentIsZeroNoise(t *testing.T) {
 	for _, count := range []int{100, 500} {
@@ -987,26 +1031,1014 @@ func TestBuildVersionDiffDeterministicWhitespaceHunks(t *testing.T) {
 	}
 }
 
-func TestHasLayoutAffectingCSSConservativeSignals(t *testing.T) {
-	positives := []string{
-		`<style>p{}</style><p>x</p>`,
-		`<link rel="stylesheet" href="a.css"><p>x</p>`,
-		`<div style="display:flex"><p>x</p></div>`,
-		`<div style="white-space:normal"><p>x</p></div>`,
+func TestVersionDiffReviewRegressions(t *testing.T) {
+	t.Run("spaced style equals", func(t *testing.T) {
+		before := `<html><body><div style = "display:inline">x</div><div style = "display:inline">y</div></body></html>`
+		after := `<html><body><div style = "display:inline">x</div> <div style = "display:inline">y</div></body></html>`
+		assertVisibleAndValid(t, before, after)
+	})
+
+	t.Run("200 row table", func(t *testing.T) {
+		before, after := tableDocuments(200, 3)
+		assertVisibleAndValid(t, before, after)
+	})
+
+	for _, count := range []int{200, 800} {
+		t.Run(fmt.Sprintf("nested_%d", count), func(t *testing.T) {
+			before, after := nestedDocuments(count)
+			assertVisibleAndValid(t, before, after)
+		})
 	}
-	for _, src := range positives {
-		if !hasLayoutAffectingCSS(src) {
-			t.Errorf("expected layout-affecting CSS for %q", src)
+	t.Run("nested 200 identical", func(t *testing.T) {
+		before, _ := nestedDocuments(200)
+		result, err := buildVersionDiff(1, 2, before, before)
+		if err != nil || len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
+			t.Fatalf("identical nested document: result=%+v err=%v", result, err)
+		}
+	})
+
+	t.Run("456 to 100", func(t *testing.T) {
+		before := repeatedParagraphs(456)
+		after := repeatedParagraphs(100)
+		if _, err := buildVersionDiff(1, 2, before, after); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	for _, count := range []int{500, 1500} {
+		t.Run(fmt.Sprintf("style_reindent_%d", count), func(t *testing.T) {
+			compact := `<style>p{color:red}</style>` + repeatedParagraphs(count)
+			pretty := strings.ReplaceAll(compact, "</p>", "</p>\n  ")
+			result, err := buildVersionDiff(1, 2, compact, pretty)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Under layout-affecting CSS (<style>), the reindent changes the
+			// inter-tag whitespace layout, which could render visibly, so it must
+			// NOT be a double-blind empty diff. The document-level whitespace
+			// fingerprint surfaces it as a single, bounded hunk that never grows
+			// with the element count and never 413s (the old zero-hunk contract was
+			// the double-blind this PR fixes; zero-noise is not required here).
+			if len(result.CodeHunks) == 0 {
+				t.Fatalf("layout-CSS reindent vanished (double-blind): 0 hunks for count=%d", count)
+			}
+			total := 0
+			for _, h := range result.CodeHunks {
+				total += len(h.Lines)
+			}
+			if total > 32 {
+				t.Fatalf("layout-CSS reindent produced %d hunk lines for count=%d; want a small bounded hunk", total, count)
+			}
+			assertNoLeakedInternals(t, result.CodeHunks)
+		})
+	}
+
+	t.Run("public lines hide identity", func(t *testing.T) {
+		result, err := buildVersionDiff(1, 2, `<pre>`+strings.Repeat("a", 1500)+`x</pre>`, `<pre>`+strings.Repeat("a", 1500)+`y</pre>`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, _ := json.Marshal(result.CodeHunks)
+		if strings.Contains(string(encoded), "␈ws") || strings.Contains(string(encoded), "␈sha256") {
+			t.Fatalf("internal identity leaked: %s", encoded)
+		}
+	})
+}
+
+func tableDocuments(rows, cells int) (string, string) {
+	var before, after strings.Builder
+	before.WriteString("<table>")
+	after.WriteString("<table>")
+	for row := range rows {
+		before.WriteString("<tr>")
+		after.WriteString("<tr>")
+		for cell := range cells {
+			fmt.Fprintf(&before, "<td>%d-%d</td>", row, cell)
+			value := fmt.Sprintf("%d-%d", row, cell)
+			if row == rows/2 && cell == cells/2 {
+				value = "changed"
+			}
+			fmt.Fprintf(&after, "<td>%s</td>", value)
+		}
+		before.WriteString("</tr>")
+		after.WriteString("</tr>")
+	}
+	before.WriteString("</table>")
+	after.WriteString("</table>")
+	return before.String(), after.String()
+}
+
+func nestedDocuments(count int) (string, string) {
+	var before, after strings.Builder
+	for index := range count {
+		fmt.Fprintf(&before, "<div><p>%d</p><p>x</p></div>", index)
+		value := "x"
+		if index == count/2 {
+			value = "changed"
+		}
+		fmt.Fprintf(&after, "<div><p>%d</p><p>%s</p></div>", index, value)
+	}
+	return before.String(), after.String()
+}
+
+func repeatedParagraphs(count int) string {
+	var result strings.Builder
+	for range count {
+		result.WriteString("<p>x</p>")
+	}
+	return result.String()
+}
+
+// TestNormalizedLineIdentityIsBoundedAndDistinct pins finding P1(2): a source
+// line's diff identity is a small fixed-width key (kind + canonical byte length
+// + SHA-256), never the canonical text itself, so line-diff memory stays linear
+// regardless of line length; distinct canonical content never collides even
+// when the display is truncated.
+func TestNormalizedLineIdentityIsBoundedAndDistinct(t *testing.T) {
+	const identityBound = 128
+	huge := newDiffSourceLine("text", strings.Repeat("z", 200_000), strings.Repeat("z", 200_000))
+	if len(huge.identity) >= identityBound {
+		t.Fatalf("identity length %d exceeds bound %d", len(huge.identity), identityBound)
+	}
+	if len(huge.display) > 1<<12 {
+		t.Fatalf("display length %d unbounded", len(huge.display))
+	}
+	if !utf8.ValidString(huge.display) {
+		t.Fatal("display not valid UTF-8")
+	}
+	// Long tails sharing a truncated display prefix keep distinct identity.
+	prefix := strings.Repeat("a", 4000)
+	if newDiffSourceLine("text", prefix+"ALPHA", "").identity == newDiffSourceLine("text", prefix+"OMEGA", "").identity {
+		t.Fatal("distinct long-tail canonical content collided in identity")
+	}
+	// The kind participates in identity so a tag line never equals a text line
+	// with the same bytes.
+	if newDiffSourceLine("tag", "x", "x").identity == newDiffSourceLine("text", "x", "x").identity {
+		t.Fatal("distinct kinds collided in identity")
+	}
+}
+
+// TestNormalizedHTMLLinesMemoryStaysLinear pins the P1(2) memory contract: a
+// large document with a few very long lines yields per-line identities of low
+// constant size, so total allocation stays a small multiple of the input rather
+// than scaling with line length.
+func TestNormalizedHTMLLinesMemoryStaysLinear(t *testing.T) {
+	var source strings.Builder
+	source.Grow(5 << 20)
+	source.WriteString("<main>")
+	for source.Len() < 5<<20 {
+		source.WriteString("<p>" + strings.Repeat("word ", 20000) + "</p>")
+	}
+	source.WriteString("</main>")
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	lines, ok := normalizedHTMLLines(source.String())
+	if !ok {
+		t.Fatal("normalizedHTMLLines rejected a bounded 5MiB input")
+	}
+	runtime.ReadMemStats(&after)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+		t.Fatalf("normalization allocated %d bytes for %d-byte input", allocated, source.Len())
+	}
+	for _, line := range lines {
+		if len(line.identity) >= 128 {
+			t.Fatalf("identity length %d exceeds bound", len(line.identity))
 		}
 	}
-	negatives := []string{
-		`<main><p>x</p><p>y</p></main>`,
-		`<div class="lead"><p>x</p></div>`,
-		`<div style="color:red"><p>x</p></div>`,
+}
+
+// TestBuildVersionDiffInlineNewlineWhitespaceSurfaces pins finding P0: whitespace
+// that can render as a visible space must surface even when it is a newline run
+// (not just a lone space) — an inline neighbour (default, unknown/custom, or an
+// inline display override) makes the run significant regardless of its bytes.
+func TestBuildVersionDiffInlineNewlineWhitespaceSurfaces(t *testing.T) {
+	cases := []struct{ name, before, after string }{
+		{"span-newline", `<span>x</span><span>y</span>`, "<span>x</span>\n<span>y</span>"},
+		{"display-inline-newline",
+			`<span style="display:inline">x</span><span style="display:inline">y</span>`,
+			"<span style=\"display:inline\">x</span>\n<span style=\"display:inline\">y</span>"},
+		{"display-inline-space-eqspace",
+			`<summary style = "display:inline">x</summary><summary style = "display:inline">y</summary>`,
+			`<summary style = "display:inline">x</summary> <summary style = "display:inline">y</summary>`},
 	}
-	for _, src := range negatives {
-		if hasLayoutAffectingCSS(src) {
-			t.Errorf("did not expect layout-affecting CSS for %q", src)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, tc.before, tc.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+				t.Fatalf("inline whitespace change vanished: %q vs %q", tc.before, tc.after)
+			}
+		})
+	}
+}
+
+// TestBuildVersionDiffStyleReindentDoesNotOverflow pins the P0 no-413 contract:
+// a large newline-based reindent of plain block elements stays ignorable even
+// when a document-level <style> is present, so it never overflows the hunk
+// budget with a per-element whitespace line.
+func TestBuildVersionDiffStyleReindentDoesNotOverflow(t *testing.T) {
+	for _, count := range []int{500, 1500} {
+		compact := `<style>p{color:red}</style>` + repeatedParagraphs(count)
+		pretty := strings.ReplaceAll(compact, "</p>", "</p>\n  ")
+		if _, err := buildVersionDiff(1, 2, compact, pretty); err != nil {
+			t.Fatalf("count=%d: style reindent overflowed: %v", count, err)
 		}
 	}
+}
+
+// TestSiblingOrderBoundsRefreshReflectsNewMatches pins finding P1(3): a
+// per-parent bounds refresh must reflect matches added after the initial
+// snapshot, so an anchor established mid-pass is honoured. A stale bound would
+// permit a crossing pairing; refreshParent must update lower/upper for the
+// parent's children from the current matches.
+func TestSiblingOrderBoundsRefreshReflectsNewMatches(t *testing.T) {
+	// parent 0 with three children 1,2,3.
+	before := []htmlDiffNode{
+		{tag: "ul", parent: -1, children: []int{1, 2, 3}},
+		{tag: "li", parent: 0, siblingPos: 0},
+		{tag: "li", parent: 0, siblingPos: 1},
+		{tag: "li", parent: 0, siblingPos: 2},
+	}
+	after := make([]htmlDiffNode, 4)
+	matches := map[int]int{}
+	bounds := newSiblingOrderBounds(before, after, matches)
+	// With no matches, no child has an anchoring sibling in either direction
+	// (lower/upper < 0 means "no anchor" per compatible()).
+	if bounds.lower[3] >= 0 || bounds.upper[1] >= 0 {
+		t.Fatalf("initial bounds wrong: lower[3]=%d upper[1]=%d", bounds.lower[3], bounds.upper[1])
+	}
+	// Establish middle child 2 as an anchor, then refresh: child 1 must gain an
+	// upper anchor and child 3 a lower anchor reflecting the new match.
+	matches[2] = 7
+	bounds.refreshParent(before, 0, matches)
+	if bounds.upper[1] != 7 {
+		t.Fatalf("stale upper bound after refresh: upper[1]=%d want 7", bounds.upper[1])
+	}
+	if bounds.lower[3] != 7 {
+		t.Fatalf("stale lower bound after refresh: lower[3]=%d want 7", bounds.lower[3])
+	}
+}
+
+// TestMatchDiffNodesNewAnchorDoesNotCrossExisting pins P1(3) end-to-end: a
+// heuristic (non-AID) sibling match must respect committed sibling anchors and
+// never cross one. Two AID-stable list items anchor the ends and an unanchored
+// middle item changes text; it must map within the anchors as one modified,
+// never a stale-bound crossing that yields spurious add/remove.
+func TestMatchDiffNodesNewAnchorDoesNotCrossExisting(t *testing.T) {
+	before := `<html><body><ul>` +
+		`<li data-odoc-aid="a">first</li>` +
+		`<li>middle old</li>` +
+		`<li data-odoc-aid="c">last</li>` +
+		`</ul></body></html>`
+	after := `<html><body><ul>` +
+		`<li data-odoc-aid="a">first</li>` +
+		`<li>middle new</li>` +
+		`<li data-odoc-aid="c">last</li>` +
+		`</ul></body></html>`
+
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified != 1 || result.Summary.Added != 0 || result.Summary.Removed != 0 {
+		t.Fatalf("summary = %+v; want exactly one modified", result.Summary)
+	}
+}
+
+// TestMatchDiffNodesLargeSiblingSetStaysBounded keeps the P1(3) performance
+// contract: incremental per-parent bounds refresh after anchoring must not
+// degrade to O(nodes×parents). A wide reordered same-tag AID sibling set must
+// match within the comparison budget.
+func TestMatchDiffNodesLargeSiblingSetStaysBounded(t *testing.T) {
+	const n = 1500
+	var before, after strings.Builder
+	before.WriteString("<main>")
+	after.WriteString("<main>")
+	for i := 0; i < n; i++ {
+		before.WriteString(`<span data-odoc-aid="s` + strconv.Itoa(i) + `">x</span>`)
+	}
+	for i := n - 1; i >= 0; i-- {
+		after.WriteString(`<span data-odoc-aid="s` + strconv.Itoa(i) + `">x</span>`)
+	}
+	before.WriteString("</main>")
+	after.WriteString("</main>")
+
+	beforeNodes, err := parseDiffHTML(before.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterNodes, err := parseDiffHTML(after.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := matchDiffNodes(beforeNodes, afterNodes); err != nil {
+		t.Fatalf("large reordered AID sibling match failed: %v", err)
+	}
+}
+
+// hunksBody joins every emitted hunk line so a test can assert user-visible
+// content (and the absence of any internal digest/token) in one string.
+func hunksBody(hunks []CodeHunk) string {
+	var b strings.Builder
+	for _, h := range hunks {
+		for _, line := range h.Lines {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// assertNoLeakedInternals fails if any hunk line exposes the internal whitespace
+// fingerprint digest or its identity kind/domain token. Public hunks must carry
+// only the bounded human-readable marker, never a hash or internal key.
+func assertNoLeakedInternals(t *testing.T, hunks []CodeHunk) {
+	t.Helper()
+	body := hunksBody(hunks)
+	for _, needle := range []string{"ws-doc:", "ws-fingerprint", "odoc-ws-fingerprint", "sha256:"} {
+		if strings.Contains(body, needle) {
+			t.Fatalf("public hunk leaked internal token %q in:\n%s", needle, body)
+		}
+	}
+}
+
+// TestBuildVersionDiffLayoutCSSBlockNewlineWhitespaceSurfaces pins the PR #26 P0:
+// under layout-affecting CSS, an inter-tag whitespace change between two
+// otherwise-block boundaries — including a pure newline — must never yield a
+// double-blind empty diff. Both the newline and the space form of the repro must
+// surface as a single, bounded, comprehensible whitespace record with no digest
+// leaked, while the per-line block-newline reindent stays otherwise ignored.
+func TestBuildVersionDiffLayoutCSSBlockNewlineWhitespaceSurfaces(t *testing.T) {
+	base := `<style>p{display:inline}</style><p>a</p>`
+	cases := []struct {
+		name  string
+		after string
+	}{
+		{"newline-between-blocks", base + "\n" + `<p>b</p>`},
+		{"space-between-blocks", base + ` ` + `<p>b</p>`},
+	}
+	before := base + `<p>b</p>`
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, before, tc.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+				t.Fatalf("layout-CSS whitespace change vanished (double-blind) for %q vs %q", before, tc.after)
+			}
+			body := hunksBody(result.CodeHunks)
+			if !strings.Contains(body, "[formatting whitespace changed]") {
+				t.Fatalf("expected comprehensible whitespace marker; hunks:\n%s", body)
+			}
+			assertNoLeakedInternals(t, result.CodeHunks)
+			total := 0
+			for _, h := range result.CodeHunks {
+				total += len(h.Lines)
+			}
+			if total > 16 {
+				t.Fatalf("whitespace record produced %d hunk lines; want a small bounded hunk", total)
+			}
+		})
+	}
+}
+
+// TestBuildVersionDiffLayoutCSSWhiteSpacePreBlockNewline pins that a block-level
+// newline under a white-space:pre style surfaces rather than vanishing.
+func TestBuildVersionDiffLayoutCSSWhiteSpacePreBlockNewline(t *testing.T) {
+	before := `<div style="white-space:pre"><span>x</span><span>y</span></div>`
+	after := `<div style="white-space:pre"><span>x</span>` + "\n" + `<span>y</span></div>`
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+		t.Fatalf("white-space:pre block newline vanished for %q vs %q", before, after)
+	}
+	assertNoLeakedInternals(t, result.CodeHunks)
+}
+
+// TestBuildVersionDiffStylesheetLinkBlockNewline pins that a rel="stylesheet"
+// link makes an inter-tag block newline change surface rather than double-blind.
+func TestBuildVersionDiffStylesheetLinkBlockNewline(t *testing.T) {
+	before := `<link rel="stylesheet" href="a.css"><div>a</div><div>b</div>`
+	after := `<link rel="stylesheet" href="a.css"><div>a</div>` + "\n" + `<div>b</div>`
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+		t.Fatalf("stylesheet-link block newline vanished for %q vs %q", before, after)
+	}
+	assertNoLeakedInternals(t, result.CodeHunks)
+}
+
+// TestBuildVersionDiffLayoutCSSLargeReindentStaysBounded pins that a large pretty
+// reindent under a <style> block does not 413 and, when it surfaces a whitespace
+// change, stays a small bounded hunk (a fixed small constant) independent of
+// document size (500 and 1500 elements).
+func TestBuildVersionDiffLayoutCSSLargeReindentStaysBounded(t *testing.T) {
+	const maxHunkLinesBound = 32
+	for _, count := range []int{500, 1500} {
+		t.Run("n-"+strconv.Itoa(count), func(t *testing.T) {
+			var compact, pretty strings.Builder
+			compact.WriteString(`<style>p{color:red}</style><div>`)
+			pretty.WriteString(`<style>p{color:red}</style>` + "\n<div>\n")
+			for range count {
+				compact.WriteString("<p>x</p>")
+				pretty.WriteString("  <p>x</p>\n")
+			}
+			compact.WriteString("</div>")
+			pretty.WriteString("</div>")
+			result, err := buildVersionDiff(1, 2, compact.String(), pretty.String())
+			if err != nil {
+				t.Fatalf("large reindent under <style> returned error (413?): %v", err)
+			}
+			total := 0
+			for _, h := range result.CodeHunks {
+				total += len(h.Lines)
+			}
+			if total > maxHunkLinesBound {
+				t.Fatalf("reindent produced %d hunk lines for %d elements; want <= %d", total, count, maxHunkLinesBound)
+			}
+			assertNoLeakedInternals(t, result.CodeHunks)
+		})
+	}
+}
+
+// TestBuildVersionDiffInlineStyleColorRedReindentStaysBounded pins that an inline
+// style unrelated to layout (color:red) is not treated as layout-affecting for
+// per-slot display, so a large reindent produces no structural changes and never
+// 413s. The document-level whitespace fingerprint is unconditional, so the
+// reindent still surfaces as exactly one bounded synthetic whitespace record
+// that does not grow with the element count.
+func TestBuildVersionDiffInlineStyleColorRedReindentStaysBounded(t *testing.T) {
+	for _, count := range []int{500, 1500} {
+		t.Run("n-"+strconv.Itoa(count), func(t *testing.T) {
+			var compact, pretty strings.Builder
+			compact.WriteString(`<div style="color:red">`)
+			pretty.WriteString(`<div style="color:red">` + "\n")
+			for range count {
+				compact.WriteString("<p>x</p>")
+				pretty.WriteString("  <p>x</p>\n")
+			}
+			compact.WriteString("</div>")
+			pretty.WriteString("</div>")
+			result, err := buildVersionDiff(1, 2, compact.String(), pretty.String())
+			if err != nil {
+				t.Fatalf("color:red reindent returned error (413?): %v", err)
+			}
+			if len(result.Changes) != 0 {
+				t.Fatalf("color:red reindent produced structural changes: %d", len(result.Changes))
+			}
+			total := 0
+			for _, h := range result.CodeHunks {
+				total += len(h.Lines)
+			}
+			if total > reindentMaxHunkLines {
+				t.Fatalf("color:red reindent produced %d hunk lines for %d elements; want a small bounded hunk", total, count)
+			}
+			assertNoLeakedInternals(t, result.CodeHunks)
+		})
+	}
+}
+
+// TestBuildVersionDiffIdenticalLayoutCSSDocIsEmpty pins that an identical document
+// under layout-affecting CSS yields no changes and no hunks: the whitespace
+// fingerprint compares equal for identical whitespace layout.
+func TestBuildVersionDiffIdenticalLayoutCSSDocIsEmpty(t *testing.T) {
+	docs := []string{
+		`<style>p{display:inline}</style><p>a</p>` + "\n" + `<p>b</p>`,
+		`<link rel="stylesheet" href="a.css"><div>a</div> <div>b</div>`,
+		`<div style="white-space:pre"><span>x</span>` + "\n\n" + `<span>y</span></div>`,
+	}
+	for _, doc := range docs {
+		result, err := buildVersionDiff(1, 2, doc, doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
+			t.Fatalf("identical layout-CSS doc produced a diff: changes=%d hunks=%d for %q", len(result.Changes), len(result.CodeHunks), doc)
+		}
+	}
+}
+
+// TestWhitespaceFingerprintIsDeterministicAndLayoutSensitive pins the fingerprint
+// contract directly: it is built for every document (unconditional, never gated
+// on CSS), depends only on the ordered inter-tag whitespace layout (slot order,
+// presence, and exact bytes), is stable across runs, and stays a bounded key.
+// Distinct whitespace layouts differ; identical layouts match; a literal-text
+// line can never forge the synthetic record's "ws-doc" kind.
+func TestWhitespaceFingerprintIsDeterministicAndLayoutSensitive(t *testing.T) {
+	linesFor := func(src string) []diffSourceLine {
+		lines, ok := normalizedHTMLLines(src)
+		if !ok {
+			t.Fatalf("normalizedHTMLLines rejected %q", src)
+		}
+		return lines
+	}
+	fpIdentity := func(lines []diffSourceLine) (string, bool) {
+		for _, l := range lines {
+			if strings.HasPrefix(l.identity, "ws-doc:") {
+				return l.identity, true
+			}
+		}
+		return "", false
+	}
+
+	noNewline := linesFor(`<style>p{display:inline}</style><p>a</p><p>b</p>`)
+	withNewline := linesFor(`<style>p{display:inline}</style><p>a</p>` + "\n" + `<p>b</p>`)
+	withSpace := linesFor(`<style>p{display:inline}</style><p>a</p> <p>b</p>`)
+
+	id0, ok0 := fpIdentity(noNewline)
+	id1, ok1 := fpIdentity(withNewline)
+	id2, ok2 := fpIdentity(withSpace)
+	if !ok0 || !ok1 || !ok2 {
+		t.Fatal("expected a whitespace fingerprint record under layout-affecting CSS")
+	}
+	if id0 == id1 || id0 == id2 || id1 == id2 {
+		t.Fatalf("distinct whitespace layouts collided: %q %q %q", id0, id1, id2)
+	}
+	if len(id0) >= 128 {
+		t.Fatalf("fingerprint identity length %d exceeds bound", len(id0))
+	}
+	for range 4 {
+		again, _ := fpIdentity(linesFor(`<style>p{display:inline}</style><p>a</p>` + "\n" + `<p>b</p>`))
+		if again != id1 {
+			t.Fatalf("nondeterministic fingerprint: %q != %q", again, id1)
+		}
+	}
+	if _, ok := fpIdentity(linesFor(`<main><p>a</p><p>b</p></main>`)); !ok {
+		t.Fatal("expected a whitespace fingerprint for every document (unconditional)")
+	}
+	// A literal text line cannot forge the synthetic "ws-doc" kind: real content
+	// lines are kind "text"/"tag"/"pre"/"ws".
+	forge := newDiffSourceLine("text", "ws-doc:deadbeef", "ws-doc:deadbeef")
+	if strings.HasPrefix(forge.identity, "ws-doc:") {
+		t.Fatalf("literal text forged the whitespace fingerprint kind: %q", forge.identity)
+	}
+}
+
+// wsDocFingerprintForSource returns the "ws-doc:" fingerprint identity that
+// normalizedHTMLLines now emits unconditionally for every document, failing the
+// test if none is present (it must always exist).
+func wsDocFingerprintForSource(t *testing.T, src string) string {
+	t.Helper()
+	lines, ok := normalizedHTMLLines(src)
+	if !ok {
+		t.Fatalf("normalizedHTMLLines rejected %q", src)
+	}
+	for _, l := range lines {
+		if strings.HasPrefix(l.identity, "ws-doc:") {
+			return l.identity
+		}
+	}
+	t.Fatalf("no unconditional whitespace fingerprint for %q", src)
+	return ""
+}
+
+// assertNotDoubleBlind fails if a before/after pair with a real (potentially
+// visible) whitespace-layout difference collapses to an empty diff. A single
+// bounded synthetic whitespace record is the accepted surfacing; the digest must
+// never leak.
+func assertNotDoubleBlind(t *testing.T, before, after string) *VersionDiff {
+	t.Helper()
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatalf("buildVersionDiff returned error (413?): %v", err)
+	}
+	if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+		t.Fatalf("whitespace-layout change vanished (double-blind) for %q vs %q", before, after)
+	}
+	assertNoLeakedInternals(t, result.CodeHunks)
+	return result
+}
+
+// TestBuildVersionDiffNoCSSBlockSiblingNewlineIsNotDoubleBlind pins P0-1: even
+// with no <style>/stylesheet/inline layout style anywhere, a newline inserted
+// between two block-level siblings must NOT double-blind. The fingerprint is
+// unconditional, so an unknown future stylesheet that renders those blocks
+// inline can never hide the change. It surfaces as a single bounded whitespace
+// record with no digest leaked.
+func TestBuildVersionDiffNoCSSBlockSiblingNewlineIsNotDoubleBlind(t *testing.T) {
+	before := `<div><p>a</p><p>b</p></div>`
+	after := `<div><p>a</p>` + "\n" + `<p>b</p></div>`
+	// Sanity: the source is genuinely CSS-free so this exercises the universal path.
+	if hasLayoutAffectingCSS(before) || hasLayoutAffectingCSS(after) {
+		t.Fatalf("test inputs unexpectedly contain layout-affecting CSS")
+	}
+	result := assertNotDoubleBlind(t, before, after)
+	body := hunksBody(result.CodeHunks)
+	if !strings.Contains(body, "[formatting whitespace changed]") {
+		t.Fatalf("expected comprehensible whitespace marker; hunks:\n%s", body)
+	}
+	total := 0
+	for _, h := range result.CodeHunks {
+		total += len(h.Lines)
+	}
+	if total > reindentMaxHunkLines {
+		t.Fatalf("no-CSS block newline produced %d hunk lines; want a small bounded hunk", total)
+	}
+}
+
+// TestBuildVersionDiffDynamicStyleScenariosAreNotDoubleBlind pins P0-1 for
+// external/dynamic styling the conservative CSS scan cannot see: a <link
+// rel="preload" as="style">, and a script that injects a stylesheet at runtime.
+// Because the fingerprint is universal (not gated on hasLayoutAffectingCSS), a
+// block-sibling whitespace change under either scenario still surfaces and never
+// double-blinds.
+func TestBuildVersionDiffDynamicStyleScenariosAreNotDoubleBlind(t *testing.T) {
+	cases := []struct {
+		name          string
+		before, after string
+	}{
+		{
+			"preload-as-style",
+			`<link rel="preload" as="style" href="a.css"><section>a</section><section>b</section>`,
+			`<link rel="preload" as="style" href="a.css"><section>a</section>` + "\n" + `<section>b</section>`,
+		},
+		{
+			"script-injected-stylesheet",
+			`<script>document.head.appendChild(document.createElement('x'))</script><div>a</div><div>b</div>`,
+			`<script>document.head.appendChild(document.createElement('x'))</script><div>a</div>` + "\n" + `<div>b</div>`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := assertNotDoubleBlind(t, tc.before, tc.after)
+			if !strings.Contains(hunksBody(result.CodeHunks), "[formatting whitespace changed]") {
+				t.Fatalf("dynamic-style whitespace change lacked the marker; hunks:\n%s", hunksBody(result.CodeHunks))
+			}
+			total := 0
+			for _, h := range result.CodeHunks {
+				total += len(h.Lines)
+			}
+			if total > reindentMaxHunkLines {
+				t.Fatalf("%s produced %d hunk lines; want a small bounded hunk", tc.name, total)
+			}
+		})
+	}
+}
+
+// TestWhitespaceMoveAcrossRepeatedTagsSurfacesViaBuildDiff pins the accepted P1
+// trade-off. The v3 fingerprint is the ordered sequence of non-empty whitespace
+// events (each event's exact bytes) with NO boundary/occurrence anchor. Moving
+// the same VISIBLE run to a different boundary between otherwise-identical
+// repeated inline tags does NOT change that ordered sequence (one space event,
+// same bytes, same index), so the fingerprint deliberately collides — this is
+// what kills the structural-insert anchor false positive. The visible move must
+// still surface, though: the overall build diff must be non-empty via the
+// per-slot inline source lines (the folded whitespace prefix moves from one line
+// to another). A silent empty diff for a visible move would be a regression; a
+// fingerprint marker here would be the false positive we removed.
+//
+// (A newline move purely between BLOCK boundaries is provably ignorable reindent
+// noise — it renders identically — so an empty diff there is correct, not a
+// regression; this test uses an inline context where the space is genuinely
+// visible.)
+func TestWhitespaceMoveAcrossRepeatedTagsSurfacesViaBuildDiff(t *testing.T) {
+	// Inline <span> siblings: the single space is visible, so moving it across a
+	// repeated boundary is a real visible change the per-slot lines must surface.
+	css := `<style>span{display:inline}</style>`
+	atBoundary1 := css + `<div><span>x</span> <span>x</span><span>x</span></div>`
+	atBoundary2 := css + `<div><span>x</span><span>x</span> <span>x</span></div>`
+	// Same ordered whitespace-event sequence (one space) => fingerprint collides,
+	// by design (position is not anchored).
+	if fp1, fp2 := wsDocFingerprintForSource(t, atBoundary1), wsDocFingerprintForSource(t, atBoundary2); fp1 != fp2 {
+		t.Fatalf("same-bytes move unexpectedly changed the anchor-free fingerprint: %q != %q", fp1, fp2)
+	}
+	// The build diff must still be non-empty (the moved space surfaces through the
+	// per-slot source lines), and must NOT forge a spurious whitespace marker.
+	result, err := buildVersionDiff(1, 2, atBoundary1, atBoundary2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+		t.Fatalf("moved-space build diff was empty for %q vs %q", atBoundary1, atBoundary2)
+	}
+	if strings.Contains(hunksBody(result.CodeHunks), "[formatting whitespace changed]") {
+		t.Fatalf("same-bytes move forged a spurious whitespace marker:\n%s", hunksBody(result.CodeHunks))
+	}
+	assertNoLeakedInternals(t, result.CodeHunks)
+}
+
+// TestWhitespaceFingerprintIgnoresStructuralOnlyEdits pins the PR #26 final P1:
+// the v3 fingerprint is the ordered sequence of non-empty whitespace events
+// (each event's exact bytes) with NO boundary/occurrence anchor. A purely
+// structural edit — inserting/removing elements, comments, raw blocks, or
+// PI/doctype that add no inter-tag whitespace — must leave the fingerprint
+// IDENTICAL regardless of whether it sits BEFORE, AFTER, or BETWEEN existing
+// whitespace events (the trailing/prefix-insert anchor false positive that
+// motivated dropping anchors entirely), so it never fabricates a spurious
+// "[formatting whitespace changed]" hunk. Structural change is reported by the
+// regular tag/text line diff. Conversely, actual whitespace presence vs absence,
+// and a change in the ordered event byte sequence, must differ.
+func TestWhitespaceFingerprintIgnoresStructuralOnlyEdits(t *testing.T) {
+	fp := func(src string) string { return wsDocFingerprintForSource(t, src) }
+
+	// --- Structural-only edits: fingerprint MUST stay identical (no marker). ---
+	// Same-type inserts are exercised before, after, AND between whitespace events
+	// to prove no position-relative anchor survives.
+	inert := []struct{ name, before, after string }{
+		{"element-insert-empty", `<a></a><b></b>`, `<a></a><b></b><c></c>`},
+		{"element-insert-content-mid", `<a>x</a><b>y</b>`, `<a>x</a><c>z</c><b>y</b>`},
+		{"same-type-insert-after-ws", `<p>x</p> <p>x</p>`, `<p>x</p> <p>x</p><p>x</p>`},
+		{"same-type-insert-before-ws", `<p>x</p> <p>x</p>`, `<p>x</p><p>x</p> <p>x</p>`},
+		{"same-type-insert-between-ws", `<p>a</p> <p>b</p> <p>c</p>`, `<p>a</p> <p>b</p><p>x</p> <p>c</p>`},
+		{"same-type-remove-before-ws", `<p>x</p><p>x</p> <p>x</p>`, `<p>x</p> <p>x</p>`},
+		{"comment-add-before-ws", `<p>a</p> <p>b</p>`, `<p>a</p><!--n--> <p>b</p>`},
+		{"comment-remove-before-ws", `<p>a</p><!--n--> <p>b</p>`, `<p>a</p> <p>b</p>`},
+		{"raw-script-add-before-ws", `<p>a</p> <p>b</p>`, `<p>a</p><script>var x=1;</script> <p>b</p>`},
+		{"pi-add-before-ws", `<p>a</p> <p>b</p>`, `<p>a</p><?x?> <p>b</p>`},
+		{"doctype-add-before-ws", `<p>a</p> <p>b</p>`, `<p>a</p><!doctype html> <p>b</p>`},
+		{"attr-change", `<p class="x">a</p> <p>b</p>`, `<p class="y">a</p> <p>b</p>`},
+		{"text-change-before-ws", `<p>a</p> <p>b</p>`, `<p>ZZZ</p> <p>b</p>`},
+		{"same-bytes-move-repeated-boundary", `<p>a</p> <p>b</p><p>c</p>`, `<p>a</p><p>b</p> <p>c</p>`},
+	}
+	for _, tc := range inert {
+		t.Run(tc.name, func(t *testing.T) {
+			if before, after := fp(tc.before), fp(tc.after); before != after {
+				t.Fatalf("structural-only edit perturbed the whitespace fingerprint:\n before=%q -> %s\n after =%q -> %s", tc.before, before, tc.after, after)
+			}
+		})
+	}
+
+	// --- Whitespace edits: fingerprint MUST change (a marker is warranted). ---
+	// These alter the ordered whitespace-event sequence (presence, exact bytes,
+	// or count).
+	changing := []struct{ name, before, after string }{
+		{"present-vs-absent", `<a></a> <b></b>`, `<a></a><b></b>`},
+		{"bytes-differ", `<a></a> <b></b>`, `<a></a>` + "\n" + `<b></b>`},
+		{"extra-event", `<p>a</p> <p>b</p><p>c</p>`, `<p>a</p> <p>b</p> <p>c</p>`},
+	}
+	for _, tc := range changing {
+		t.Run(tc.name, func(t *testing.T) {
+			if before, after := fp(tc.before), fp(tc.after); before == after {
+				t.Fatalf("whitespace-layout change left the fingerprint unchanged:\n before=%q\n after =%q\n digest=%s", tc.before, tc.after, before)
+			}
+		})
+	}
+
+	// Identical whitespace layout compares equal and is deterministic.
+	if s1, s2 := fp(`<a></a> <b></b><c></c>`), fp(`<a></a> <b></b><c></c>`); s1 != s2 {
+		t.Fatalf("identical layout mismatched: %q != %q", s1, s2)
+	}
+}
+
+// TestBuildVersionDiffIdenticalDocIsEmptyUniversal pins that an identical
+// document (whitespace fingerprint now unconditional) still yields no changes and
+// no hunks via the identical-source fast path and the equal fingerprint.
+func TestBuildVersionDiffIdenticalDocIsEmptyUniversal(t *testing.T) {
+	docs := []string{
+		`<div><p>a</p><p>b</p></div>`,
+		`<div><p>a</p>` + "\n" + `<p>b</p></div>`,
+		`<ul><li>x</li> <li>y</li></ul>`,
+		`<a></a><b></b><c></c>`,
+	}
+	for _, doc := range docs {
+		result, err := buildVersionDiff(1, 2, doc, doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Changes) != 0 || len(result.CodeHunks) != 0 {
+			t.Fatalf("identical doc produced a diff: changes=%d hunks=%d for %q", len(result.Changes), len(result.CodeHunks), doc)
+		}
+	}
+}
+
+// TestBuildVersionDiffSameLayoutAcrossContentEditFingerprintMatches pins that a
+// non-whitespace edit that preserves the exact inter-tag whitespace layout does
+// not spuriously produce a whitespace record: the fingerprint is content-
+// independent, so the ws-doc line is identical on both sides and only the real
+// text change surfaces.
+func TestBuildVersionDiffSameLayoutAcrossContentEditFingerprintMatches(t *testing.T) {
+	before := `<div><p>alpha</p> <p>beta</p></div>`
+	after := `<div><p>ALPHA</p> <p>beta</p></div>`
+	fpBefore := wsDocFingerprintForSource(t, before)
+	fpAfter := wsDocFingerprintForSource(t, after)
+	if fpBefore != fpAfter {
+		t.Fatalf("content-only edit changed the whitespace fingerprint: %q != %q", fpBefore, fpAfter)
+	}
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(hunksBody(result.CodeHunks), "[formatting whitespace changed]") {
+		t.Fatalf("content-only edit spuriously surfaced a whitespace record:\n%s", hunksBody(result.CodeHunks))
+	}
+	assertNoLeakedInternals(t, result.CodeHunks)
+}
+
+// TestBuildVersionDiffPlainReindentLargeStaysBoundedNoCSS pins the P0 no-413
+// contract for the universal fingerprint: a large CSS-free newline reindent
+// (500 and 1500 elements) never 413s and stays a small bounded hunk that does
+// not grow with the element count.
+func TestBuildVersionDiffPlainReindentLargeStaysBoundedNoCSS(t *testing.T) {
+	for _, count := range []int{500, 1500} {
+		t.Run("n-"+strconv.Itoa(count), func(t *testing.T) {
+			var compact, pretty strings.Builder
+			compact.WriteString("<main>")
+			pretty.WriteString("<main>\n")
+			for range count {
+				compact.WriteString("<p>x</p>")
+				pretty.WriteString("  <p>x</p>\n")
+			}
+			compact.WriteString("</main>")
+			pretty.WriteString("</main>")
+			if hasLayoutAffectingCSS(compact.String()) || hasLayoutAffectingCSS(pretty.String()) {
+				t.Fatalf("test inputs unexpectedly contain layout-affecting CSS")
+			}
+			result, err := buildVersionDiff(1, 2, compact.String(), pretty.String())
+			if err != nil {
+				t.Fatalf("count=%d: plain reindent overflowed (413?): %v", count, err)
+			}
+			if len(result.Changes) != 0 {
+				t.Fatalf("count=%d: plain reindent produced structural changes: %d", count, len(result.Changes))
+			}
+			total := 0
+			for _, h := range result.CodeHunks {
+				total += len(h.Lines)
+			}
+			if total > reindentMaxHunkLines {
+				t.Fatalf("count=%d: plain reindent produced %d hunk lines; want a small bounded hunk", count, total)
+			}
+			assertNoLeakedInternals(t, result.CodeHunks)
+		})
+	}
+}
+
+// whitespaceMarkerChanged reports whether any hunk carries the whitespace record
+// as an ADDED or REMOVED line (unified prefix '+'/'-'), i.e. a real
+// whitespace-layout change. An unchanged marker that merely appears as context
+// (leading ' ') is not a change and must not count — the fingerprint only
+// surfaces a whitespace hunk when the layout actually differs.
+func whitespaceMarkerChanged(hunks []CodeHunk) bool {
+	for _, h := range hunks {
+		for _, line := range h.Lines {
+			if len(line) == 0 {
+				continue
+			}
+			if (line[0] == '+' || line[0] == '-') && strings.Contains(line, "[formatting whitespace changed]") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestBuildVersionDiffStructuralOnlyEditEmitsNoWhitespaceHunk is the end-to-end
+// guard for the final P1: a pure element/comment/raw/text edit must never
+// surface a "[formatting whitespace changed]" change line. The structural
+// change may (and should) surface through the normal line diff, but the
+// whitespace record must stay silent because no inter-token whitespace moved.
+func TestBuildVersionDiffStructuralOnlyEditEmitsNoWhitespaceHunk(t *testing.T) {
+	cases := []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{"element-insert-empty", `<a></a><b></b>`, `<a></a><c></c><b></b>`},
+		{"element-insert-content", `<a>x</a><b>y</b>`, `<a>x</a><c>z</c><b>y</b>`},
+		{"element-remove-empty", `<a></a><c></c><b></b>`, `<a></a><b></b>`},
+		{"comment-insert", `<p>a</p><p>b</p>`, `<p>a</p><!--c--><p>b</p>`},
+		{"comment-remove", `<p>a</p><!--c--><p>b</p>`, `<p>a</p><p>b</p>`},
+		{"raw-script-insert", `<p>a</p><p>b</p>`, `<p>a</p><script>x()</script><p>b</p>`},
+		{"raw-script-remove", `<p>a</p><script>x()</script><p>b</p>`, `<p>a</p><p>b</p>`},
+		{"attr-change", `<p class="x">a</p><p>b</p>`, `<p class="y">a</p><p>b</p>`},
+		{"text-change", `<p>a</p><p>b</p>`, `<p>zzz</p><p>b</p>`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, tc.before, tc.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if whitespaceMarkerChanged(result.CodeHunks) {
+				t.Fatalf("structural-only edit produced a spurious whitespace change:\n%s", hunksBody(result.CodeHunks))
+			}
+			assertNoLeakedInternals(t, result.CodeHunks)
+		})
+	}
+}
+
+// TestBuildVersionDiffWhitespaceEditEmitsWhitespaceHunk is the end-to-end
+// converse: an actual inter-token whitespace add/remove/byte change must surface
+// the single bounded "[formatting whitespace changed]" change marker. A
+// same-bytes move across a repeated boundary is NOT here — it does not alter the
+// ordered whitespace-event sequence, so it surfaces via the per-slot/structural
+// diff instead (see TestWhitespaceMoveAcrossRepeatedTagsSurfacesViaBuildDiff).
+func TestBuildVersionDiffWhitespaceEditEmitsWhitespaceHunk(t *testing.T) {
+	cases := []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{"whitespace-add", `<p>a</p><p>b</p>`, `<p>a</p> <p>b</p>`},
+		{"whitespace-remove", `<p>a</p> <p>b</p>`, `<p>a</p><p>b</p>`},
+		{"whitespace-bytes-differ", `<p>a</p> <p>b</p>`, `<p>a</p>` + "\n" + `<p>b</p>`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, tc.before, tc.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !whitespaceMarkerChanged(result.CodeHunks) {
+				t.Fatalf("whitespace-layout change did not surface a whitespace change:\n%s", hunksBody(result.CodeHunks))
+			}
+			assertNoLeakedInternals(t, result.CodeHunks)
+		})
+	}
+}
+
+// TestWhitespaceFingerprintStructuralInsertBeforeRunDoesNotShift pins the
+// final sign-off P1 repro A: prepending a whitespace-free element (a bare
+// <p>x</p> before an existing "</p> <p>" run) must NOT perturb the whitespace
+// fingerprint. The v3 fingerprint is the ordered sequence of non-empty
+// whitespace events; a whitespace-free insert adds no event, so the sequence is
+// unchanged. The structural insert surfaces through the ordinary line diff,
+// never as a spurious "[formatting whitespace changed]" hunk.
+func TestWhitespaceFingerprintStructuralInsertBeforeRunDoesNotShift(t *testing.T) {
+	before := `<p>x</p> <p>x</p>`
+	after := `<p>x</p><p>x</p> <p>x</p>`
+	fpBefore := wsDocFingerprintForSource(t, before)
+	fpAfter := wsDocFingerprintForSource(t, after)
+	if fpBefore != fpAfter {
+		t.Fatalf("pure structural insert before a whitespace run shifted the fingerprint: %q != %q", fpBefore, fpAfter)
+	}
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if whitespaceMarkerChanged(result.CodeHunks) {
+		t.Fatalf("structural <p> insert fabricated a whitespace change:\n%s", hunksBody(result.CodeHunks))
+	}
+	// The structural insert itself must still surface (a real added element).
+	if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+		t.Fatalf("structural <p> insert vanished entirely: changes=0 hunks=0")
+	}
+	assertNoLeakedInternals(t, result.CodeHunks)
+}
+
+// TestWhitespaceFingerprintCommentInsertBeforeRunIsTransparent pins the final
+// sign-off P1 repro B: inserting a whitespace-free comment between "</p>" and an
+// existing inter-tag whitespace run must NOT change the ordered whitespace-event
+// sequence. Comments are transparent for whitespace (they add no event), so the
+// run stays a single event and no spurious whitespace hunk appears.
+func TestWhitespaceFingerprintCommentInsertBeforeRunIsTransparent(t *testing.T) {
+	before := `<p>a</p> <p>b</p>`
+	after := `<p>a</p><!--c--> <p>b</p>`
+	fpBefore := wsDocFingerprintForSource(t, before)
+	fpAfter := wsDocFingerprintForSource(t, after)
+	if fpBefore != fpAfter {
+		t.Fatalf("comment insert before a whitespace run shifted the fingerprint: %q != %q", fpBefore, fpAfter)
+	}
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if whitespaceMarkerChanged(result.CodeHunks) {
+		t.Fatalf("comment insert fabricated a whitespace change:\n%s", hunksBody(result.CodeHunks))
+	}
+	assertNoLeakedInternals(t, result.CodeHunks)
+}
+
+// TestWhitespaceFingerprintRawInsertBeforeRunIsTransparent pins that a
+// whitespace-free raw-text (script/style) block inserted before an existing
+// inter-tag whitespace run is transparent too: it adds no whitespace event, so
+// the ordered sequence is unchanged and no spurious whitespace hunk appears,
+// while a real whitespace run adjacent to a raw block is still detected.
+func TestWhitespaceFingerprintRawInsertBeforeRunIsTransparent(t *testing.T) {
+	before := `<p>a</p> <p>b</p>`
+	after := `<p>a</p><script>x()</script> <p>b</p>`
+	fpBefore := wsDocFingerprintForSource(t, before)
+	fpAfter := wsDocFingerprintForSource(t, after)
+	if fpBefore != fpAfter {
+		t.Fatalf("raw-text insert before a whitespace run shifted the fingerprint: %q != %q", fpBefore, fpAfter)
+	}
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if whitespaceMarkerChanged(result.CodeHunks) {
+		t.Fatalf("raw-text insert fabricated a whitespace change:\n%s", hunksBody(result.CodeHunks))
+	}
+	assertNoLeakedInternals(t, result.CodeHunks)
+
+	// A genuine whitespace run added adjacent to a raw block must still surface:
+	// transparency applies to the block, never to real whitespace bytes.
+	wsBefore := `<p>a</p><script>x()</script><p>b</p>`
+	wsAfter := `<p>a</p><script>x()</script> <p>b</p>`
+	wsResult, err := buildVersionDiff(1, 2, wsBefore, wsAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !whitespaceMarkerChanged(wsResult.CodeHunks) {
+		t.Fatalf("real whitespace beside a raw block was swallowed:\n%s", hunksBody(wsResult.CodeHunks))
+	}
+	assertNoLeakedInternals(t, wsResult.CodeHunks)
 }
