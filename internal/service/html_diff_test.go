@@ -421,6 +421,169 @@ func TestBuildVersionDiffRejectsExcessiveNormalizedLines(t *testing.T) {
 	}
 }
 
+func TestLayoutCSSNewlineRelocationSurfaces(t *testing.T) {
+	for _, tc := range []struct {
+		name, css, gap, tag string
+		distance            int
+	}{
+		{"style-lf", `<style>p{display:inline}</style>`, "\n", "p", 1},
+		{"style-crlf", `<style>li{display:inline}</style>`, "\r\n", "li", 1},
+		{"style-indent", `<style>div{display:inline}</style>`, "\n  ", "div", 1},
+		{"move-four", `<style>p{display:inline}</style>`, "\n", "p", 4},
+		{"stylesheet", `<link rel="stylesheet" href="x.css">`, "\n", "p", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			element := func(i int) string { return fmt.Sprintf("<%s>%d</%s>", tc.tag, i, tc.tag) }
+			var before, after strings.Builder
+			before.WriteString(tc.css)
+			after.WriteString(tc.css)
+			for i := 0; i < tc.distance+2; i++ {
+				before.WriteString(element(i))
+				after.WriteString(element(i))
+				if i == 0 {
+					before.WriteString(tc.gap)
+				}
+				if i == tc.distance {
+					after.WriteString(tc.gap)
+				}
+			}
+			result, err := buildVersionDiff(1, 2, before.String(), after.String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+				t.Fatal("newline relocation produced an empty diff")
+			}
+			assertNoLeakedInternals(t, result.CodeHunks)
+		})
+	}
+}
+
+func TestManyIdenticalLFEventsRelocationStaysNonEmptyAndBounded(t *testing.T) {
+	for _, count := range []int{130, 500, 1500} {
+		t.Run("n-"+strconv.Itoa(count), func(t *testing.T) {
+			var before, after strings.Builder
+			before.WriteString(`<style>span{display:inline}</style><div>`)
+			after.WriteString(`<style>span{display:inline}</style><div>`)
+			for i := 0; i < count+2; i++ {
+				element := fmt.Sprintf("<span>%d</span>", i)
+				before.WriteString(element)
+				after.WriteString(element)
+				if i < count {
+					before.WriteByte('\n')
+				}
+				if i != count-1 && i <= count {
+					after.WriteByte('\n')
+				}
+			}
+			before.WriteString(`</div>`)
+			after.WriteString(`</div>`)
+
+			if fpBefore, fpAfter := wsDocFingerprintForSource(t, before.String()), wsDocFingerprintForSource(t, after.String()); fpBefore == fpAfter {
+				t.Fatalf("count=%d: relocated LF event left fingerprint unchanged", count)
+			}
+			result, err := buildVersionDiff(1, 2, before.String(), after.String())
+			if err != nil {
+				t.Fatalf("count=%d: relocation failed: %v", count, err)
+			}
+			if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
+				t.Fatalf("count=%d: relocation produced an empty diff", count)
+			}
+			total := 0
+			for _, hunk := range result.CodeHunks {
+				total += len(hunk.Lines)
+			}
+			if total > 20 {
+				t.Fatalf("count=%d: relocation produced %d hunk lines", count, total)
+			}
+			assertNoLeakedInternals(t, result.CodeHunks)
+		})
+	}
+}
+
+func TestLineDiffResyncsAfterSingleParagraphInsert(t *testing.T) {
+	var before, after strings.Builder
+	for i := range 600 {
+		line := fmt.Sprintf("<p>paragraph %d</p>\n", i)
+		before.WriteString(line)
+		after.WriteString(line)
+		if i == 299 {
+			after.WriteString("<p>inserted</p>\n")
+		}
+	}
+	result, err := buildVersionDiff(1, 2, before.String(), after.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	for _, hunk := range result.CodeHunks {
+		total += len(hunk.Lines)
+	}
+	if total > 20 {
+		t.Fatalf("single insert produced %d hunk lines", total)
+	}
+}
+
+func TestDiffLineOpsResyncsRepeatedSuffixAtEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		suffix []string
+	}{
+		{name: "two-lines", suffix: []string{"q", "q"}},
+		{name: "one-line", suffix: []string{"q"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldIDs := append([]string(nil), tc.suffix...)
+			newIDs := append([]string{"insert"}, tc.suffix...)
+			ops, ok := diffLineOps(diffTestLines(oldIDs...), diffTestLines(newIDs...))
+			if !ok {
+				t.Fatal("diffLineOps rejected bounded input")
+			}
+			wantKinds := "+" + strings.Repeat(" ", len(tc.suffix))
+			if got := diffOpKinds(ops); got != wantKinds {
+				t.Fatalf("operation kinds = %q; want %q", got, wantKinds)
+			}
+		})
+	}
+}
+
+func TestDiffLineOpsDoesNotResyncSingleRepeatedLineBeforeEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		oldLines []string
+		newLines []string
+	}{
+		{"both-have-tail", []string{"q", "old", "q"}, []string{"insert", "q", "new", "q"}},
+		{"old-ends-amid-repeats", []string{"q", "q"}, []string{"insert", "q", "tail", "q"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, ok := diffLineOps(diffTestLines(tc.oldLines...), diffTestLines(tc.newLines...))
+			if !ok {
+				t.Fatal("diffLineOps rejected bounded input")
+			}
+			if len(ops) < 2 || ops[0].kind == ' ' || ops[1].kind == ' ' {
+				t.Fatalf("single middle repeat was used as a sync point: %q", diffOpKinds(ops))
+			}
+		})
+	}
+}
+
+func diffTestLines(identities ...string) []diffSourceLine {
+	lines := make([]diffSourceLine, len(identities))
+	for i, identity := range identities {
+		lines[i] = diffSourceLine{identity: identity, display: identity}
+	}
+	return lines
+}
+
+func diffOpKinds(ops []diffLineOp) string {
+	kinds := make([]byte, len(ops))
+	for i, op := range ops {
+		kinds[i] = op.kind
+	}
+	return string(kinds)
+}
+
 func TestBuildVersionDiffRejectsExcessiveDepth(t *testing.T) {
 	var source strings.Builder
 	for range maxDiffDepth + 1 {
@@ -1706,13 +1869,12 @@ func TestWhitespaceMoveAcrossRepeatedTagsSurfacesViaBuildDiff(t *testing.T) {
 	css := `<style>span{display:inline}</style>`
 	atBoundary1 := css + `<div><span>x</span> <span>x</span><span>x</span></div>`
 	atBoundary2 := css + `<div><span>x</span><span>x</span> <span>x</span></div>`
-	// Same ordered whitespace-event sequence (one space) => fingerprint collides,
-	// by design (position is not anchored).
-	if fp1, fp2 := wsDocFingerprintForSource(t, atBoundary1), wsDocFingerprintForSource(t, atBoundary2); fp1 != fp2 {
-		t.Fatalf("same-bytes move unexpectedly changed the anchor-free fingerprint: %q != %q", fp1, fp2)
+	// Same bytes at another boundary must change the single positioned digest.
+	if fp1, fp2 := wsDocFingerprintForSource(t, atBoundary1), wsDocFingerprintForSource(t, atBoundary2); fp1 == fp2 {
+		t.Fatalf("same-bytes move left the positioned fingerprint unchanged: %q", fp1)
 	}
 	// The build diff must still be non-empty (the moved space surfaces through the
-	// per-slot source lines), and must NOT forge a spurious whitespace marker.
+	// per-slot source lines and the document marker).
 	result, err := buildVersionDiff(1, 2, atBoundary1, atBoundary2)
 	if err != nil {
 		t.Fatal(err)
@@ -1720,23 +1882,15 @@ func TestWhitespaceMoveAcrossRepeatedTagsSurfacesViaBuildDiff(t *testing.T) {
 	if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
 		t.Fatalf("moved-space build diff was empty for %q vs %q", atBoundary1, atBoundary2)
 	}
-	if strings.Contains(hunksBody(result.CodeHunks), "[formatting whitespace changed]") {
-		t.Fatalf("same-bytes move forged a spurious whitespace marker:\n%s", hunksBody(result.CodeHunks))
+	if !whitespaceMarkerChanged(result.CodeHunks) {
+		t.Fatalf("same-bytes move lacked the whitespace marker:\n%s", hunksBody(result.CodeHunks))
 	}
 	assertNoLeakedInternals(t, result.CodeHunks)
 }
 
-// TestWhitespaceFingerprintIgnoresStructuralOnlyEdits pins the PR #26 final P1:
-// the v3 fingerprint is the ordered sequence of non-empty whitespace events
-// (each event's exact bytes) with NO boundary/occurrence anchor. A purely
-// structural edit — inserting/removing elements, comments, raw blocks, or
-// PI/doctype that add no inter-tag whitespace — must leave the fingerprint
-// IDENTICAL regardless of whether it sits BEFORE, AFTER, or BETWEEN existing
-// whitespace events (the trailing/prefix-insert anchor false positive that
-// motivated dropping anchors entirely), so it never fabricates a spurious
-// "[formatting whitespace changed]" hunk. Structural change is reported by the
-// regular tag/text line diff. Conversely, actual whitespace presence vs absence,
-// and a change in the ordered event byte sequence, must differ.
+// TestWhitespaceFingerprintIgnoresStructuralOnlyEdits covers structural edits
+// that do not move an event's boundary position. Positioned events deliberately
+// permit one bounded marker when an element insertion does shift that position.
 func TestWhitespaceFingerprintIgnoresStructuralOnlyEdits(t *testing.T) {
 	fp := func(src string) string { return wsDocFingerprintForSource(t, src) }
 
@@ -1747,9 +1901,6 @@ func TestWhitespaceFingerprintIgnoresStructuralOnlyEdits(t *testing.T) {
 		{"element-insert-empty", `<a></a><b></b>`, `<a></a><b></b><c></c>`},
 		{"element-insert-content-mid", `<a>x</a><b>y</b>`, `<a>x</a><c>z</c><b>y</b>`},
 		{"same-type-insert-after-ws", `<p>x</p> <p>x</p>`, `<p>x</p> <p>x</p><p>x</p>`},
-		{"same-type-insert-before-ws", `<p>x</p> <p>x</p>`, `<p>x</p><p>x</p> <p>x</p>`},
-		{"same-type-insert-between-ws", `<p>a</p> <p>b</p> <p>c</p>`, `<p>a</p> <p>b</p><p>x</p> <p>c</p>`},
-		{"same-type-remove-before-ws", `<p>x</p><p>x</p> <p>x</p>`, `<p>x</p> <p>x</p>`},
 		{"comment-add-before-ws", `<p>a</p> <p>b</p>`, `<p>a</p><!--n--> <p>b</p>`},
 		{"comment-remove-before-ws", `<p>a</p><!--n--> <p>b</p>`, `<p>a</p> <p>b</p>`},
 		{"raw-script-add-before-ws", `<p>a</p> <p>b</p>`, `<p>a</p><script>var x=1;</script> <p>b</p>`},
@@ -1757,7 +1908,6 @@ func TestWhitespaceFingerprintIgnoresStructuralOnlyEdits(t *testing.T) {
 		{"doctype-add-before-ws", `<p>a</p> <p>b</p>`, `<p>a</p><!doctype html> <p>b</p>`},
 		{"attr-change", `<p class="x">a</p> <p>b</p>`, `<p class="y">a</p> <p>b</p>`},
 		{"text-change-before-ws", `<p>a</p> <p>b</p>`, `<p>ZZZ</p> <p>b</p>`},
-		{"same-bytes-move-repeated-boundary", `<p>a</p> <p>b</p><p>c</p>`, `<p>a</p><p>b</p> <p>c</p>`},
 	}
 	for _, tc := range inert {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1955,31 +2105,30 @@ func TestBuildVersionDiffWhitespaceEditEmitsWhitespaceHunk(t *testing.T) {
 	}
 }
 
-// TestWhitespaceFingerprintStructuralInsertBeforeRunDoesNotShift pins the
-// final sign-off P1 repro A: prepending a whitespace-free element (a bare
-// <p>x</p> before an existing "</p> <p>" run) must NOT perturb the whitespace
-// fingerprint. The v3 fingerprint is the ordered sequence of non-empty
-// whitespace events; a whitespace-free insert adds no event, so the sequence is
-// unchanged. The structural insert surfaces through the ordinary line diff,
-// never as a spurious "[formatting whitespace changed]" hunk.
-func TestWhitespaceFingerprintStructuralInsertBeforeRunDoesNotShift(t *testing.T) {
+// A structural insert before a run may shift the positioned fingerprint, but
+// output must remain bounded to the single document marker plus the real edit.
+func TestWhitespaceFingerprintStructuralInsertBeforeRunStaysBounded(t *testing.T) {
 	before := `<p>x</p> <p>x</p>`
 	after := `<p>x</p><p>x</p> <p>x</p>`
 	fpBefore := wsDocFingerprintForSource(t, before)
 	fpAfter := wsDocFingerprintForSource(t, after)
-	if fpBefore != fpAfter {
-		t.Fatalf("pure structural insert before a whitespace run shifted the fingerprint: %q != %q", fpBefore, fpAfter)
+	if fpBefore == fpAfter {
+		t.Fatalf("positioned fingerprint ignored a shifted whitespace run: %q", fpBefore)
 	}
 	result, err := buildVersionDiff(1, 2, before, after)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if whitespaceMarkerChanged(result.CodeHunks) {
-		t.Fatalf("structural <p> insert fabricated a whitespace change:\n%s", hunksBody(result.CodeHunks))
-	}
 	// The structural insert itself must still surface (a real added element).
 	if len(result.Changes) == 0 && len(result.CodeHunks) == 0 {
 		t.Fatalf("structural <p> insert vanished entirely: changes=0 hunks=0")
+	}
+	total := 0
+	for _, hunk := range result.CodeHunks {
+		total += len(hunk.Lines)
+	}
+	if total > 20 {
+		t.Fatalf("structural insert produced %d hunk lines; want bounded output", total)
 	}
 	assertNoLeakedInternals(t, result.CodeHunks)
 }

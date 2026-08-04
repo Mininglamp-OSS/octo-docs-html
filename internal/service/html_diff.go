@@ -829,6 +829,7 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 			}
 			matches[beforeIndex] = afterIndex
 			used[afterIndex] = true
+			bounds.refreshParent(before, beforeNode.parent, matches)
 			break
 		}
 	}
@@ -856,6 +857,7 @@ func matchDiffNodes(before, after []htmlDiffNode) (map[int]int, error) {
 		if bestIndex >= 0 && bestScore >= 0.55 {
 			matches[beforeIndex] = bestIndex
 			used[bestIndex] = true
+			bounds.refreshParent(before, beforeNode.parent, matches)
 		}
 	}
 	return matches, nil
@@ -1365,7 +1367,16 @@ func newDiffSourceLine(kind, canonical, display string) diffSourceLine {
 
 func diffLineOps(oldLines, newLines []diffSourceLine) ([]diffLineOp, bool) {
 	const syncWindow = 64
+	const minSyncRun = 3
 	const maxLineComparisons = maxDiffInputLines * 128
+	oldCounts := make(map[string]int, len(oldLines))
+	newCounts := make(map[string]int, len(newLines))
+	for _, line := range oldLines {
+		oldCounts[line.identity]++
+	}
+	for _, line := range newLines {
+		newCounts[line.identity]++
+	}
 	ops := make([]diffLineOp, 0, len(oldLines)+len(newLines))
 	oldIndex, newIndex, comparisons := 0, 0, 0
 	for oldIndex < len(oldLines) || newIndex < len(newLines) {
@@ -1394,7 +1405,27 @@ func diffLineOps(oldLines, newLines []diffSourceLine) ([]diffLineOp, bool) {
 				if comparisons > maxLineComparisons {
 					return nil, false
 				}
-				if oldLines[candidateOld].identity == newLines[candidateNew].identity {
+				if oldLines[candidateOld].identity != newLines[candidateNew].identity {
+					continue
+				}
+				unique := oldCounts[oldLines[candidateOld].identity] == 1 && newCounts[newLines[candidateNew].identity] == 1
+				remainingOld := len(oldLines) - candidateOld
+				remainingNew := len(newLines) - candidateNew
+				requiredRun := min(minSyncRun, remainingOld, remainingNew)
+				run := 0
+				for run < requiredRun {
+					comparisons++
+					if comparisons > maxLineComparisons {
+						return nil, false
+					}
+					if oldLines[candidateOld+run].identity != newLines[candidateNew+run].identity {
+						break
+					}
+					run++
+				}
+				shortEOFSync := run == requiredRun && requiredRun < minSyncRun &&
+					candidateOld+run == len(oldLines) && candidateNew+run == len(newLines)
+				if unique || run == minSyncRun || shortEOFSync {
 					bestOld, bestNew = candidateOld, candidateNew
 					break
 				}
@@ -1420,35 +1451,16 @@ func diffLineOps(oldLines, newLines []diffSourceLine) ([]diffLineOp, bool) {
 // carry actual whitespace bytes (a whitespace-only run, or a content run with
 // leading/trailing whitespace). Gaps with no whitespace at all (two adjacent
 // boundaries, or a pure-content run) are NOT recorded and contribute no hash
-// bytes and no event index, so a purely structural edit that inserts or removes
-// elements/comments/raw blocks without touching any whitespace leaves the
-// fingerprint identical: structural change is reported by the regular tag/text
-// line diff, never as a spurious "[formatting whitespace changed]" hunk. The
-// fingerprint represents ONLY inter-token whitespace layout.
+// bytes and no event index. Each real event is located by the number of element
+// boundaries since the previous event, so relocating identical bytes changes
+// this single digest without adding per-event source lines.
 //
 // The digest is exactly the sequence of whitespace events in document order.
-// Each event contributes its document-order event index, the exact byte length
-// of its whitespace-layout signature, and those exact bytes. Deliberately absent
-// are any boundary tokens, occurrence counters, or leading/trailing anchors:
-// earlier attempts keyed each event to the surrounding element-boundary tag pair
-// plus an occurrence index (v2 leading, then trailing), but ANY structural
-// insert/removal that introduced (or deleted) another boundary of a shared tag
-// pair on the counted side of an event shifted that index and forged a spurious
-// whitespace change (a trailing index still shifts for an insert placed AFTER
-// the event; full structural invariance plus anchor-based move localization is
-// provably unachievable). Fingerprinting only the ordered whitespace-event byte
-// sequence makes ANY purely structural edit (insert/remove element, comment,
-// raw block, PI/doctype, attribute or text change) a no-op for the fingerprint,
-// regardless of where it sits relative to existing whitespace events, while a
-// real whitespace add/remove/byte change still alters the event sequence and is
-// detected.
-//
-// The accepted trade-off: whitespace whose exact bytes and document-order event
-// sequence are both unchanged but that "moved position" without changing the
-// event sequence is not distinguished by the fingerprint. Common visible moves
-// still surface through the per-slot inline/unknown source lines and the
-// structural line diff; this avoids an unbounded game of patching anchor false
-// positives.
+// Each event contributes its event index, boundary distance, exact byte length,
+// and exact signature bytes. Boundary tags and content are deliberately absent.
+// A structural element insertion can shift a distance and therefore cause the
+// one bounded formatting marker to change; this accepted false positive is the
+// cost of detecting same-byte relocation at any event count.
 //
 // It is built unconditionally for every document (never gated on a CSS
 // heuristic), so no external/dynamic style, preload, or script can double-blind
@@ -1462,8 +1474,8 @@ func diffLineOps(oldLines, newLines []diffSourceLine) ([]diffLineOp, bool) {
 //     gap. Consecutive text runs (rare; the scanner coalesces) concatenate.
 //   - boundary() closes the pending gap at an ELEMENT boundary: only if the
 //     pending gap carried actual whitespace does it fold one event into the
-//     digest (its document-order index and exact whitespace bytes); it then
-//     clears the pending gap. No anchor is kept.
+//     digest (its index, boundary distance, and exact whitespace bytes); it then
+//     clears the pending gap.
 //   - transparent() marks a comment/PI/doctype/raw-text emit: it is NOT an
 //     element boundary, so it neither closes the pending gap nor advances the
 //     event counter. Whitespace on either side of it stays in the pending gap
@@ -1476,20 +1488,21 @@ type wsFingerprint struct {
 	hasher  hash.Hash
 	frame   [8]byte
 	pending strings.Builder
-	// events counts how many whitespace events have been folded into the hash so
-	// far; it is each event's document-order index. Whitespace-free boundaries do
-	// not advance it, so structural inserts/removals never shift an event's index.
-	events uint64
+	// events is each whitespace event's document-order index. The boundary count
+	// locates that event without emitting a separate diff line per event.
+	events               uint64
+	boundariesSinceEvent uint64
 }
 
 func newWSFingerprint() *wsFingerprint {
 	fp := &wsFingerprint{hasher: sha256.New()}
 	// Domain-separate the stream so it can never coincide with any other digest.
-	// v3: ordered whitespace-event byte sequence (v2 anchor-keyed each gap by a
+	// v4: ordered whitespace events including their boundary distance. v3 stored
+	// only event bytes, so relocating identical events could collide. v2 anchor-keyed each gap by a
 	// surrounding element-boundary tag pair + occurrence index, which structural
 	// inserts on the counted side shifted; v1 framed every boundary by absolute
 	// slot).
-	fp.hasher.Write([]byte("odoc-ws-fingerprint-v3\x00"))
+	fp.hasher.Write([]byte("odoc-ws-fingerprint-v4\x00"))
 	return fp
 }
 
@@ -1515,11 +1528,15 @@ func (fp *wsFingerprint) boundary() {
 	fp.pending.Reset()
 	sig := whitespaceLayoutSignature(run)
 	if !signatureHasWhitespace(sig) {
+		fp.boundariesSinceEvent++
 		return
 	}
 	binary.BigEndian.PutUint64(fp.frame[0:8], fp.events)
 	_, _ = fp.hasher.Write(fp.frame[:8])
+	binary.BigEndian.PutUint64(fp.frame[0:8], fp.boundariesSinceEvent)
+	_, _ = fp.hasher.Write(fp.frame[:8])
 	fp.events++
+	fp.boundariesSinceEvent = 1
 	fp.writeField(sig)
 }
 
@@ -1734,11 +1751,13 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 	// layout so any whitespace-only change surfaces without adding a line per
 	// event (see wsFingerprint). It is built unconditionally so no unknown or
 	// dynamic CSS can double-blind a whitespace-layout change, and structural-only
-	// edits leave it identical. It is skipped only if the line budget is already
-	// exhausted. sum() closes the final trailing-edge boundary.
-	if len(lines) < maxDiffInputLines {
-		lines = append(lines, newWhitespaceFingerprintLine(fingerprint.sum()))
+	// edits can perturb its boundary positions by design. Hitting the line budget
+	// is an error rather than silently dropping this reserved record.
+	digest := fingerprint.sum()
+	if len(lines)+1 > maxDiffInputLines {
+		return nil, false
 	}
+	lines = append(lines, newWhitespaceFingerprintLine(digest))
 	return lines, true
 }
 
