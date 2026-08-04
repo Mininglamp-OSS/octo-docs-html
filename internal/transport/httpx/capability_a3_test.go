@@ -51,6 +51,17 @@ func (m *stubMirror) UpsertDirectGrant(_ context.Context, docID, uid string, rol
 	m.roles[docID+"|"+uid] = role
 	return nil
 }
+func (m *stubMirror) InsertDirectGrantIfAbsent(_ context.Context, docID, uid string, role int, grantedBy string) (bool, error) {
+	if m.roles == nil {
+		m.roles = map[string]int{}
+	}
+	if _, ok := m.roles[docID+"|"+uid]; ok {
+		return false, nil
+	}
+	m.writes = append(m.writes, stubMirrorWrite{op: "insert_if_absent", docID: docID, uid: uid, role: role, grantedBy: grantedBy})
+	m.roles[docID+"|"+uid] = role
+	return true, nil
+}
 func (m *stubMirror) DeleteGrant(_ context.Context, docID, uid string) error {
 	m.writes = append(m.writes, stubMirrorWrite{op: "delete", docID: docID, uid: uid})
 	delete(m.roles, docID+"|"+uid)

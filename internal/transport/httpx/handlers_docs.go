@@ -225,6 +225,10 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return err
 	}
+	cap, err := s.resolveCap(r, slug)
+	if err != nil {
+		return err
+	}
 	// Draft mode: the overlay shows a Publish affordance (promote) instead of
 	// Share/Fork. Version 0 signals "not yet a committed version".
 	html, err := core.InjectOverlayCfg(data.HTML, s.overlayJS, core.OverlayConfig{
@@ -241,6 +245,7 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return err
 	}
+	html = injectCapMarker(html, cap)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if r.Method == http.MethodHead {
 		w.WriteHeader(200)
@@ -250,8 +255,8 @@ func (s *Server) handleRenderDraft(w http.ResponseWriter, r *http.Request) error
 	return nil
 }
 
-// handleShare mints (or rotates) the per-doc share code and returns a coded read
-// URL. Author-only. POST /v1/docs/{slug}/share.
+// handleShare mints (or rotates) the per-doc read-only share code and returns a
+// coded read URL. Manage-only. POST /v1/docs/{slug}/share.
 func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) error {
 	slug, err := requireSlug(chi.URLParam(r, "slug"))
 	if err != nil {
@@ -272,7 +277,7 @@ func (s *Server) handleShare(w http.ResponseWriter, r *http.Request) error {
 }
 
 // handleRevokeShare clears the per-doc share code (existing links stop working).
-// Author-only. DELETE /v1/docs/{slug}/share.
+// Manage-only. DELETE /v1/docs/{slug}/share.
 func (s *Server) handleRevokeShare(w http.ResponseWriter, r *http.Request) error {
 	slug, err := requireSlug(chi.URLParam(r, "slug"))
 	if err != nil {
@@ -361,10 +366,9 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	// Is this viewer the author (write token via Bearer or cookie) or a reader
-	// (share code)? Both reach here through requireDocReadHTML, but only the author
-	// may mint/rotate a share code — so the overlay must hide the Share CTA from a
-	// reader (clicking it would 404). We carry the flag OUTSIDE core.OverlayConfig
+	// Carry the resolved capability OUTSIDE core.OverlayConfig so the overlay can
+	// hide every write affordance from read-only viewers. The server still
+	// re-authorizes every mutation.
 	// (which is byte-frozen) as a separate window.__ODOC_CAP__ marker.
 	cap, err := s.resolveCap(r, slug)
 	if err != nil {
@@ -393,7 +397,7 @@ func (s *Server) handleRender(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	html = injectCapMarker(html, cap == service.CapAuthor)
+	html = injectCapMarker(html, cap)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if r.Method == http.MethodHead {
 		w.WriteHeader(200)
@@ -422,11 +426,26 @@ func (s *Server) resolveVersionParam(ctx context.Context, slug, raw string) (int
 }
 
 // injectCapMarker adds window.__ODOC_CAP__ before the overlay script so the
-// overlay can gate author-only UI (the Share/mint-code button) without touching
-// the byte-frozen core.OverlayConfig. It is injected right before the overlay's
-// own <script> so it is defined when the overlay boots.
-func injectCapMarker(html string, isAuthor bool) string {
-	marker := `<script>window.__ODOC_CAP__ = {isAuthor: ` + strconv.FormatBool(isAuthor) + `};</script>`
+// overlay can gate role-scoped UI (comment composer, "let AI process", member
+// management, delete) without touching the byte-frozen core.OverlayConfig. It is
+// injected right before the overlay's own <script> so it is defined when the
+// overlay boots. The marker is a UX hint ONLY — every write is re-authorized
+// server-side. isAuthor means the creator/admin management identity; writers
+// use canEdit but must not inherit manager/author UI.
+func injectCapMarker(html string, cap service.Capability) string {
+	role := capRoleLabel(cap)
+	canRead := cap.AtLeast(service.CapRead)
+	canComment := cap.AtLeast(service.CapComment)
+	canEdit := cap.AtLeast(service.CapEdit)
+	canManage := cap.AtLeast(service.CapManage)
+	marker := `<script>window.__ODOC_CAP__ = {` +
+		`role: ` + strconv.Quote(role) + `, ` +
+		`canRead: ` + strconv.FormatBool(canRead) + `, ` +
+		`canComment: ` + strconv.FormatBool(canComment) + `, ` +
+		`canEdit: ` + strconv.FormatBool(canEdit) + `, ` +
+		`canManage: ` + strconv.FormatBool(canManage) + `, ` +
+		`isAuthor: ` + strconv.FormatBool(canManage) +
+		`};</script>`
 	// The overlay boot is the last "<script>" InjectOverlayCfg wrote; place the
 	// marker before the window.__ODOC__ config script so both precede the overlay.
 	const anchor = "<script>window.__ODOC__ = "
@@ -434,6 +453,23 @@ func injectCapMarker(html string, isAuthor bool) string {
 		return html[:i] + marker + "\n" + html[i:]
 	}
 	return html + marker
+}
+
+// capRoleLabel maps a capability to the HTML UI role label the overlay/Web
+// expect. writer is the internal name; the UI renders it as "可编辑".
+func capRoleLabel(cap service.Capability) string {
+	switch {
+	case cap.AtLeast(service.CapManage):
+		return "admin"
+	case cap.AtLeast(service.CapEdit):
+		return "writer"
+	case cap.AtLeast(service.CapComment):
+		return "commenter"
+	case cap.AtLeast(service.CapRead):
+		return "reader"
+	default:
+		return "none"
+	}
 }
 
 func (s *Server) handleForkExport(w http.ResponseWriter, r *http.Request) error {

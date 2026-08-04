@@ -16,7 +16,7 @@ import (
 //   - author = the doc's creator uid matched (real user Login, or bot OwnerUID),
 //     or an octo superAdmin. Full access.
 //   - reader = a valid per-doc share code (Bearer, cookie, or ?code=). Read
-//     published versions + comment/react. Never drafts/publish/promote/delete.
+//     published versions and comments only; never write or access drafts.
 //   - none   → 404 (never confirm the doc exists).
 //
 // Browsers carry the code as ?code= on the first hit, which is exchanged for an
@@ -96,8 +96,8 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 	}
 	sess := octoSessionFromCtx(r.Context())
 	if sess != nil && s.auth.IsOwner(sess) {
-		if service.CapAuthor > best {
-			best = service.CapAuthor
+		if service.CapManage > best {
+			best = service.CapManage
 		}
 		return best, nil
 	}
@@ -137,8 +137,8 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 			creator := meta.CreatorUID()
 			// ① self-uid == creator_uid.
 			if creator != "" && selfUID != "" && creator == selfUID {
-				if service.CapAuthor > best {
-					best = service.CapAuthor
+				if service.CapManage > best {
+					best = service.CapManage
 				}
 				return best, nil
 			}
@@ -174,50 +174,60 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 				hit = true
 			}
 			if hit {
-				if service.CapAuthor > best {
-					best = service.CapAuthor
+				if service.CapManage > best {
+					best = service.CapManage
 				}
 				return best, nil
 			}
 		}
 	}
-	// Plan③ A4 reader tier: doc_member row with role >= reader → CapReader.
-	// Consumes selfUID so a bot forwarding-granted as a direct reader (rare
-	// but supported) still reads; the bot's owner reads bot-authored docs via
-	// A3② already, so keying reader on selfUID here does not hide docs from
-	// owners. When no mirror is wired, fall back to the pre-plan③ meta.grants
-	// path (still owner-preferring via matchUID) so single-node deploys and
-	// in-memory tests keep working.
-	if best < service.CapReader {
-		hit := false
+	// Plan③ A4 member tier: a doc_member row maps to its capability via
+	// CapabilityForDocRole (reader→Read, commenter→Comment, writer→Edit,
+	// admin→Manage). This replaces the old coarse role>=reader⇒CapReader mapping
+	// so a commenter/writer member is not flattened to read-only. Consumes
+	// selfUID so a directly-granted bot still resolves; the bot's owner reads
+	// bot-authored docs via A3② already.
+	if best < service.CapManage {
 		fallbackAllowed := true
 		if s.auth.DocMembersWired() && selfUID != "" {
 			role, ok, docRegistered, err := s.auth.RoleBySlugUID(r.Context(), slug, selfUID)
 			if err != nil {
 				return service.CapNone, err
 			}
-			if ok && role >= service.DocMemberRoleReader {
-				hit = true
+			if ok {
+				if c := service.CapabilityForDocRole(role); c > best {
+					best = c
+				}
 			}
-			// Registered doc + no reader row must not fall back to
-			// meta.GrantRole. Otherwise a stale meta.grants
-			// entry left after M2 (M2 copies, does not delete) or after a
-			// revoke would still grant read = revoke bypass.
+			// Registered doc + no member row must not fall back to
+			// meta.GrantRole. Otherwise a stale meta.grants entry left after M2
+			// (M2 copies, does not delete) or after a revoke would still grant
+			// access = revoke bypass. This no-stale-fallback invariant is
+			// load-bearing; do not relax it.
 			if docRegistered {
 				fallbackAllowed = false
 			}
 		}
-		if !hit && fallbackAllowed && matchUID != "" {
+		// Legacy meta.grants can carry reader/commenter/writer in unwired mode,
+		// so probe while best is still below the writer ceiling (CapEdit) rather
+		// than below CapRead: a commenter/writer grant may legitimately upgrade a
+		// caller who already holds CapRead from another tier (e.g. a share code).
+		if best < service.CapEdit && fallbackAllowed && matchUID != "" {
 			meta, err := s.auth.MetaFor(r.Context(), slug)
 			if err != nil {
 				return service.CapNone, err
 			}
-			if meta != nil && meta.GrantRole(matchUID) != "" { //nolint:staticcheck // A4 fallback covers the registration gap and unwired deployments
-				hit = true
+			// Legacy meta.grants is only consulted in unwired/single-node mode
+			// (registered docs force fallbackAllowed=false above). In that mode the
+			// same meta.grants store both grants and revokes, so there is no
+			// stale-grant revoke bypass, and the four-role vocabulary can be
+			// honoured: reader→Read, commenter→Comment, writer→Edit. Unknown
+			// labels map to CapNone (fail closed); admin is never authored here.
+			if meta != nil { //nolint:staticcheck // A4 fallback covers the registration gap and unwired deployments
+				if c := service.CapabilityForGrantRole(meta.GrantRole(matchUID)); c > best {
+					best = c
+				}
 			}
-		}
-		if hit {
-			best = service.CapReader
 		}
 	}
 	// FEAT-3 doc_binding probe (see method comment). Only kicks in when we
@@ -251,21 +261,17 @@ func (s *Server) bestCred(r *http.Request, slug string) (service.Capability, err
 }
 
 // capCtxKey stashes the resolved capability for handlers that branch on it.
-// requireDocReadHTML gates an HTML /d/ route: it resolves the capability for the
-// path {slug}, 404s on none, and — when the credential arrived as ?code= and is
-// valid — sets the HttpOnly capability cookie and 302-redirects to the same URL
-// without the query param (so the code leaves the address bar). Otherwise it
-// continues to the handler.
+// requireDocReadHTML gates an HTML /d/ route at CapRead (published page view).
 func (s *Server) requireDocReadHTML(next http.HandlerFunc) http.HandlerFunc {
-	return s.docHTMLGate(service.CapReader, next)
+	return s.docHTMLGate(service.CapRead, next)
 }
 
-// requireDocAuthorHTML is the author-only HTML gate (draft view). It uses the same
-// ?code= → cookie → 302 exchange, so the write token can arrive as ?code= in a
-// browser (e.g. opening the draft with ?code=<write-token>) and then ride as a
-// cookie — the only way a browser can present the author credential.
+// requireDocAuthorHTML gates the author-only HTML draft view. Draft is edit
+// content, so it now requires CapEdit (not the coarse manage tier): a writer
+// may open and iterate the draft, while readers/commenters get the hidden 404.
+// It uses the same ?code= → cookie → 302 exchange as the reader gate.
 func (s *Server) requireDocAuthorHTML(next http.HandlerFunc) http.HandlerFunc {
-	return s.docHTMLGate(service.CapAuthor, next)
+	return s.docHTMLGate(service.CapEdit, next)
 }
 
 // docHTMLGate resolves the capability for the path {slug}, requires at least min,
@@ -316,6 +322,32 @@ func (s *Server) docHTMLGate(min service.Capability, next http.HandlerFunc) http
 	}
 }
 
+// requireDocCapability resolves the capability for slug and returns a hidden-404
+// error when it is below min. It is the single body-slug guard the four
+// capability-specific helpers below delegate to (the slug is only known after a
+// handler decodes the body, so these cannot ride path-based middleware).
+func (s *Server) requireDocCapability(r *http.Request, slug string, min service.Capability) error {
+	cap, err := s.resolveCap(r, slug)
+	if err != nil {
+		return err
+	}
+	if !cap.AtLeast(min) {
+		// Hide existence + the op: same 404 the private gate returns.
+		return apperr.NotFound("Not found")
+	}
+	return nil
+}
+
+// requireDocCommentSlug requires CapComment (create/reply/react, own-comment edit).
+func (s *Server) requireDocCommentSlug(r *http.Request, slug string) error {
+	return s.requireDocCapability(r, slug, service.CapComment)
+}
+
+// requireDocEditSlug requires CapEdit (AI/draft/publish/thread moderation).
+func (s *Server) requireDocEditSlug(r *http.Request, slug string) error {
+	return s.requireDocCapability(r, slug, service.CapEdit)
+}
+
 // requireDocReadJSON gates a JSON read route whose slug is a path or query param
 // (versions, list-comments). No cookie/redirect — JSON clients (overlay via
 // cookie, CLI via Bearer) present the credential directly.
@@ -339,34 +371,41 @@ func (s *Server) requireDocReadJSON(slugFrom func(*http.Request) string, next ht
 	}
 }
 
-// requireDocCap resolves the capability for a body-slug mutation route (the slug
-// is only known after the handler parses the body). Handlers call this once they
-// have the slug; it returns a 404-worthy error on none. Returns nil when the
-// caller has at least reader access.
-func (s *Server) requireDocCap(r *http.Request, slug string) error {
-	cap, err := s.resolveCap(r, slug)
-	if err != nil {
-		return err
-	}
-	if cap == service.CapNone {
-		return apperr.NotFound("Not found")
-	}
-	return nil
+// requireDocEdit is the chi path-middleware edit-tier guard for routes whose
+// slug is in the path. It resolves {slug} and enforces CapEdit, returning a
+// hidden 404 below it.
+func (s *Server) requireDocEdit(next http.Handler) http.Handler {
+	return s.requirePathCapability(service.CapEdit, next)
 }
 
-// requireDocAuthorSlug enforces author capability for an explicit slug (used by
-// body-slug routes like /agent/* where the slug is only known after the handler
-// decodes the body, so it cannot ride path-based middleware). Returns a 404 on
-// anything less than author, hiding both existence and the op.
+// requirePathCapability is the shared body of the path-based capability
+// middlewares: resolve {slug}, require min, hidden-404 otherwise.
+func (s *Server) requirePathCapability(min service.Capability, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slug, err := requireSlug(chi.URLParam(r, "slug"))
+		if err != nil {
+			writeErr(w, s.logger, err)
+			return
+		}
+		cap, err := s.resolveCap(r, slug)
+		if err != nil {
+			writeErr(w, s.logger, err)
+			return
+		}
+		if !cap.AtLeast(min) {
+			writeErr(w, s.logger, apperr.NotFound("Not found"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireDocAuthorSlug enforces CapManage for an explicit slug (used by the
+// high-risk bulk comment wipe, where the slug arrives in the body/query so it
+// cannot ride path middleware). Returns a hidden 404 on anything less, hiding
+// both existence and the op.
 func (s *Server) requireDocAuthorSlug(r *http.Request, slug string) error {
-	cap, err := s.resolveCap(r, slug)
-	if err != nil {
-		return err
-	}
-	if cap != service.CapAuthor {
-		return apperr.NotFound("Not found")
-	}
-	return nil
+	return s.requireDocCapability(r, slug, service.CapManage)
 }
 
 // requireDocAuthorOrFirstCreate gates draft-first mutations (draft save/promote)
@@ -408,15 +447,15 @@ func (s *Server) requireDocAuthorOrFirstCreate(next http.Handler) http.Handler {
 			writeErr(w, s.logger, apperr.NotFound("Not found"))
 			return
 		}
-		// Doc already owned (or existing creator-less content) → strict author-only
-		// (same as requireDocAuthor). A creator-less-but-existing doc can only be
-		// authored by the superAdmin override; nobody can claim it via /draft.
+		// Doc already owned (or existing creator-less content) → require CapEdit
+		// (draft save/promote is edit content). A creator-less-but-existing doc can
+		// only be edited by the superAdmin override; nobody can claim it via /draft.
 		cap, err := s.resolveCap(r, slug)
 		if err != nil {
 			writeErr(w, s.logger, err)
 			return
 		}
-		if cap != service.CapAuthor {
+		if !cap.AtLeast(service.CapEdit) {
 			writeErr(w, s.logger, apperr.NotFound("Not found"))
 			return
 		}
@@ -464,27 +503,10 @@ func hasWriteSession(ctx context.Context) bool {
 	return false
 }
 
-// requireDocAuthor is chi middleware for author-only mutations whose slug is in
-// the path (share, draft save/promote, delete). It accepts the author credential
-// via Bearer OR the per-doc cookie, so the overlay's Publish/Share buttons work
-// in a browser (cookie) as well as the CLI (Bearer).
-func (s *Server) requireDocAuthor(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		slug, err := requireSlug(chi.URLParam(r, "slug"))
-		if err != nil {
-			writeErr(w, s.logger, err)
-			return
-		}
-		cap, err := s.resolveCap(r, slug)
-		if err != nil {
-			writeErr(w, s.logger, err)
-			return
-		}
-		if cap != service.CapAuthor {
-			// A reader (or nobody) must not learn that author-only ops exist here.
-			writeErr(w, s.logger, apperr.NotFound("Not found"))
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+// requireDocManage is chi middleware for manage-only mutations whose slug is in
+// the path (share, delete, grants). It requires CapManage and accepts the
+// credential via Bearer OR the per-doc cookie, so the overlay's Share/member
+// buttons work in a browser (cookie) as well as the CLI (Bearer).
+func (s *Server) requireDocManage(next http.Handler) http.Handler {
+	return s.requirePathCapability(service.CapManage, next)
 }

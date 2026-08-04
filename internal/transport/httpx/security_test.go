@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/Mininglamp-OSS/octo-docs-html/assets"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/config"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/log"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
@@ -43,7 +44,7 @@ func newTestServerWithHealth(t *testing.T, check func() error) http.Handler {
 
 // TestDocsPrivateByDefault verifies every doc is private by default: a caller
 // with no credential gets 404 (existence hidden) on reads, the author (creator
-// uid via trust headers) gets through, and a valid share code grants read + comment.
+// uid via trust headers) gets through, and a valid share code grants read-only access.
 func TestDocsPrivateByDefault(t *testing.T) {
 	h := newTestServer(t, nil) // default cfg
 	auth := authorHdr()
@@ -81,7 +82,9 @@ func TestDocsPrivateByDefault(t *testing.T) {
 		t.Fatalf("share returned no code: %s", sh.Body.String())
 	}
 
-	// Reader (code as Bearer) reads published + can comment, but NOT the draft.
+	// Reader (code as Bearer) reads published + list-comments, but a share code is
+	// READ-ONLY: it can neither create comments nor read the draft (plan §1 — the
+	// share code always has read capability only, never comment).
 	codeAuth := map[string]string{"Authorization": "Bearer " + code}
 	if rec := do(t, h, http.MethodGet, "/d/doc/v/1", codeAuth, ""); rec.Code != http.StatusOK {
 		t.Errorf("reader render with code = %d; want 200", rec.Code)
@@ -92,8 +95,8 @@ func TestDocsPrivateByDefault(t *testing.T) {
 	cm := do(t, h, http.MethodPost, "/v1/comments",
 		map[string]string{"Authorization": "Bearer " + code, "Content-Type": "application/json"},
 		`{"slug":"doc","version":1,"text":"nice"}`)
-	if cm.Code != http.StatusOK {
-		t.Errorf("reader comment with code = %d; want 200: %s", cm.Code, cm.Body.String())
+	if cm.Code != http.StatusNotFound {
+		t.Errorf("reader comment with code = %d; want 404 (share code is read-only): %s", cm.Code, cm.Body.String())
 	}
 
 	// A wrong code is rejected (404) on read and comment.
@@ -236,8 +239,9 @@ func TestFreshCodeBeatsStaleCookie(t *testing.T) {
 }
 
 // TestRenderCapMarkerReflectsViewer asserts the render injects window.__ODOC_CAP__
-// with isAuthor true only for the write-token holder, so the overlay hides the
-// author-only Share (mint-code) button from a reader.
+// as the four-tier capability object. isAuthor follows canManage (not canEdit),
+// so a writer does not receive creator/admin management UI. The creator
+// resolves to manage (admin); a share-code reader gets read-only.
 func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	h := newTestServer(t, nil)
 	auth := authorHdr()
@@ -248,22 +252,72 @@ func TestRenderCapMarkerReflectsViewer(t *testing.T) {
 	_ = json.Unmarshal(sh.Body.Bytes(), &share)
 	code, _ := share["data"].(map[string]any)["code"].(string)
 
-	// Author (creator uid via trust header) → isAuthor: true.
+	// Author (creator uid via trust header) → manage tier: canManage/canEdit/
+	// canComment/canRead all true, role admin, isAuthor alias true.
 	rec := do(t, h, http.MethodGet, "/d/cap/v/1", authorHdrNoCT(), "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("author render = %d", rec.Code)
 	}
-	if !contains(rec.Body.String(), `window.__ODOC_CAP__ = {isAuthor: true}`) {
-		t.Error("author render should carry isAuthor: true")
+	body := rec.Body.String()
+	for _, want := range []string{`role: "admin"`, `canManage: true`, `canEdit: true`, `canComment: true`, `canRead: true`, `isAuthor: true`} {
+		if !contains(body, want) {
+			t.Errorf("author render marker missing %q: %s", want, body)
+		}
 	}
 
-	// Reader (share code cookie) → isAuthor: false.
+	// Reader (share code cookie) → read-only: role reader, only canRead true.
 	rec = do(t, h, http.MethodGet, "/d/cap/v/1", map[string]string{"Cookie": capCookie("cap", code)}, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("reader render = %d: %s", rec.Code, rec.Body.String())
 	}
-	if !contains(rec.Body.String(), `window.__ODOC_CAP__ = {isAuthor: false}`) {
-		t.Error("reader render should carry isAuthor: false (Share button hidden)")
+	body = rec.Body.String()
+	for _, want := range []string{`role: "reader"`, `canRead: true`, `canComment: false`, `canEdit: false`, `canManage: false`, `isAuthor: false`} {
+		if !contains(body, want) {
+			t.Errorf("reader render marker missing %q: %s", want, body)
+		}
+	}
+}
+
+func TestDraftRenderInjectsEditorCapabilityMarker(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, http.MethodPut, "/v1/docs/draft-cap/draft", authorHdr(),
+		`{"html":"<html><body><p>draft</p></body></html>"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save draft = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, h, http.MethodGet, "/d/draft-cap/draft", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("draft render = %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{`role: "admin"`, `canManage: true`, `canEdit: true`, `canComment: true`, `canRead: true`} {
+		if !contains(rec.Body.String(), want) {
+			t.Errorf("draft render marker missing %q: %s", want, rec.Body.String())
+		}
+	}
+}
+
+func TestCapMarkerWriterIsNotAuthorManager(t *testing.T) {
+	html := httpx.InjectCapMarkerForTest("<script>window.__ODOC__ = {};</script>", service.CapEdit)
+	for _, want := range []string{`role: "writer"`, `canEdit: true`, `canManage: false`, `isAuthor: false`} {
+		if !contains(html, want) {
+			t.Errorf("writer marker missing %q: %s", want, html)
+		}
+	}
+}
+
+func TestOverlayConsumesCommentCapability(t *testing.T) {
+	for _, want := range []string{
+		"window.__ODOC_CAP__.canComment",
+		"if (!canComment) return; // read-only: no new comments",
+		"canComment ? renderReactInline",
+		"canComment ? `<span class=\"odoc-reply-toggle\"",
+		"canComment ? `<div class=\"odoc-reply-form\"",
+		"canComment ? `<div class=\"odoc-anchor-actions\"",
+	} {
+		if !contains(assets.OverlayJS, want) {
+			t.Errorf("overlay missing read-only capability gate %q", want)
+		}
 	}
 }
 

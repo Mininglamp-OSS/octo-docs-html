@@ -12,6 +12,7 @@ package service_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"testing"
 
@@ -31,7 +32,7 @@ func setupDocMemberMirrorTables(t *testing.T, db *sql.DB) {
 		"DROP TABLE IF EXISTS doc_meta",
 		`CREATE TABLE doc_meta (
 			doc_id VARCHAR(64) PRIMARY KEY,
-			octree_doc_slug VARCHAR(255),
+			octo_doc_slug VARCHAR(255),
 			permission_epoch BIGINT NOT NULL DEFAULT 0,
 			status INT NOT NULL DEFAULT 1
 		)`,
@@ -40,7 +41,11 @@ func setupDocMemberMirrorTables(t *testing.T, db *sql.DB) {
 			uid VARCHAR(128),
 			role INT NOT NULL,
 			granted_by VARCHAR(128),
-			PRIMARY KEY (doc_id, uid)
+			source INT NOT NULL DEFAULT 1,
+			invite_token VARCHAR(128) NOT NULL DEFAULT '',
+			PRIMARY KEY (doc_id, uid),
+			CONSTRAINT fk_doc_member_doc FOREIGN KEY (doc_id)
+				REFERENCES doc_meta (doc_id)
 		)`,
 	}
 	for _, q := range stmts {
@@ -154,5 +159,114 @@ func TestDeleteGrantAdminGuardTripsNoEpochBump(t *testing.T) {
 	after := currentEpoch(t, db, docID)
 	if after != before {
 		t.Fatalf("guard-tripped DeleteGrant bumped epoch: %d -> %d", before, after)
+	}
+}
+
+// InsertDirectGrantIfAbsent: a fresh row inserts, reports inserted=true, and
+// bumps the epoch exactly once.
+func TestInsertIfAbsentInsertsAndBumpsEpoch(t *testing.T) {
+	db := mysqlMirrorTestDB(t)
+	mirror := service.NewMySQLDocMemberMirror(db)
+	docID := "docIfAbsentNew"
+	before := seedEpoch(t, db, docID, 2)
+	inserted, err := mirror.InsertDirectGrantIfAbsent(context.Background(), docID, "reader-1", service.DocMemberRoleReader, "reconcile")
+	if err != nil || !inserted {
+		t.Fatalf("insert-if-absent(new) = (%v,%v); want (true,nil)", inserted, err)
+	}
+	if after := currentEpoch(t, db, docID); after != before+1 {
+		t.Fatalf("insert epoch: %d -> %d; want +1", before, after)
+	}
+}
+
+// InsertDirectGrantIfAbsent must NEVER overwrite an existing row and must NOT
+// bump the epoch when a row already exists (any role) — the P1 race guard: a
+// concurrent authoritative writer/commenter is preserved.
+func TestInsertIfAbsentNeverOverwritesOrBumps(t *testing.T) {
+	db := mysqlMirrorTestDB(t)
+	mirror := service.NewMySQLDocMemberMirror(db)
+	docID := "docIfAbsentExisting"
+	before := seedEpoch(t, db, docID, 5)
+	if _, err := db.ExecContext(context.Background(),
+		"INSERT INTO doc_member (doc_id, uid, role, granted_by) VALUES (?, ?, ?, ?)",
+		docID, "user-1", service.DocMemberRoleWriter, "direct"); err != nil {
+		t.Fatalf("seed writer: %v", err)
+	}
+	inserted, err := mirror.InsertDirectGrantIfAbsent(context.Background(), docID, "user-1", service.DocMemberRoleReader, "reconcile")
+	if err != nil {
+		t.Fatalf("insert-if-absent(existing) err = %v", err)
+	}
+	if inserted {
+		t.Fatalf("inserted=true for existing row; must be false (no overwrite)")
+	}
+	var role int
+	if err := db.QueryRowContext(context.Background(),
+		"SELECT role FROM doc_member WHERE doc_id=? AND uid=?", docID, "user-1").Scan(&role); err != nil {
+		t.Fatalf("read role: %v", err)
+	}
+	if role != service.DocMemberRoleWriter {
+		t.Fatalf("existing writer overwritten to %d; want writer preserved", role)
+	}
+	if after := currentEpoch(t, db, docID); after != before {
+		t.Fatalf("no-op insert-if-absent bumped epoch: %d -> %d", before, after)
+	}
+}
+
+// Non-duplicate insert failures must propagate so reconcile retains metadata.
+func TestInsertIfAbsentPropagatesForeignKeyError(t *testing.T) {
+	db := mysqlMirrorTestDB(t)
+	mirror := service.NewMySQLDocMemberMirror(db)
+
+	inserted, err := mirror.InsertDirectGrantIfAbsent(
+		context.Background(), "missing-doc", "reader-1", service.DocMemberRoleReader, "reconcile",
+	)
+	if err == nil {
+		t.Fatal("insert-if-absent(FK violation) err = nil; want non-duplicate error")
+	}
+	if inserted {
+		t.Fatal("insert-if-absent(FK violation) inserted = true; want false")
+	}
+}
+
+func TestRequireAppendRoleEncoding(t *testing.T) {
+	db := mysqlMirrorTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE docs_metadata (
+		meta_key VARCHAR(64) PRIMARY KEY, meta_value VARCHAR(64) NOT NULL)`); err != nil {
+		t.Fatalf("create marker table: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS docs_metadata") })
+
+	for _, tc := range []struct {
+		name, value string
+		ok          bool
+	}{
+		{name: "append contract", value: service.DocRoleEncodingAppendV1, ok: true},
+		{name: "ordered v2 rejected", value: "v2"},
+		{name: "unknown rejected", value: "future-v9"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := db.ExecContext(ctx, "DELETE FROM docs_metadata"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, "INSERT INTO docs_metadata(meta_key,meta_value) VALUES (?,?)", service.DocRoleEncodingKey, tc.value); err != nil {
+				t.Fatal(err)
+			}
+			err := service.RequireAppendRoleEncoding(ctx, db)
+			if tc.ok && err != nil {
+				t.Fatalf("append-v1 rejected: %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("unsafe encoding %q accepted", tc.value)
+			}
+		})
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM docs_metadata"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RequireAppendRoleEncoding(ctx, db); err == nil {
+		t.Fatal("missing marker accepted")
+	}
+	if err := service.RequireAppendRoleEncoding(ctx, nil); !errors.Is(err, service.ErrDocRoleEncodingUnverified) {
+		t.Fatalf("nil db error = %v; want ErrDocRoleEncodingUnverified", err)
 	}
 }

@@ -13,7 +13,7 @@ It exercises the full surface:
   saves a mutable draft; `POST /v1/docs/{slug}/draft/promote` freezes it as
   **v1**; iterate and promote again for **v2**, **v3**.
 - **Default-private + share codes** — a fresh doc is author-only;
-  `POST /v1/docs/{slug}/share` mints a read+comment `?code=` link anyone can open.
+  `POST /v1/docs/{slug}/share` mints a read-only `?code=` link anyone can open.
 - **Anchored comments that re-anchor across versions**, threaded replies, and
   **agent verdicts** (`applied` / `partial` / `question`), plus emoji reactions.
 - **Comment-driven editing** — v3 adds a section that answers a reviewer's
@@ -61,17 +61,17 @@ jq -n --rawfile html $D/index.v3.html '{html:$html}' \
   | curl -s "${AUTH[@]}" "${JSON[@]}" -X PUT -d @- "$BASE/v1/docs/octo-demo/draft"
 curl -s "${AUTH[@]}" -X POST "$BASE/v1/docs/octo-demo/draft/promote"   # → /d/octo-demo/v/3
 
-# 4) Share it — mint a read+comment link (the doc is private by default).
+# 4) Share it — mint a read-only link (the doc is private by default).
 curl -s "${AUTH[@]}" -X POST "$BASE/v1/docs/octo-demo/share"          # → { data: { code, url: ".../d/octo-demo/v/3?code=<code>" } }
 ```
 
 Open the printed `?code=` link in a browser: the code is exchanged for a cookie,
-the URL is cleaned, and the doc renders with the review overlay. Select any
-sentence to leave an anchored comment; open the version picker to compare v1/v2/v3.
+the URL is cleaned, and the doc renders read-only with existing review threads.
+Open the version picker to compare v1/v2/v3.
 
 To seed the review threads shown in the screenshots (a human comment + an agent
-`applied` reply + a 👍), post through the `/v1` API. The reader comment uses the
-share code as its credential; the author reply uses the write token.
+`applied` reply + a 👍), post through the `/v1` API. The comment and reaction use
+a commenter member's authenticated identity; the author reply uses the write token.
 
 Anchored comments are normally created in the browser overlay — selecting text
 computes the structured `anchor` object (aid + fingerprint + fallback) for you.
@@ -81,8 +81,9 @@ comment, as below:
 ```bash
 CODE=$(curl -s "${AUTH[@]}" -X POST "$BASE/v1/docs/octo-demo/share" | jq -r .data.code)
 
-# A reader comment (code = read+comment capability).
-CID=$(curl -s -H "Authorization: Bearer $CODE" "${JSON[@]}" \
+# A commenter-member comment. A share-code-only request would be rejected;
+# use that member's authenticated Octo session/forwarded identity here.
+CID=$(curl -s -H "Authorization: Bearer $MEMBER_TOKEN" "${JSON[@]}" \
   -d '{"slug":"octo-demo","version":3,
        "text":"Does the guarantee survive a full rewrite of the paragraph?"}' \
   "$BASE/v1/comments" | jq -r .data.id)
@@ -93,7 +94,7 @@ curl -s "${AUTH[@]}" "${JSON[@]}" \
        \"text\":\"Yes — v3's new \\\"What happens when the text is rewritten?\\\" section covers it.\"}" \
   "$BASE/v1/agent/replies"
 
-# React with a 👍 (reader capability).
+# React with a 👍 (commenter capability).
 curl -s -H "Authorization: Bearer $CODE" "${JSON[@]}" \
   -d "{\"slug\":\"octo-demo\",\"comment_id\":\"$CID\",\"emoji\":\"👍\",\"version\":3}" \
   "$BASE/v1/reactions"

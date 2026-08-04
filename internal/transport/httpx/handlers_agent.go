@@ -22,7 +22,7 @@ func (s *Server) handleAgentReply(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
-	if err := s.requireDocAuthorSlug(r, slug); err != nil {
+	if err := s.requireDocEditSlug(r, slug); err != nil {
 		return err
 	}
 	if body.ParentID == "" || body.Text == "" {
