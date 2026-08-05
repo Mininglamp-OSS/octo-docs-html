@@ -225,6 +225,37 @@ func TestStructuralDigestIgnoresBlockSiblingIndentation(t *testing.T) {
 	}
 }
 
+func TestBuildVersionDiffPreservesWhitespaceInsideChildlessInlineElement(t *testing.T) {
+	inlineCases := []struct {
+		name          string
+		before, after string
+	}{
+		{"span", `<p>x<span></span>y</p>`, `<p>x<span> </span>y</p>`},
+		{"bold", `<p>x<b></b>y</p>`, `<p>x<b> </b>y</p>`},
+		{"anchor", `<p>x<a href="#"></a>y</p>`, `<p>x<a href="#"> </a>y</p>`},
+		{"em_newline", `<p>x<em></em>y</p>`, "<p>x<em>\n</em>y</p>"},
+	}
+	for _, test := range inlineCases {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) != 1 || result.Summary.Modified != 1 {
+				t.Fatalf("visible inline whitespace change was lost: %+v", result)
+			}
+		})
+	}
+
+	result, err := buildVersionDiff(1, 2, `<section><div></div></section>`, `<section><div> </div></section>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) != 0 || result.Summary.Modified != 0 {
+		t.Fatalf("block-only formatting whitespace became structural: %+v", result)
+	}
+}
+
 func TestBuildVersionDiffPrettyPrintedDocumentsStayBounded(t *testing.T) {
 	var source strings.Builder
 	source.WriteString("<main>\n")

@@ -37,7 +37,7 @@ const (
 	maxDiffOpeningBytes = 1024
 	maxDiffOutputBytes  = 512 << 10
 	diffContextLines    = 3
-	diffLineTimeout     = 500 * time.Millisecond
+	diffLineTimeout     = 50 * time.Millisecond
 )
 
 // VersionDiff is a bounded structural and source-level comparison of two HTML versions.
@@ -670,10 +670,10 @@ func diffSlotWhitespaceVisible(node htmlDiffNode, slot int) bool {
 }
 
 // diffBoundarySideIsBlock reports whether the child at childPos is block-level.
-// An out-of-range position denotes the parent's own edge, which is block-like.
+// An out-of-range position denotes the parent's own edge.
 func diffBoundarySideIsBlock(node htmlDiffNode, childPos int) bool {
 	if childPos < 0 || childPos >= len(node.children) {
-		return true
+		return isBlockLevelDiffTag(node.tag)
 	}
 	return isBlockLevelDiffTag(node.childTags[childPos])
 }
@@ -1387,7 +1387,7 @@ func diffLineOps(oldLines, newLines []diffSourceLine) ([]diffLineOp, bool) {
 	ops := make([]diffLineOp, 0, len(oldLines)+len(newLines))
 	oldIndex, newIndex := 0, 0
 	for _, diff := range diffs {
-		for _, token := range []rune(diff.Text) {
+		for _, token := range diff.Text {
 			if int(token) >= len(tokenLines) {
 				return nil, false
 			}
