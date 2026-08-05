@@ -524,6 +524,65 @@ func TestLineDiffResyncsAfterSingleParagraphInsert(t *testing.T) {
 	}
 }
 
+func TestLineDiffAllParagraphTextSubstitutionsStayBounded(t *testing.T) {
+	var before, after strings.Builder
+	for i := range 338 {
+		fmt.Fprintf(&before, "<p>before %d</p>\n", i)
+		fmt.Fprintf(&after, "<p>after %d</p>\n", i)
+	}
+	result, err := buildVersionDiff(1, 2, before.String(), after.String())
+	if err != nil {
+		t.Fatalf("all-text substitution returned 413: %v", err)
+	}
+	if len(result.CodeHunks) != 1 {
+		t.Fatalf("code hunks = %d; want 1", len(result.CodeHunks))
+	}
+	if got := len(result.CodeHunks[0].Lines); got >= 1500 {
+		t.Fatalf("all-text substitution produced %d lines", got)
+	}
+}
+
+func TestDiffLineOpsMyersCases(t *testing.T) {
+	tests := []struct {
+		name, wantKinds    string
+		oldLines, newLines []string
+	}{
+		{"repeated lines", " +  ", []string{"q", "q", "q"}, []string{"q", "insert", "q", "q"}},
+		{"single insertion", "  + ", []string{"a", "b", "c"}, []string{"a", "b", "x", "c"}},
+		{"asymmetric eof", "  --", []string{"a", "b", "c", "d"}, []string{"a", "b"}},
+		{"short eof", "+ ", []string{"q"}, []string{"insert", "q"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ops, ok := diffLineOps(diffTestLines(tc.oldLines...), diffTestLines(tc.newLines...))
+			if !ok {
+				t.Fatal("diffLineOps rejected bounded input")
+			}
+			if got := diffOpKinds(ops); got != tc.wantKinds {
+				t.Fatalf("operation kinds = %q; want %q", got, tc.wantKinds)
+			}
+		})
+	}
+}
+
+func TestDiffLineOpsDeterministic(t *testing.T) {
+	oldLines := diffTestLines("a", "q", "q", "old", "q", "z")
+	newLines := diffTestLines("a", "q", "new", "q", "q", "z")
+	var first string
+	for run := range 100 {
+		ops, ok := diffLineOps(oldLines, newLines)
+		if !ok {
+			t.Fatalf("run %d rejected bounded input", run)
+		}
+		got := diffOpKinds(ops)
+		if run == 0 {
+			first = got
+		} else if got != first {
+			t.Fatalf("run %d = %q; first = %q", run, got, first)
+		}
+	}
+}
+
 func TestDiffLineOpsResyncsRepeatedSuffixAtEOF(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -547,24 +606,30 @@ func TestDiffLineOpsResyncsRepeatedSuffixAtEOF(t *testing.T) {
 	}
 }
 
-func TestDiffLineOpsDoesNotResyncSingleRepeatedLineBeforeEOF(t *testing.T) {
+func TestDiffLineOpsFindsShortestRepeatedLineAlignment(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		oldLines []string
-		newLines []string
+		name, wantKinds    string
+		oldLines, newLines []string
 	}{
-		{"both-have-tail", []string{"q", "old", "q"}, []string{"insert", "q", "new", "q"}},
-		{"old-ends-amid-repeats", []string{"q", "q"}, []string{"insert", "q", "tail", "q"}},
+		{"both-have-tail", "+ -+ ", []string{"q", "old", "q"}, []string{"insert", "q", "new", "q"}},
+		{"old-ends-amid-repeats", "+ + ", []string{"q", "q"}, []string{"insert", "q", "tail", "q"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ops, ok := diffLineOps(diffTestLines(tc.oldLines...), diffTestLines(tc.newLines...))
 			if !ok {
 				t.Fatal("diffLineOps rejected bounded input")
 			}
-			if len(ops) < 2 || ops[0].kind == ' ' || ops[1].kind == ' ' {
-				t.Fatalf("single middle repeat was used as a sync point: %q", diffOpKinds(ops))
+			if got := diffOpKinds(ops); got != tc.wantKinds {
+				t.Fatalf("operation kinds = %q; want %q", got, tc.wantKinds)
 			}
 		})
+	}
+}
+
+func TestDiffLineOpsRejectsOversizedInput(t *testing.T) {
+	lines := make([]diffSourceLine, maxDiffInputLines+1)
+	if _, ok := diffLineOps(lines, nil); ok {
+		t.Fatal("diffLineOps accepted oversized input")
 	}
 }
 

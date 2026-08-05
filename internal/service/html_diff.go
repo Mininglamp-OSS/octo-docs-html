@@ -12,7 +12,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
+
+	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
 var errDiffLimit = errors.New("diff complexity limit exceeded")
@@ -34,6 +37,7 @@ const (
 	maxDiffOpeningBytes = 1024
 	maxDiffOutputBytes  = 512 << 10
 	diffContextLines    = 3
+	diffLineTimeout     = 500 * time.Millisecond
 )
 
 // VersionDiff is a bounded structural and source-level comparison of two HTML versions.
@@ -1366,84 +1370,63 @@ func newDiffSourceLine(kind, canonical, display string) diffSourceLine {
 }
 
 func diffLineOps(oldLines, newLines []diffSourceLine) ([]diffLineOp, bool) {
-	const syncWindow = 64
-	const minSyncRun = 3
-	const maxLineComparisons = maxDiffInputLines * 128
-	oldCounts := make(map[string]int, len(oldLines))
-	newCounts := make(map[string]int, len(newLines))
-	for _, line := range oldLines {
-		oldCounts[line.identity]++
+	if len(oldLines) > maxDiffInputLines || len(newLines) > maxDiffInputLines {
+		return nil, false
 	}
-	for _, line := range newLines {
-		newCounts[line.identity]++
-	}
+	oldText := diffIdentityText(oldLines)
+	newText := diffIdentityText(newLines)
+	dmp := diffmatchpatch.New()
+	// go-diff enforces DiffTimeout internally but does not report whether the
+	// deadline produced a coarse diff. Accept that valid result; elapsed wall
+	// time after return cannot distinguish a timeout from a scheduler pause.
+	// Input, hunk, and output limits below keep the public result bounded.
+	dmp.DiffTimeout = diffLineTimeout
+	oldTokens, newTokens, tokenLines := dmp.DiffLinesToRunes(oldText, newText)
+	diffs := dmp.DiffMainRunes(oldTokens, newTokens, false)
+
 	ops := make([]diffLineOp, 0, len(oldLines)+len(newLines))
-	oldIndex, newIndex, comparisons := 0, 0, 0
-	for oldIndex < len(oldLines) || newIndex < len(newLines) {
-		if oldIndex < len(oldLines) && newIndex < len(newLines) && oldLines[oldIndex].identity == newLines[newIndex].identity {
-			ops = append(ops, diffLineOp{kind: ' ', line: oldLines[oldIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
-			oldIndex++
-			newIndex++
-			continue
-		}
-		bestOld, bestNew := -1, -1
-		oldLimit, newLimit := oldIndex+syncWindow, newIndex+syncWindow
-		if oldLimit > len(oldLines) {
-			oldLimit = len(oldLines)
-		}
-		if newLimit > len(newLines) {
-			newLimit = len(newLines)
-		}
-		for distance := 1; distance < syncWindow*2 && bestOld < 0; distance++ {
-			for oldOffset := 0; oldOffset <= distance; oldOffset++ {
-				newOffset := distance - oldOffset
-				candidateOld, candidateNew := oldIndex+oldOffset, newIndex+newOffset
-				if candidateOld >= oldLimit || candidateNew >= newLimit {
-					continue
-				}
-				comparisons++
-				if comparisons > maxLineComparisons {
+	oldIndex, newIndex := 0, 0
+	for _, diff := range diffs {
+		for _, token := range []rune(diff.Text) {
+			if int(token) >= len(tokenLines) {
+				return nil, false
+			}
+			identity := strings.TrimSuffix(tokenLines[token], "\n")
+			switch diff.Type {
+			case diffmatchpatch.DiffEqual:
+				if oldIndex >= len(oldLines) || newIndex >= len(newLines) || oldLines[oldIndex].identity != identity || newLines[newIndex].identity != identity {
 					return nil, false
 				}
-				if oldLines[candidateOld].identity != newLines[candidateNew].identity {
-					continue
+				ops = append(ops, diffLineOp{kind: ' ', line: oldLines[oldIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
+				oldIndex++
+				newIndex++
+			case diffmatchpatch.DiffDelete:
+				if oldIndex >= len(oldLines) || oldLines[oldIndex].identity != identity {
+					return nil, false
 				}
-				unique := oldCounts[oldLines[candidateOld].identity] == 1 && newCounts[newLines[candidateNew].identity] == 1
-				remainingOld := len(oldLines) - candidateOld
-				remainingNew := len(newLines) - candidateNew
-				requiredRun := min(minSyncRun, remainingOld, remainingNew)
-				run := 0
-				for run < requiredRun {
-					comparisons++
-					if comparisons > maxLineComparisons {
-						return nil, false
-					}
-					if oldLines[candidateOld+run].identity != newLines[candidateNew+run].identity {
-						break
-					}
-					run++
+				ops = append(ops, diffLineOp{kind: '-', line: oldLines[oldIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
+				oldIndex++
+			case diffmatchpatch.DiffInsert:
+				if newIndex >= len(newLines) || newLines[newIndex].identity != identity {
+					return nil, false
 				}
-				shortEOFSync := run == requiredRun && requiredRun < minSyncRun &&
-					candidateOld+run == len(oldLines) && candidateNew+run == len(newLines)
-				if unique || run == minSyncRun || shortEOFSync {
-					bestOld, bestNew = candidateOld, candidateNew
-					break
-				}
+				ops = append(ops, diffLineOp{kind: '+', line: newLines[newIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
+				newIndex++
+			default:
+				return nil, false
 			}
 		}
-		if bestOld < 0 {
-			bestOld, bestNew = oldLimit, newLimit
-		}
-		for oldIndex < bestOld {
-			ops = append(ops, diffLineOp{kind: '-', line: oldLines[oldIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
-			oldIndex++
-		}
-		for newIndex < bestNew {
-			ops = append(ops, diffLineOp{kind: '+', line: newLines[newIndex], oldLine: oldIndex + 1, newLine: newIndex + 1})
-			newIndex++
-		}
 	}
-	return ops, true
+	return ops, oldIndex == len(oldLines) && newIndex == len(newLines)
+}
+
+func diffIdentityText(lines []diffSourceLine) string {
+	var text strings.Builder
+	for _, line := range lines {
+		text.WriteString(line.identity)
+		text.WriteByte('\n')
+	}
+	return text.String()
 }
 
 // wsFingerprint is a streaming, fixed-memory digest of a document's inter-tag
