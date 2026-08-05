@@ -112,7 +112,9 @@ func (s *AuthService) DocMembersWired() bool { return s.docMembers != nil }
 
 // RoleBySlugUID looks the caller's row up in doc_member for slug. Two-hop:
 // slug -> doc_id (via mirror) -> role. Callers use this for plan③ A3
-// owner-admin (role=3) short-circuit and A4 reader (role>=1) decisions.
+// owner-admin (role=admin) short-circuit and A4 member (any doc_member row)
+// decisions. Capability is derived via CapabilityForDocRole's explicit switch,
+// not by comparing the stored role integer.
 //
 // Two different states must not collapse into the same "ok=false", or a stale
 // meta.grants entry could restore access after a registered grant is revoked.

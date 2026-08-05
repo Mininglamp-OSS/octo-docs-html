@@ -839,7 +839,7 @@ func (s *DocService) afterPublished(parent context.Context, result *PublishResul
 	}
 	if s.reconcileFn != nil {
 		if reconcileErr := s.reconcileFn(ctx, result.Slug); reconcileErr != nil {
-			s.log().Debug("grant_reconcile_failed", "slug", result.Slug, "err", reconcileErr.Error())
+			s.log().Error("grant_reconcile_failed", "slug", result.Slug, "err", reconcileErr.Error())
 		}
 	}
 }
@@ -855,7 +855,7 @@ func (s *DocService) afterLegacyPublished(parent context.Context, result *Publis
 	}
 	if ctx.Err() == nil && s.reconcileFn != nil {
 		if err := s.reconcileFn(ctx, result.Slug); err != nil {
-			s.log().Debug("grant_reconcile_failed", "slug", result.Slug, "err", err.Error())
+			s.log().Error("grant_reconcile_failed", "slug", result.Slug, "err", err.Error())
 		}
 	}
 }

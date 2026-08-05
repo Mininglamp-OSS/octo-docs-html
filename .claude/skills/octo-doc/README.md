@@ -38,7 +38,7 @@ export OCTO_TOKEN="$(scripts/octo.sh bootstrap)"   # first run on a fresh server
 # author → save a draft → publish → share
 scripts/octo.sh draft   my-explainer ./doc.html "Compound interest, explained"
 scripts/octo.sh promote my-explainer               # → /d/my-explainer/v/1
-scripts/octo.sh share   my-explainer               # → a read + comment ?code= link
+scripts/octo.sh share   my-explainer               # → a read-only ?code= link
 ```
 
 See [SKILL.md](SKILL.md) for the full Create / Edit / Share workflow and

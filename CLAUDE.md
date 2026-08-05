@@ -91,8 +91,9 @@ built or released from this repo.
 
 ## Access control
 
-Documents are **private by default**: the write token is the author; a per-doc
-share **code** grants read+comment. Browsers carry the code as `?code=` → HttpOnly
+Documents are **private by default**: creator/admin manages; writer edits;
+commenter comments; reader and per-doc share **code** holders read. Browsers carry
+the code as `?code=` → HttpOnly
 cookie; agents/CLI send it as `Authorization: Bearer`. See `docs/AUTH.md`. The
 draft slot (`docs/<hash>/draft/…`, meta `Extra["share"]`) is author-only and never
 enters the immutable version numbering until `promote`.

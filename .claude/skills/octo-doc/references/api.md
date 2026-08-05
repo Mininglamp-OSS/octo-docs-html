@@ -23,7 +23,7 @@ Two credentials, both sent as `Authorization: Bearer <value>`:
 | Credential | Role | Can |
 | --- | --- | --- |
 | **write token** | **author** | everything: publish, draft, promote, delete, share, upload/delete assets, agent replies |
-| **share code** | **reader** | read published versions; comment; react |
+| **share code** | **reader** | read published versions and comments only |
 | _(none)_ | — | nothing → 404 |
 
 Browsers instead carry the share code as `?code=<code>` on a `/d/...` URL, which
@@ -108,7 +108,7 @@ snapshot:
 
 Note the wire field is **`created_at`** (the stored form is `created`).
 
-### `POST /v1/comments` — create a comment or reply (reader)
+### `POST /v1/comments` — create a comment or reply (commenter+)
 Body: `{slug, text, version?, anchor?, parent_id?}`.
 `version` accepts omitted / `null` / `0`, a positive number or quoted number, `vN`, or `latest`; explicit versions above the latest published version are rejected.
 - `anchor` binds a top-level comment (see `references/anchoring.md`); omit for a
@@ -122,12 +122,12 @@ Body: `{slug, parent_id, text, status?, applied_in?}` where `status` is
 `applied | partial | question`. Flips the parent comment's status and drops a
 status emoji (✅ / 🟡 / ❓).
 
-### `PATCH /v1/comments` — re-anchor (reader)
+### `PATCH /v1/comments` — re-anchor (commenter+)
 Body: `{slug, id, anchor, version?}`. `version` accepts the same forms as comment create. Resets an element comment onto a new anchor.
 
-### `DELETE /v1/comments?slug=<slug>&id=<id>&version=<n>` — soft-delete (reader)
+### `DELETE /v1/comments?slug=<slug>&id=<id>&version=<n>` — soft-delete (commenter+; own comment)
 
-### `POST /v1/reactions` — toggle a reaction (reader)
+### `POST /v1/reactions` — toggle a reaction (commenter+)
 Body: `{slug, comment_id, emoji, version?}`. `version` accepts the same forms as comment create. Reacting again with the same
 `(login, emoji)` toggles it off.
 

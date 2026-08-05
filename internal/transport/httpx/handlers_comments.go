@@ -239,9 +239,9 @@ func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		return err
 	}
-	// A comment requires at least a reader capability (the doc's share code) — or
-	// the author write token. Default-private: no credential → 404.
-	if err := s.requireDocCap(r, slug); err != nil {
+	// Creating/replying is a comment-tier write: require CapComment (share-code
+	// readers and unauthorized callers get the hidden 404). Default-private.
+	if err := s.requireDocCommentSlug(r, slug); err != nil {
 		return err
 	}
 	if body.Text == "" {
@@ -287,7 +287,7 @@ func (s *Server) handlePatchComment(w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
-	if err := s.requireDocCap(r, slug); err != nil {
+	if err := s.requireDocCommentSlug(r, slug); err != nil {
 		return err
 	}
 	if body.ID == "" || body.Anchor == nil {
@@ -297,7 +297,7 @@ func (s *Server) handlePatchComment(w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
-	if err := s.authorizeMutation(r, slug, body.ID, session); err != nil {
+	if err := s.authorizeOwnCommentMutation(r, slug, body.ID, session, service.CapManage); err != nil {
 		return err
 	}
 	actor := actorLogin(session)
@@ -325,10 +325,10 @@ func (s *Server) handleDeleteComment(w http.ResponseWriter, r *http.Request) err
 	if id == "" {
 		return apperr.Validation("slug and id required", "id_required")
 	}
-	if err := s.requireDocCap(r, slug); err != nil {
+	if err := s.requireDocCommentSlug(r, slug); err != nil {
 		return err
 	}
-	if err := s.authorizeMutation(r, slug, id, session); err != nil {
+	if err := s.authorizeOwnCommentMutation(r, slug, id, session, service.CapEdit); err != nil {
 		return err
 	}
 	version := parseVersionQuery(r.URL.Query().Get("version"))
@@ -361,7 +361,7 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := s.requireDocCap(r, slug); err != nil {
+	if err := s.requireDocCommentSlug(r, slug); err != nil {
 		return err
 	}
 	if body.CommentID == "" || body.Emoji == "" {
@@ -402,17 +402,32 @@ func (s *Server) wipeComments(w http.ResponseWriter, r *http.Request, slug strin
 	return nil
 }
 
-// authorizeMutation enforces author/owner permission on a comment mutation.
+// authorizeOwnCommentMutation gates a comment mutation to its author, with a
+// moderation escape at the caller-supplied moderationCap. soft-delete passes
+// CapEdit (writers may moderate); reanchor passes CapManage so an ordinary
+// writer cannot move another author's anchor.
 //
-// In anonymous mode (no login provider, no session) comments are unowned, so
-// there is nothing to enforce and the mutation is allowed — this matches the
-// upstream "local mode is unauthenticated" behavior. Once a future login
-// provider populates sessions, an authenticated viewer may only mutate their own
-// comments (or anything, if they are the owner). The seam is ready: it activates
-// the moment sessions start carrying a real identity.
-func (s *Server) authorizeMutation(r *http.Request, slug, id string, session *storage.Session) error {
+// Actor identity comes only from the trusted session. With a login provider a
+// nil session fails closed (403); a stand-alone local-dev deploy treats nil as
+// anonymous/unowned. Owner/superAdmin and callers at/above moderationCap may
+// act on any comment; otherwise the author login must match the session.
+func (s *Server) authorizeOwnCommentMutation(r *http.Request, slug, id string, session *storage.Session, moderationCap service.Capability) error {
 	if session == nil {
-		return nil // anonymous: unowned comments, nothing to authorize against
+		if s.auth.LoginEnabled() {
+			return apperr.Forbidden("authentication required", "auth_required")
+		}
+		return nil // local-dev anonymous: unowned comments
+	}
+	if s.auth.IsOwner(session) {
+		return nil
+	}
+	// Moderation escape at moderationCap.
+	cap, err := s.resolveCap(r, slug)
+	if err != nil {
+		return err
+	}
+	if cap.AtLeast(moderationCap) {
+		return nil
 	}
 	list, err := s.comments.Read(r.Context(), slug)
 	if err != nil {
@@ -421,9 +436,6 @@ func (s *Server) authorizeMutation(r *http.Request, slug, id string, session *st
 	author := findAuthorRecord(list, id)
 	if author == nil {
 		return apperr.Validation("not found", "not_found")
-	}
-	if s.auth.IsOwner(session) {
-		return nil
 	}
 	if author.Login != "" && author.Login == session.Login {
 		return nil

@@ -73,6 +73,23 @@ func (f *fakeDocMemberMirror) UpsertDirectGrant(_ context.Context, docID, uid st
 	return nil
 }
 
+func (f *fakeDocMemberMirror) InsertDirectGrantIfAbsent(_ context.Context, docID, uid string, role int, grantedBy string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, mirrorCall{op: "insert_if_absent", docID: docID, uid: uid, role: role, grantedBy: grantedBy})
+	if f.err != nil {
+		return false, f.err
+	}
+	if f.roles == nil {
+		f.roles = map[string]int{}
+	}
+	if _, ok := f.roles[uid]; ok {
+		return false, nil // row exists: never overwrite
+	}
+	f.roles[uid] = role
+	return true, nil
+}
+
 func (f *fakeDocMemberMirror) DeleteGrant(_ context.Context, docID, uid string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -119,6 +136,86 @@ func newGrantSvc(t *testing.T) (*service.AuthService, string) {
 	return service.NewAuthService(store, &config.Config{}, sluglock.NewMemory()), slug
 }
 
+// TestDocMemberRoleEncodingContract pins the doc_member.role integer encoding to
+// the docs-backend's values (reader=1, writer=2, admin=3, commenter=4). These
+// are a same-database wire contract with docs-backend: a mismatch silently
+// grants the wrong capability. Kept separate from the capability mapping below
+// so a swap of either the numbers or the mapping is caught independently.
+func TestDocMemberRoleEncodingContract(t *testing.T) {
+	cases := []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"reader", service.DocMemberRoleReader, 1},
+		{"writer", service.DocMemberRoleWriter, 2},
+		{"admin", service.DocMemberRoleAdmin, 3},
+		{"commenter", service.DocMemberRoleCommenter, 4},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Fatalf("DocMemberRole%s = %d; want %d (docs-backend encoding)", c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestCapabilityForDocRoleMapping pins the role→capability mapping. Capability
+// order (None<Read<Comment<Edit<Manage) is derived only via this explicit
+// switch, never by comparing the stored role integer — so the non-monotonic
+// encoding (admin=3 < commenter=4) still yields Manage>Comment.
+func TestCapabilityForDocRoleMapping(t *testing.T) {
+	cases := []struct {
+		role int
+		want service.Capability
+	}{
+		{service.DocMemberRoleReader, service.CapRead},
+		{service.DocMemberRoleCommenter, service.CapComment},
+		{service.DocMemberRoleWriter, service.CapEdit},
+		{service.DocMemberRoleAdmin, service.CapManage},
+		{0, service.CapNone},
+		{-1, service.CapNone},
+		{99, service.CapNone},
+	}
+	for _, c := range cases {
+		if got := service.CapabilityForDocRole(c.role); got != c.want {
+			t.Fatalf("CapabilityForDocRole(%d) = %v; want %v", c.role, got, c.want)
+		}
+	}
+	// Explicit non-monotonic guard: admin (3) outranks commenter (4) in
+	// capability even though its encoded integer is smaller.
+	if !service.CapabilityForDocRole(service.DocMemberRoleAdmin).AtLeast(
+		service.CapabilityForDocRole(service.DocMemberRoleCommenter)) {
+		t.Fatalf("admin capability must be >= commenter regardless of numeric encoding")
+	}
+}
+
+// TestGrantRoleLabelCodeRoundTrip pins the label↔code mapping used by the HTML
+// /grants API through the public AddGrant→ListGrants path so every accepted
+// label round-trips back to the same label (staying 1:1 with the encoding).
+func TestGrantRoleLabelCodeRoundTrip(t *testing.T) {
+	for _, label := range []string{"reader", "commenter", "writer"} {
+		svc, slug := newGrantSvc(t)
+		if err := svc.AddGrant(context.Background(), slug, "u1", label, "owner"); err != nil {
+			t.Fatalf("AddGrant(%q): %v", label, err)
+		}
+		grants, err := svc.ListGrants(context.Background(), slug)
+		if err != nil {
+			t.Fatalf("ListGrants(%q): %v", label, err)
+		}
+		if grants["u1"] != label {
+			t.Fatalf("round-trip %q -> %q", label, grants["u1"])
+		}
+	}
+	// admin is never mintable via the grants API; an unknown label fails closed.
+	svc, slug := newGrantSvc(t)
+	if err := svc.AddGrant(context.Background(), slug, "u1", "admin", "owner"); err == nil {
+		t.Fatalf("AddGrant admin should be rejected")
+	}
+	if err := svc.AddGrant(context.Background(), slug, "u1", "bogus", "owner"); err == nil {
+		t.Fatalf("AddGrant unknown label should be rejected (fail closed)")
+	}
+}
+
 // GrantRole reads the per-uid role from Extra["grants"], nil-safe at every layer.
 func TestDocMetaGrantRole(t *testing.T) {
 	var nilMeta *storage.DocMeta
@@ -141,8 +238,9 @@ func TestDocMetaGrantRole(t *testing.T) {
 	}
 }
 
-// AddGrant upserts, ListGrants reads back, RemoveGrant is idempotent, and a
-// non-reader role is rejected.
+// AddGrant upserts, ListGrants reads back, RemoveGrant is idempotent. Grantable
+// roles are reader/commenter/writer; admin is rejected (never mintable via the
+// grants API), and an unknown role/empty uid is rejected.
 func TestGrantLifecycle(t *testing.T) {
 	svc, slug := newGrantSvc(t)
 	ctx := context.Background()
@@ -158,8 +256,22 @@ func TestGrantLifecycle(t *testing.T) {
 		t.Fatalf("grants[u1] = %q; want reader", grants["u1"])
 	}
 
-	if err := svc.AddGrant(ctx, slug, "u1", "writer", "owner"); err == nil {
-		t.Fatalf("AddGrant writer should be rejected")
+	// writer is now a grantable role (four-role redesign) and updates in place.
+	if err := svc.AddGrant(ctx, slug, "u1", "writer", "owner"); err != nil {
+		t.Fatalf("AddGrant writer should be accepted: %v", err)
+	}
+	grants, _ = svc.ListGrants(ctx, slug)
+	if grants["u1"] != "writer" {
+		t.Fatalf("grants[u1] after writer = %q; want writer", grants["u1"])
+	}
+
+	// admin may never be granted through this API.
+	if err := svc.AddGrant(ctx, slug, "u2", "admin", "owner"); err == nil {
+		t.Fatalf("AddGrant admin should be rejected")
+	}
+	// unknown role fails closed.
+	if err := svc.AddGrant(ctx, slug, "u2", "superuser", "owner"); err == nil {
+		t.Fatalf("AddGrant unknown role should be rejected")
 	}
 	if err := svc.AddGrant(ctx, slug, "", "reader", "owner"); err == nil {
 		t.Fatalf("AddGrant empty uid should be rejected")
@@ -561,6 +673,10 @@ func (unregisteredMirror) UpsertDirectGrant(context.Context, string, string, int
 	panic("unregisteredMirror.UpsertDirectGrant should not be called")
 }
 
+func (unregisteredMirror) InsertDirectGrantIfAbsent(context.Context, string, string, int, string) (bool, error) {
+	panic("unregisteredMirror.InsertDirectGrantIfAbsent should not be called")
+}
+
 func (unregisteredMirror) DeleteGrant(context.Context, string, string) error {
 	panic("unregisteredMirror.DeleteGrant should not be called")
 }
@@ -664,11 +780,13 @@ func TestReconcileMetaGrantsPromotesReaderIntoDocMember(t *testing.T) {
 	if mirror.roles["reader-5"] != service.DocMemberRoleReader {
 		t.Fatalf("reader-5 not promoted into doc_member: roles=%v", mirror.roles)
 	}
-	// meta.grants entry stays put so mirror-unwired deploys keep working.
+	// In wired/registered mode doc_member is authoritative: once the grant is
+	// migrated the consumed meta.grants entry is cleared so no later fallback
+	// transition can resurrect stale privilege.
 	meta, _ := store.GetMeta(context.Background(), slug)
-	grants, _ := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // asserting meta.grants left in place
-	if _, ok := grants["reader-5"]; !ok {
-		t.Fatalf("meta.grants[reader-5] must not be deleted; got %v", grants)
+	grants, _ := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // asserting meta.grants cleared after migration
+	if _, ok := grants["reader-5"]; ok {
+		t.Fatalf("meta.grants[reader-5] must be cleared after successful migration; got %v", grants)
 	}
 }
 
@@ -784,6 +902,133 @@ func TestRemoveGrantRegisteredBranchAlsoSweepsMeta(t *testing.T) {
 	}
 }
 
+// P1 (round-6): AddGrant on a registered doc must sweep any stale legacy
+// meta.grants[uid] left from an earlier unregistered/fallback write. Without
+// the sweep, a downgrade written to doc_member here could be reverted later:
+// an unmount/soft-delete flips DocIDBySlug back to ok=false and the A4 legacy
+// fallback revives the higher stale role. Symmetric with RemoveGrant's sweep.
+func TestAddGrantRegisteredBranchSweepsStaleMetaOnDowngrade(t *testing.T) {
+	store := memory.New()
+	slug := "docP1Add"
+	// Stale legacy meta.grants row (writer) + a live doc_member writer row: the
+	// M2-style double-write state an unregistered fallback earlier produced.
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{
+			storage.CreatorUIDExtraKey: "owner-1",
+			storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // seed stale double-write for P1 sweep
+				"member-7": map[string]any{"role": "writer"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-P1Add", roles: map[string]int{"member-7": service.DocMemberRoleWriter}}
+	svc.WithDocMemberMirror(mirror)
+
+	// Downgrade writer → reader through the registered doc_member path.
+	if err := svc.AddGrant(context.Background(), slug, "member-7", "reader", "owner"); err != nil {
+		t.Fatalf("AddGrant(downgrade): %v", err)
+	}
+	// doc_member now holds the downgraded reader role...
+	if got := mirror.roles["member-7"]; got != service.DocMemberRoleReader {
+		t.Fatalf("doc_member role after downgrade = %d; want reader(%d)", got, service.DocMemberRoleReader)
+	}
+	// ...and the stale higher-role meta.grants entry was swept, so a later
+	// unregistered fallback cannot revive writer.
+	meta, _ := store.GetMeta(context.Background(), slug)
+	grants, _ := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // asserting meta.grants swept
+	if _, still := grants["member-7"]; still {
+		t.Fatalf("meta.grants[member-7] not swept on registered AddGrant: %v", grants)
+	}
+}
+
+// P1 same-role regression: a registered member already holds the identical
+// current role in doc_member, but a STALE HIGHER legacy meta.grants[uid] row
+// lingers from an earlier unregistered/fallback write. AddGrant with the same
+// role must still sweep that stale meta entry under the slug lock so a later
+// unregistration (DocIDBySlug→ok=false) cannot revive the higher role via the
+// A4 legacy fallback. It must do so WITHOUT a doc_member write (no upsert call,
+// no permission_epoch bump) — preserving the no-op DB semantics of an unchanged
+// role. Before the fix AddGrant returned early on role==roleCode, skipping the
+// sweep entirely.
+func TestAddGrantRegisteredSameRoleStillSweepsStaleMeta(t *testing.T) {
+	store := memory.New()
+	slug := "docP1AddSame"
+	// Live doc_member reader row + a stale legacy meta.grants writer row for the
+	// same uid (an earlier fallback double-write that outranks the current role).
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{
+			storage.CreatorUIDExtraKey: "owner-1",
+			storage.GrantsExtraKey: map[string]any{ //nolint:staticcheck // seed stale higher legacy role for same-role P1 sweep
+				"member-9": map[string]any{"role": "writer"},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-P1AddSame", roles: map[string]int{"member-9": service.DocMemberRoleReader}}
+	svc.WithDocMemberMirror(mirror)
+
+	// Re-grant the SAME role (reader) the member already has.
+	if err := svc.AddGrant(context.Background(), slug, "member-9", "reader", "owner"); err != nil {
+		t.Fatalf("AddGrant(same role): %v", err)
+	}
+	// doc_member role is unchanged...
+	if got := mirror.roles["member-9"]; got != service.DocMemberRoleReader {
+		t.Fatalf("doc_member role after same-role AddGrant = %d; want reader(%d)", got, service.DocMemberRoleReader)
+	}
+	// ...and no doc_member write happened (no-op DB semantics: no epoch bump).
+	mirror.mu.Lock()
+	for _, c := range mirror.calls {
+		if c.op == "upsert" {
+			mirror.mu.Unlock()
+			t.Fatalf("same-role AddGrant issued an UpsertDirectGrant (%+v); want no-op, no epoch bump", c)
+		}
+	}
+	mirror.mu.Unlock()
+	// ...but the stale higher-role meta.grants entry WAS swept, so a later
+	// unregistration cannot revive writer over the unchanged reader.
+	meta, _ := store.GetMeta(context.Background(), slug)
+	grants, _ := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // asserting stale meta.grants swept on same-role path
+	if _, still := grants["member-9"]; still {
+		t.Fatalf("stale meta.grants[member-9] not swept on same-role AddGrant: %v", grants)
+	}
+}
+
+// The AddGrant sweep is safe/idempotent when there is nothing stale to clear:
+// a registered grant to a uid with no legacy meta.grants row succeeds and
+// leaves meta.grants absent (no spurious key, no error).
+func TestAddGrantRegisteredBranchSweepIdempotentOnAbsentMeta(t *testing.T) {
+	store := memory.New()
+	slug := "docP1AddIdem"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug: slug, Title: "T",
+		Extra: map[string]any{storage.CreatorUIDExtraKey: "owner-1"},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-P1AddIdem"}
+	svc.WithDocMemberMirror(mirror)
+
+	if err := svc.AddGrant(context.Background(), slug, "fresh-8", "commenter", "owner"); err != nil {
+		t.Fatalf("AddGrant(fresh): %v", err)
+	}
+	if got := mirror.roles["fresh-8"]; got != service.DocMemberRoleCommenter {
+		t.Fatalf("doc_member role = %d; want commenter(%d)", got, service.DocMemberRoleCommenter)
+	}
+	meta, _ := store.GetMeta(context.Background(), slug)
+	if _, has := meta.Extra[storage.GrantsExtraKey]; has { //nolint:staticcheck // asserting no stale key introduced
+		t.Fatalf("meta.grants unexpectedly present after clean AddGrant: %v", meta.Extra)
+	}
+}
+
 // Sweep is a no-op when meta.grants has nothing for uid (probe returns nil,
 // no permission_epoch bump). Guards against a doubled sweep after the
 // unregistered branch already ran removeGrantFromMeta itself.
@@ -883,6 +1128,9 @@ func (r *raceMirror) DocIDBySlug(context.Context, string) (string, bool, error) 
 }
 func (r *raceMirror) UpsertDirectGrant(context.Context, string, string, int, string) error {
 	panic("raceMirror.UpsertDirectGrant should not be called")
+}
+func (r *raceMirror) InsertDirectGrantIfAbsent(context.Context, string, string, int, string) (bool, error) {
+	panic("raceMirror.InsertDirectGrantIfAbsent should not be called")
 }
 func (r *raceMirror) DeleteGrant(context.Context, string, string) error {
 	if r.delRole == service.DocMemberRoleAdmin {
@@ -1024,5 +1272,197 @@ func TestReconcileMetaGrantsConcurrentRevokeNoResurrect(t *testing.T) {
 	// not appear in doc_member at the end.
 	if role, present := mirror.roles["reader-9"]; present {
 		t.Fatalf("concurrent reconcile resurrected revoked reader-9 (role=%d) — TOCTOU bug", role)
+	}
+}
+
+// lockObservingLocker wraps sluglock.Memory and records, per key, whether the
+// lock is currently held. The stale-pre-lock-probe regression asserts that
+// addGrantToDocMember's RoleByDocUID probe runs while the slug lock is held —
+// i.e. INSIDE s.lock.With, not before it. The buggy round-6 code probed before
+// locking, so this observer would report held=false at probe time and the test
+// fails; the fixed round-7 code probes inside the lock (held=true).
+type lockObservingLocker struct {
+	inner *sluglock.Memory
+	mu    sync.Mutex
+	held  map[string]bool
+}
+
+func newLockObservingLocker() *lockObservingLocker {
+	return &lockObservingLocker{inner: sluglock.NewMemory(), held: map[string]bool{}}
+}
+
+func (l *lockObservingLocker) With(ctx context.Context, key string, fn func() error) error {
+	return l.inner.With(ctx, key, func() error {
+		l.mu.Lock()
+		l.held[key] = true
+		l.mu.Unlock()
+		defer func() {
+			l.mu.Lock()
+			l.held[key] = false
+			l.mu.Unlock()
+		}()
+		return fn()
+	})
+}
+
+func (l *lockObservingLocker) isHeld(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.held[key]
+}
+
+// stalePreLockProbeMirror simulates the exact P1 (round-7) race: a concurrent
+// RemoveGrant that deleted the doc_member row in the window a pre-lock probe
+// left open. Its RoleByDocUID reports the row as a live reader the FIRST time
+// (the cached view a pre-lock probe would carry) and DELETES the row on that
+// same call — modelling the concurrent revoke landing at probe time. It also
+// records, via lockObservingLocker, whether the slug lock was held when the
+// probe ran: the buggy pre-lock probe runs unlocked (held=false), the fixed
+// in-lock probe runs locked (held=true). Every later probe sees the row gone.
+type stalePreLockProbeMirror struct {
+	mu          sync.Mutex
+	docID       string
+	roles       map[string]int
+	calls       []mirrorCall
+	probes      int
+	probeLocked []bool // lock-held state observed at each probe (in call order)
+	locker      *lockObservingLocker
+	slug        string
+	revokeUID   string
+	revokeOnce  bool
+}
+
+func (m *stalePreLockProbeMirror) DocIDBySlug(context.Context, string) (string, bool, error) {
+	return m.docID, true, nil
+}
+func (m *stalePreLockProbeMirror) UpsertDirectGrant(_ context.Context, docID, uid string, role int, grantedBy string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, mirrorCall{op: "upsert", docID: docID, uid: uid, role: role, grantedBy: grantedBy})
+	if m.roles == nil {
+		m.roles = map[string]int{}
+	}
+	m.roles[uid] = role
+	return nil
+}
+func (m *stalePreLockProbeMirror) InsertDirectGrantIfAbsent(context.Context, string, string, int, string) (bool, error) {
+	panic("stalePreLockProbeMirror.InsertDirectGrantIfAbsent should not be called")
+}
+func (m *stalePreLockProbeMirror) DeleteGrant(context.Context, string, string) error {
+	panic("stalePreLockProbeMirror.DeleteGrant should not be called")
+}
+func (m *stalePreLockProbeMirror) RoleByDocUID(_ context.Context, _, uid string) (int, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.probes++
+	m.probeLocked = append(m.probeLocked, m.locker.isHeld(m.slug))
+	role, ok := m.roles[uid]
+	// Simulate a concurrent RemoveGrant deleting the row at probe time: the
+	// row is present exactly once, then gone. A pre-lock probe caches this
+	// (present, reader) view; a correct in-lock probe is serialised behind the
+	// revoke by the slug lock and would never see it present here.
+	if uid == m.revokeUID && !m.revokeOnce {
+		m.revokeOnce = true
+		delete(m.roles, uid)
+	}
+	return role, ok, nil
+}
+func (m *stalePreLockProbeMirror) ListMembers(context.Context, string) ([]service.DocMember, error) {
+	return nil, nil
+}
+
+// P1 (round-7) regression: a stale pre-lock probe must not suppress a required
+// upsert. addGrantToDocMember probes RoleByDocUID and decides whether to skip
+// the doc_member write as "unchanged". If that probe runs BEFORE the slug lock,
+// a concurrent RemoveGrant can delete the row after the probe; AddGrant then
+// locks, honours the stale unchanged=true, skips UpsertDirectGrant, sweeps
+// meta, and returns success — dropping the grant the admin requested.
+//
+// This test proves the probe now runs INSIDE the slug lock. lockObservingLocker
+// records the lock-held state at probe time; the fix requires held=true. On the
+// buggy pre-lock code the probe ran unlocked (held=false) → the assertion below
+// fails, so this is a genuine regression guard, not just a happy-path check.
+func TestAddGrantStalePreLockProbeRunsUnderLock(t *testing.T) {
+	store := memory.New()
+	slug := "docP1StaleProbe"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{storage.CreatorUIDExtraKey: "owner-1"},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	locker := newLockObservingLocker()
+	svc := service.NewAuthService(store, &config.Config{}, locker)
+	mirror := &stalePreLockProbeMirror{
+		docID:     "doc-P1StaleProbe",
+		roles:     map[string]int{"member-11": service.DocMemberRoleReader},
+		locker:    locker,
+		slug:      slug,
+		revokeUID: "member-11",
+	}
+	svc.WithDocMemberMirror(mirror)
+
+	if err := svc.AddGrant(context.Background(), slug, "member-11", "reader", "owner"); err != nil {
+		t.Fatalf("AddGrant(raced same role): %v", err)
+	}
+
+	mirror.mu.Lock()
+	defer mirror.mu.Unlock()
+	if mirror.probes == 0 {
+		t.Fatalf("RoleByDocUID never probed")
+	}
+	// Every probe that drives the skip-upsert decision must run under the lock.
+	// The buggy pre-lock probe would record held=false here.
+	for i, held := range mirror.probeLocked {
+		if !held {
+			t.Fatalf("probe #%d ran WITHOUT the slug lock held — pre-lock probe TOCTOU (round-6 bug)", i)
+		}
+	}
+}
+
+// P1 (round-7) drop-guard: with the in-lock probe observing the row already
+// revoked (concurrent RemoveGrant committed first because the slug lock
+// serialised it before AddGrant), AddGrant must (re)write the requested grant
+// rather than skip it as "unchanged". Proves the grant is not silently dropped.
+func TestAddGrantAfterConcurrentRevokeRestoresGrant(t *testing.T) {
+	store := memory.New()
+	slug := "docP1AddRace"
+	if err := store.PutMeta(context.Background(), slug, storage.DocMeta{
+		Slug:  slug,
+		Title: "T",
+		Extra: map[string]any{storage.CreatorUIDExtraKey: "owner-1"},
+	}); err != nil {
+		t.Fatalf("seed PutMeta: %v", err)
+	}
+	svc := service.NewAuthService(store, &config.Config{}, sluglock.NewMemory())
+	mirror := &fakeDocMemberMirror{docID: "doc-P1AddRace", roles: map[string]int{"member-12": service.DocMemberRoleReader}}
+	svc.WithDocMemberMirror(mirror)
+
+	// Deterministic "revoke lands first" leg: fully revoke, then re-add the same
+	// role. A pre-lock probe cached before the revoke would have seen reader and
+	// skipped the upsert; the in-lock re-probe sees the row gone and rewrites it.
+	if err := svc.RemoveGrant(context.Background(), slug, "member-12"); err != nil {
+		t.Fatalf("RemoveGrant: %v", err)
+	}
+	if _, present := mirror.roles["member-12"]; present {
+		t.Fatalf("RemoveGrant did not delete row: roles=%v", mirror.roles)
+	}
+	if err := svc.AddGrant(context.Background(), slug, "member-12", "reader", "owner"); err != nil {
+		t.Fatalf("AddGrant after revoke: %v", err)
+	}
+	if got := mirror.roles["member-12"]; got != service.DocMemberRoleReader {
+		t.Fatalf("grant not restored after concurrent revoke: role=%d, want reader(%d)", got, service.DocMemberRoleReader)
+	}
+	mirror.mu.Lock()
+	var upserts int
+	for _, c := range mirror.calls {
+		if c.op == "upsert" && c.uid == "member-12" {
+			upserts++
+		}
+	}
+	mirror.mu.Unlock()
+	if upserts != 1 {
+		t.Fatalf("upsert count for member-12 = %d; want 1 (grant restored)", upserts)
 	}
 }

@@ -12,10 +12,16 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 )
 
-// grantRoleReader is the only role a per-uid grant may carry today. Editing
-// (writer) needs a new Capability tier + a full pass over the resolution chain,
-// so grants are read+comment only for now.
-const grantRoleReader = "reader"
+// grant role labels accepted/emitted by the HTML /grants API. They map 1:1 to
+// the doc_member.role encoding via roleLabelToCode / roleCodeToLabel so the HTML
+// grants path and the rich-doc doc_member table share one four-role vocabulary
+// (no second permission fact).
+const (
+	grantRoleReader    = "reader"
+	grantRoleCommenter = "commenter"
+	grantRoleWriter    = "writer"
+	grantRoleAdmin     = "admin"
+)
 
 // ErrGrantProtected is returned by AddGrant / RemoveGrant when the target uid
 // is the doc's creator or a doc_member admin — those rows must never be
@@ -72,7 +78,11 @@ func (s *AuthService) ListGrants(ctx context.Context, slug string) (map[string]s
 		if creator != "" && m.UID == creator {
 			continue // handler synthesises the creator row (P2-B)
 		}
-		out[m.UID] = roleCodeToLabel(m.Role)
+		label := roleCodeToLabel(m.Role)
+		if label == "" {
+			continue // unknown/corrupt stored role: do not expose a synthetic grant
+		}
+		out[m.UID] = label
 	}
 	return out, nil
 }
@@ -102,27 +112,58 @@ func legacyListGrantsFromMeta(meta *storage.DocMeta, creator string) map[string]
 	return out
 }
 
-// roleCodeToLabel translates rich-doc doc_member.role integers to the string
-// labels this API has always returned. Only reader is used today; admin is
-// added so the creator row from ListGrants renders correctly.
+// roleCodeToLabel translates rich-doc doc_member.role integers to string labels.
+// Unknown codes return the empty label so callers do not misrepresent corrupt
+// data as a valid reader grant.
 func roleCodeToLabel(role int) string {
 	switch role {
 	case DocMemberRoleAdmin:
-		return "admin"
+		return grantRoleAdmin
+	case DocMemberRoleWriter:
+		return grantRoleWriter
+	case DocMemberRoleCommenter:
+		return grantRoleCommenter
 	case DocMemberRoleReader:
 		return grantRoleReader
 	default:
-		return grantRoleReader
+		return ""
 	}
 }
 
+// roleLabelToCode maps a grant role label to its doc_member.role encoding.
+// ok=false for any unknown label so callers fail closed (never default reader).
+func roleLabelToCode(role string) (int, bool) {
+	switch role {
+	case grantRoleReader:
+		return DocMemberRoleReader, true
+	case grantRoleCommenter:
+		return DocMemberRoleCommenter, true
+	case grantRoleWriter:
+		return DocMemberRoleWriter, true
+	case grantRoleAdmin:
+		return DocMemberRoleAdmin, true
+	default:
+		return 0, false
+	}
+}
+
+// CapabilityForGrantRole maps a legacy meta.grants role label to a Capability
+// for the unwired/single-node fallback (reader→Read, commenter→Comment,
+// writer→Edit). admin and any unknown label fail closed to CapNone: the
+// unwired fallback must never grant Manage, so a legacy/corrupt admin entry
+// cannot escalate through this path.
+func CapabilityForGrantRole(role string) Capability {
+	code, ok := roleLabelToCode(role)
+	if !ok || code == DocMemberRoleAdmin {
+		return CapNone
+	}
+	return CapabilityForDocRole(code)
+}
+
 // AddGrant grants uid a role on slug (upsert). grantedBy records who authorized
-// it. Only the reader role is accepted for now.
-//
-// Plan③ A6: doc_member is authoritative — the upsert goes straight through
-// UpsertDirectGrant (source=1 direct grant, encoded inside the mirror impl).
-// meta.grants is no longer written. When no mirror is wired we still write
-// meta.grants so single-node deploys keep working.
+// it. Accepts reader/commenter/writer; admin is refused here — admin identity is
+// owned by creator_uid + the M1 backfill, never mintable through the grants API
+// (RemoveGrant/AddGrant both refuse to touch an admin row).
 //
 // TODO: verify uid is a real octo user (anti ghost-member) once octo-server
 // exposes a uid-existence lookup the doc can call; today any uid is accepted.
@@ -130,27 +171,37 @@ func (s *AuthService) AddGrant(ctx context.Context, slug, uid, role, grantedBy s
 	if uid == "" {
 		return apperr.Validation("uid required", "invalid_grant")
 	}
-	if role != grantRoleReader {
-		return apperr.Validation("role must be reader", "invalid_grant")
+	code, ok := roleLabelToCode(role)
+	if !ok || code == DocMemberRoleAdmin {
+		return apperr.Validation("role must be reader|commenter|writer", "invalid_grant")
 	}
 	if s.docMembers != nil {
-		return s.addGrantToDocMember(ctx, slug, uid, grantedBy)
+		return s.addGrantToDocMember(ctx, slug, uid, code, grantedBy)
 	}
 	return s.addGrantToMeta(ctx, slug, uid, role, grantedBy)
 }
 
 // addGrantToDocMember is the plan③ A6 primary path. UpsertDirectGrant is
-// idempotent — repeated calls for the same (docID,uid,role) update
-// updated_at only, no duplicate row.
+// idempotent for the same (docID,uid,role). It refuses grants that would touch
+// the creator uid or an admin (role=admin, encoded 3) row.
+// An identical existing role skips the doc_member write (no permission_epoch
+// bump); a different non-admin role is a legitimate change (e.g. reader→commenter,
+// commenter→writer, or a downgrade) and is written through. Either way, on a
+// registered doc the (optional) write and a sweep of any stale legacy
+// meta.grants[uid] run under one slug lock (P1) so a later unregistered fallback
+// cannot revive the pre-change role — including the same-role case, where a
+// stale HIGHER meta.grants role must still be cleared even though doc_member is
+// unchanged.
 //
-// Probe RoleByDocUID first and refuse reader-grants that would
-// silently downgrade an admin (role=3) or the creator uid. UpsertDirectGrant
-// runs ON DUPLICATE KEY UPDATE role=VALUES(role), so a naive reader upsert on
-// an existing admin row would clobber it — and once A1 flips creator_uid to
-// the bot, the owner's author is nothing but their doc_member admin row.
-// One reader grant would demote them. Idempotent reader→reader is a no-op
-// (no permission_epoch bump).
-func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grantedBy string) error {
+// P1 (round-7): the RoleByDocUID probe and the resulting skip-upsert decision
+// BOTH run inside the slug lock. An earlier version probed before locking, so a
+// concurrent RemoveGrant that deleted the row after the probe (but before we
+// locked) left a stale unchanged=true: AddGrant then acquired the lock, skipped
+// the upsert as "unchanged", swept meta, and returned success — silently
+// dropping the requested grant (the row was gone). Re-probing under the lock
+// closes that TOCTOU: whatever RemoveGrant/backfill did is now committed before
+// we read, so the skip only fires on a genuinely-current identical role.
+func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid string, roleCode int, grantedBy string) error {
 	// Existence check via meta so we still 404 on a bogus slug (rich-doc
 	// mirror only knows registered docs).
 	meta, err := s.meta.GetMeta(ctx, slug)
@@ -169,27 +220,46 @@ func (s *AuthService) addGrantToDocMember(ctx context.Context, slug, uid, grante
 	}
 	if !ok {
 		// Doc not yet registered in doc_member (post-commit registration gap, or
-		// a non-mounted / failed registration). Thread mounts are registerable,
-		// but may transiently land here during that gap. Reads /
-		// ListGrants / RemoveGrant all fall back to meta.grants in this state;
-		// AddGrant used to 404 here, breaking API symmetry and making such docs
-		// un-grantable. Fall back to the legacy meta.grants writer so the four
-		// operations stay aligned.
-		return s.addGrantToMeta(ctx, slug, uid, grantRoleReader, grantedBy)
+		// a non-mounted / failed registration). Fall back to the legacy
+		// meta.grants writer so the four operations stay aligned.
+		return s.addGrantToMeta(ctx, slug, uid, roleCodeToLabel(roleCode), grantedBy)
 	}
-	role, ok, err := s.docMembers.RoleByDocUID(ctx, docID, uid)
-	if err != nil {
-		return err
-	}
-	if ok {
-		if role == DocMemberRoleAdmin {
+	// P1 (round-6): serialize the doc_member write and the legacy meta.grants
+	// sweep under one slug lock (same lock reconcile + RemoveGrant take). On a
+	// REGISTERED doc, doc_member is authoritative, so any leftover
+	// meta.grants[uid] from an earlier unregistered/fallback write is stale. Left
+	// behind, a later unmount/soft-delete flipping DocIDBySlug back to ok=false
+	// would let the A4 legacy fallback revive that stale (possibly higher) role —
+	// reverting a downgrade written here, OR reviving a higher role over an
+	// unchanged one. Sweeping on every registered path (change AND no-change)
+	// makes AddGrant symmetric with RemoveGrant, which already sweeps unconditionally.
+	return s.lock.With(ctx, slug, func() error {
+		// Re-probe the CURRENT registered role inside the lock (P1 round-7). A
+		// pre-lock probe could go stale if a concurrent RemoveGrant deleted the
+		// row between probe and lock — skipping the upsert then would drop the
+		// requested grant. Deciding here, after the lock serialises us behind
+		// any concurrent revoke/backfill, keeps the skip honest.
+		role, ok, err := s.docMembers.RoleByDocUID(ctx, docID, uid)
+		if err != nil {
+			return err
+		}
+		if ok && role == DocMemberRoleAdmin {
+			// Creator/admin rows are never mintable/mutable through this API.
 			return ErrGrantProtected
 		}
-		if role >= DocMemberRoleReader {
-			return nil // already reader (or higher-that-is-not-admin); no-op, no epoch bump
+		// Skip the doc_member write only when a row genuinely still exists with
+		// the identical role (no permission_epoch bump). If the row is now
+		// absent (ok=false, e.g. a concurrent revoke landed first) or holds a
+		// different role, we MUST write it — the grant was requested and must be
+		// (re)applied.
+		if !ok || role != roleCode {
+			if err := s.docMembers.UpsertDirectGrant(ctx, docID, uid, roleCode, grantedBy); err != nil {
+				return err
+			}
 		}
-	}
-	return s.docMembers.UpsertDirectGrant(ctx, docID, uid, DocMemberRoleReader, grantedBy)
+		// Absent entry ⇒ nil (idempotent); never fail the grant on a clean sweep.
+		return s.removeGrantFromMetaLocked(ctx, slug, uid)
+	})
 }
 
 // addGrantToMeta preserves the pre-plan③ meta.grants write path for the
@@ -400,20 +470,21 @@ func (s *AuthService) mirrorGrantDelete(ctx context.Context, slug, uid string) {
 	}
 }
 
-// ReconcileMetaGrantsToDocMember copies any legacy meta.grants readers into
-// doc_member. Called by DocService.afterPublished after confirmed registration so
-// that grants issued during the registration gap (AddGrant → meta.grants
-// fallback while DocIDBySlug ok=false) do not evaporate once bestCred flips to
-// the strict wired gate. Best-effort: per-uid errors are
-// logged and skipped so one bad row cannot block the rest. meta.grants entries are
-// left in place so mirror-unwired deploys keep working; A7 cleanup drops them.
+// ReconcileMetaGrantsToDocMember migrates any legacy meta.grants entries into
+// doc_member and then clears the consumed entries. Called by
+// DocService.afterPublished after confirmed registration so that grants issued
+// during the registration gap (AddGrant → meta.grants fallback while
+// DocIDBySlug ok=false) do not evaporate once bestCred flips to the strict
+// wired gate.
 //
-// The entire read-then-upsert sequence runs under the
-// slug lock (same lock removeGrantFromMeta takes) and re-fetches meta inside
-// the critical section. Without this, RemoveGrant could delete a doc_member
-// row and sweep meta.grants between reconcile's read and its upsert,
-// resurrecting a revoked reader when the next Publish/SaveDraft fires
-// afterPublished.
+// Wired/registered mode: doc_member is the sole authority. reader/commenter/
+// writer are inserted via InsertDirectGrantIfAbsent (atomic: never overwrites a
+// concurrently-written authoritative row; bumps epoch only on insert). admin,
+// unknown, and malformed entries are never restored (fail closed). Once the doc
+// is registered every consumed entry is cleared — including invalid/admin ones
+// so they cannot resurrect via a later unregistered fallback — but only after a
+// successful insert / confirmed existing row; a DB error retains the entry for
+// retry. Runs under the slug lock (shared with RemoveGrant's sweep).
 func (s *AuthService) ReconcileMetaGrantsToDocMember(ctx context.Context, slug string) error {
 	if s.docMembers == nil {
 		return nil
@@ -431,8 +502,8 @@ func (s *AuthService) ReconcileMetaGrantsToDocMember(ctx context.Context, slug s
 			return fmt.Errorf("reconcile slug resolve: %w", err)
 		}
 		if !ok {
-			// Not registered yet (or unregisterable mount type). Nothing to
-			// reconcile; a later publish or manual mount will retrigger.
+			// Not registered yet: leave meta.grants intact for the unwired
+			// fallback; a later publish/mount retriggers.
 			return nil
 		}
 		grants, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
@@ -441,29 +512,84 @@ func (s *AuthService) ReconcileMetaGrantsToDocMember(ctx context.Context, slug s
 		}
 		creator := meta.CreatorUID()
 		logger := slog.Default()
+		consumed := make([]string, 0, len(grants))
 		for uid, v := range grants {
 			if uid == "" || (creator != "" && uid == creator) {
 				continue
 			}
 			entry, ok := v.(map[string]any)
 			if !ok {
+				// Malformed shape: consume so it cannot resurrect once wired.
+				consumed = append(consumed, uid)
 				continue
 			}
 			roleStr, _ := entry["role"].(string)
-			if roleStr != grantRoleReader {
-				// Only reader is a valid per-uid role today; skip anything else
-				// rather than surprise-promote a stray value.
+			code, ok := roleLabelToCode(roleStr)
+			if !ok || code == DocMemberRoleAdmin {
+				// admin/unknown: never restore; consume so a later unregistered
+				// fallback cannot escalate from a legacy/corrupt entry.
+				consumed = append(consumed, uid)
 				continue
 			}
 			grantedBy, _ := entry["granted_by"].(string)
 			if grantedBy == "" {
 				grantedBy = "reconcile_afterpublished"
 			}
-			if err := s.docMembers.UpsertDirectGrant(ctx, docID, uid, DocMemberRoleReader, grantedBy); err != nil {
-				logger.Debug("reconcile upsert failed", "slug", slug, "uid", uid, "err", err.Error())
-				continue
+			// Atomic insert-if-absent: never overwrites a concurrent authoritative
+			// row. Consume on insert OR when a row already exists; retain on error.
+			if _, err := s.docMembers.InsertDirectGrantIfAbsent(ctx, docID, uid, code, grantedBy); err != nil {
+				logger.Error("reconcile insert failed", "slug", slug, "uid", uid, "err", err.Error())
+				continue // leave this entry for a later retry; do not clear
 			}
+			consumed = append(consumed, uid)
 		}
+		if len(consumed) == 0 {
+			return nil
+		}
+		// Clear consumed entries only after their writes succeeded, re-reading
+		// meta under the same lock to avoid clobbering a concurrent meta write.
+		return s.clearConsumedMetaGrantsLocked(ctx, slug, consumed)
+	})
+}
+
+// clearConsumedMetaGrantsLocked removes uids from meta.grants; caller holds
+// s.lock for slug. Drops the whole key when the map empties. Idempotent for
+// absent uids. Completes the wired migration: once a grant is authoritative in
+// doc_member, its stale metadata is removed so no fallback can resurrect it.
+func (s *AuthService) clearConsumedMetaGrantsLocked(ctx context.Context, slug string, uids []string) error {
+	meta, err := s.meta.GetMeta(ctx, slug)
+	if err != nil {
+		return fmt.Errorf("reconcile clear lookup: %w", err)
+	}
+	if meta == nil {
 		return nil
+	}
+	existing, ok := meta.Extra[storage.GrantsExtraKey].(map[string]any) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
+	if !ok || len(existing) == 0 {
+		return nil
+	}
+	remove := make(map[string]struct{}, len(uids))
+	for _, uid := range uids {
+		remove[uid] = struct{}{}
+	}
+	grants := map[string]any{}
+	for k, v := range existing {
+		if _, drop := remove[k]; drop {
+			continue
+		}
+		grants[k] = v
+	}
+	if len(grants) == len(existing) {
+		return nil // nothing actually removed
+	}
+	extra := map[string]any{}
+	maps.Copy(extra, meta.Extra)
+	if len(grants) == 0 {
+		delete(extra, storage.GrantsExtraKey) //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
+	} else {
+		extra[storage.GrantsExtraKey] = grants //nolint:staticcheck // legacy meta.grants fallback until A7 cleanup
+	}
+	return s.meta.PutMeta(ctx, slug, storage.DocMeta{
+		Slug: meta.Slug, Title: meta.Title, Versions: meta.Versions, Extra: extra,
 	})
 }

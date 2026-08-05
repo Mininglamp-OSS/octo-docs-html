@@ -10,8 +10,8 @@
 #   OCTO_TOKEN      write token — the AUTHOR credential (Bearer)
 #   OCTO_CODE       a per-doc share code — the READER credential (Bearer)
 #
-# Auth: author ops send OCTO_TOKEN; reader ops (pull/comment/react) fall back to
-# OCTO_CODE when no token is set. The server maps both to a capability.
+# Auth: author/write ops send OCTO_TOKEN; read-only pull may fall back to
+# OCTO_CODE. Comment/reply/react never use the read-only share code.
 #
 # Usage:
 #   octo.sh bootstrap                          # mint + print the first write token
@@ -19,7 +19,7 @@
 #   octo.sh draft    <slug> <html-file> [title]# save/overwrite the mutable draft
 #   octo.sh promote  <slug> [title]            # draft -> next immutable version
 #   octo.sh versions <slug>                    # list a doc's versions
-#   octo.sh share    <slug>                    # mint/rotate a read+comment code+URL
+#   octo.sh share    <slug>                    # mint/rotate a read-only code+URL
 #   octo.sh unshare  <slug>                    # revoke the share code
 #   octo.sh unpublish <slug>                   # delete the doc (all versions)
 #   octo.sh pull     <slug>                    # full comment history (JSON)
@@ -123,6 +123,7 @@ case "$cmd" in
     ;;
 
   comment)
+    require_token
     slug="${1:?slug}"; text="${2:?text}"; version="${3:-}"; anchor="${4:-}"
     body="$(jq -n --arg slug "$slug" --arg text "$text" \
       --argjson version "${version:-null}" --argjson anchor "${anchor:-null}" \
@@ -144,6 +145,7 @@ case "$cmd" in
     ;;
 
   react)
+    require_token
     slug="${1:?slug}"; cid="${2:?comment-id}"; emoji="${3:?emoji}"; version="${4:-}"
     body="$(jq -n --arg slug "$slug" --arg cid "$cid" --arg emoji "$emoji" \
       --argjson version "${version:-null}" \

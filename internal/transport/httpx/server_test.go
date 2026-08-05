@@ -265,7 +265,7 @@ func TestRenderAlwaysPublishedMode(t *testing.T) {
 
 func TestCommentRequiresCapability(t *testing.T) {
 	// Default-private: a comment with no credential is rejected (404, existence
-	// hidden). A share code (or the write token) is required to comment.
+	// hidden). Comment capability (author or commenter member) is required.
 	h := newTestServer(t, nil)
 	auth := authorHdr()
 	_ = do(t, h, http.MethodPost, "/v1/docs", auth,

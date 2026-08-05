@@ -123,10 +123,15 @@ of `/v1` — they return browser HTML, not the JSON envelope.
 
 ### Reads (capability-gated — private by default)
 
-Documents are private by default. Each read resolves a capability from the request
-(write token = author, per-doc share code = reader; else none → **404**, existence
-hidden). Browsers present the code as `?code=` once and it is exchanged for an
-HttpOnly cookie; agents/CLI send it as `Authorization: Bearer`. See docs/AUTH.md.
+Documents are private by default. Each read resolves a capability from the
+request, ordered `None < Read < Comment < Edit < Manage` (the doc creator /
+`superAdmin` / `doc_member` admin = Manage; a `doc_member` writer = Edit; a
+commenter = Comment; a per-doc share code or `doc_member` reader = Read; else
+None → **404**, existence hidden). Browsers present the code as `?code=` once and
+it is exchanged for an HttpOnly cookie; agents/CLI send it as
+`Authorization: Bearer`. The four-role `doc_member` append-v1 encoding, its
+mandatory runtime marker, and the legacy `meta.grants` fallback boundary are in
+docs/AUTH.md.
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
@@ -141,7 +146,7 @@ HttpOnly cookie; agents/CLI send it as `Authorization: Bearer`. See docs/AUTH.md
 | `GET`  | `/` | neutral landing page (no catalog, unauthed) |
 | `GET`  | `/me` | owner-only doc catalog (redirects others) |
 
-### Comment mutations (reader capability required)
+### Comment mutations (Comment capability required)
 
 | Method | Path | Description |
 | ------ | ---- | ----------- |
@@ -150,8 +155,9 @@ HttpOnly cookie; agents/CLI send it as `Authorization: Bearer`. See docs/AUTH.md
 | `DELETE` | `/v1/comments?slug=&id=&version=` | soft-delete |
 | `POST`   | `/v1/reactions` | toggle an emoji reaction |
 
-Commenting requires at least a **reader** capability (the doc's share code, or the
-author write token) — a default-private doc cannot be commented on anonymously.
+Commenting requires at least the **Comment** capability (a `doc_member` commenter
+or higher). A share code alone is **Read**, so it does not grant commenting — a
+default-private doc cannot be commented on anonymously.
 Comment identity is still anonymous (no login provider); the author/owner checks on
 PATCH/DELETE are the seam a future Octo unified login activates.
 
@@ -162,8 +168,11 @@ PATCH/DELETE are the seam a future Octo unified login activates.
 | `POST`   | `/v1/docs` | publish directly; returns the HTML version plus `doc_id`, `share_url`, `registered`, and `status` |
 | `PUT`    | `/v1/docs/:slug/draft` | save/overwrite the mutable draft slot |
 | `POST`   | `/v1/docs/:slug/draft/promote` | promote the draft to a new immutable version |
-| `POST`   | `/v1/docs/:slug/share` | mint/rotate the per-doc read+comment code → `{ code, url }` |
+| `POST`   | `/v1/docs/:slug/share` | mint/rotate the per-doc **read** share code → `{ code, url }` |
 | `DELETE` | `/v1/docs/:slug/share` | revoke the share code |
+| `GET`    | `/v1/docs/:slug/grants` | list direct grants (creator synthesized as the leading author row) |
+| `PUT`    | `/v1/docs/:slug/grants` | grant a uid `reader\|commenter\|writer` (upsert); admin/creator refused |
+| `DELETE` | `/v1/docs/:slug/grants/:uid` | revoke a uid's grant; creator/admin refused |
 | `POST`   | `/v1/agent/replies` | agent posts a reply + verdict (✅/🟡/❓) |
 | `POST`   | `/v1/agent/element/get` | return one stamped element by AID; body `version` is an integer, where `0` means latest |
 | `POST`   | `/v1/agent/element/replace` | replace one stamped element and publish a new version; body `base_version` is an integer, where `0` means latest |

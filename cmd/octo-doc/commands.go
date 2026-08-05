@@ -63,7 +63,12 @@ func buildServices(ctx context.Context, cfg *config.Config) (deps *httpx.Deps, c
 		notifier = eventwebhook.New(cfg.OctoWebhookURL, cfg.OctoDocEventWebhookToken, nil)
 	}
 	comments := service.NewCommentService(meta, locker).WithEventWebhook(notifier, cfg.BaseURL, nil)
-	auth := service.NewAuthService(meta, cfg, locker).WithDocMemberMirror(docMemberMirror(meta))
+	mirror, err := docMemberMirror(ctx, meta)
+	if err != nil {
+		_ = meta.Close()
+		return nil, nil, fmt.Errorf("verify doc_member role encoding: %w", err)
+	}
+	auth := service.NewAuthService(meta, cfg, locker).WithDocMemberMirror(mirror)
 	docs := service.NewDocService(blobs, meta, comments, locker, cfg.BaseURL, cfg.MaxHTMLBytes)
 	if cfg.DocsBackendRegisterURL != "" {
 		docs = docs.WithDocsBackendRegistration(
@@ -177,7 +182,11 @@ func bootstrap(cfg *config.Config) error {
 		return err
 	}
 	defer func() { _ = meta.Close() }()
-	auth := service.NewAuthService(meta, cfg, meta.Locker()).WithDocMemberMirror(docMemberMirror(meta))
+	mirror, err := docMemberMirror(ctx, meta)
+	if err != nil {
+		return err
+	}
+	auth := service.NewAuthService(meta, cfg, meta.Locker()).WithDocMemberMirror(mirror)
 	token, err := auth.Bootstrap(ctx)
 	if err != nil {
 		return err
@@ -197,18 +206,22 @@ func openMetadata(ctx context.Context, cfg *config.Config) (metadataBackend, err
 	}
 }
 
-func docMemberMirror(meta metadataBackend) service.DocMemberMirror {
+func docMemberMirror(ctx context.Context, meta metadataBackend) (service.DocMemberMirror, error) {
 	mysqlStore, ok := meta.(*mysql.Store)
 	if !ok {
-		return nil
+		return nil, nil
 	}
-	// Return untyped nil (not a typed-nil interface) so AuthService's
-	// docMembers==nil check stays valid when the pool is absent.
+	// The shared table is safe to interpret only when Backend #147's append-v1
+	// marker is present. Missing/unknown/ordered-v2 fail startup closed; this
+	// verification never recodes role rows.
+	if err := service.RequireAppendRoleEncoding(ctx, mysqlStore.DB()); err != nil {
+		return nil, err
+	}
 	m := service.NewMySQLDocMemberMirror(mysqlStore.DB())
 	if m == nil {
-		return nil
+		return nil, nil
 	}
-	return m
+	return m, nil
 }
 
 func migrateMetadata(ctx context.Context, cfg *config.Config) error {
