@@ -326,8 +326,20 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 	for _, entry := range stack {
 		nodes[entry.index].outer = source[entry.start:]
 	}
+	preformattedNode := make([]bool, len(nodes))
+	for index := range nodes {
+		preserve := nodes[index].tag == "pre" || nodes[index].tag == "textarea"
+		if parent := nodes[index].parent; parent >= 0 {
+			preserve = preformattedNode[parent]
+		}
+		if stylePreserves, specified := inlineWhiteSpaceMode(nodes[index].attrs["style"]); specified {
+			preserve = stylePreserves
+		}
+		preformattedNode[index] = preserve
+	}
 	for index := range nodes {
 		literalRawText := isDiffLiteralRawTextTag(nodes[index].tag)
+		preserveWhitespace := preformattedNode[index]
 		fullText := ""
 		textDigest := sha256.New()
 		if literalRawText {
@@ -345,7 +357,10 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				segment := strings.Join(parts[start:end], "")
 				start = end
 				fullTextBuilder.WriteString(segment)
-				normalizedSegment := normalizeDiffTextSegment(segment)
+				normalizedSegment := segment
+				if !preserveWhitespace {
+					normalizedSegment = normalizeDiffTextSegment(segment)
+				}
 				if normalizedSegment == "" {
 					continue
 				}
@@ -354,7 +369,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				// boundary, so it must not perturb the digest. Whitespace touching an
 				// inline (or unknown/custom, treated inline) neighbor stays framed so
 				// "see <a>here</a>" keeps its visible space.
-				if isOnlyHTMLASCIIWhitespace(segment) && !diffSlotWhitespaceVisible(nodes[index], slot) {
+				if !preserveWhitespace && isOnlyHTMLASCIIWhitespace(segment) && !diffSlotWhitespaceVisible(nodes[index], slot) {
 					continue
 				}
 				// Frame each non-empty segment with its boundary slot so text at
@@ -364,7 +379,10 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				writeDiffFrame(textDigest, strconv.Itoa(slot))
 				writeDiffFrame(textDigest, normalizedSegment)
 			}
-			fullText = collapseHTMLASCIIWhitespace(fullTextBuilder.String())
+			fullText = fullTextBuilder.String()
+			if !preserveWhitespace {
+				fullText = collapseHTMLASCIIWhitespace(fullText)
+			}
 		}
 		nodes[index].textParts = nil
 		nodes[index].textBounds = nil
@@ -546,8 +564,8 @@ func boundaryInline(tag, attrRaw string) bool {
 // boundary).
 func nextBoundaryInline(rest string) bool {
 	if len(rest) == 0 {
-		// Document end is a clean block edge (like the parent's own edge), not an
-		// inline neighbour; trailing formatting whitespace is not visible.
+		// Document end is a clean block edge, not an inline neighbour; trailing
+		// formatting whitespace is not visible.
 		return false
 	}
 	if rest[0] != '<' {
@@ -670,7 +688,8 @@ func diffSlotWhitespaceVisible(node htmlDiffNode, slot int) bool {
 }
 
 // diffBoundarySideIsBlock reports whether the child at childPos is block-level.
-// An out-of-range position denotes the parent's own edge.
+// An out-of-range position denotes the parent's own edge, so an inline or
+// unknown/custom parent's edge counts as inline.
 func diffBoundarySideIsBlock(node htmlDiffNode, childPos int) bool {
 	if childPos < 0 || childPos >= len(node.children) {
 		return isBlockLevelDiffTag(node.tag)
@@ -1378,8 +1397,9 @@ func diffLineOps(oldLines, newLines []diffSourceLine) ([]diffLineOp, bool) {
 	dmp := diffmatchpatch.New()
 	// go-diff enforces DiffTimeout internally but does not report whether the
 	// deadline produced a coarse diff. Accept that valid result; elapsed wall
-	// time after return cannot distinguish a timeout from a scheduler pause.
-	// Input, hunk, and output limits below keep the public result bounded.
+	// time after return cannot distinguish a timeout from a scheduler pause. The
+	// 50ms deadline is unreachable for any input that can return 200 (a coarse
+	// diff needs enough lines that maxDiffHunkLines rejects it first).
 	dmp.DiffTimeout = diffLineTimeout
 	oldTokens, newTokens, tokenLines := dmp.DiffLinesToRunes(oldText, newText)
 	diffs := dmp.DiffMainRunes(oldTokens, newTokens, false)
@@ -1800,26 +1820,42 @@ func isPreformattedContext(tag, attrRaw string) bool {
 }
 
 func styleHasPreservedWhitespace(style string) bool {
-	style = strings.ToLower(style)
-	idx := strings.Index(style, "white-space")
-	for idx >= 0 {
-		value := style[idx+len("white-space"):]
-		if colon := strings.IndexByte(value, ':'); colon >= 0 {
-			value = value[colon+1:]
-			if semi := strings.IndexByte(value, ';'); semi >= 0 {
-				value = value[:semi]
-			}
-			if strings.Contains(value, "pre") || strings.Contains(value, "break-spaces") {
-				return true
-			}
+	preserve, _ := inlineWhiteSpaceMode(style)
+	return preserve
+}
+
+func inlineWhiteSpaceMode(style string) (preserve, specified bool) {
+	var normalValue string
+	var importantValue string
+	for _, declaration := range strings.Split(style, ";") {
+		property, value, ok := strings.Cut(declaration, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(property), "white-space") {
+			continue
 		}
-		next := strings.Index(style[idx+len("white-space"):], "white-space")
-		if next < 0 {
-			break
+		value = strings.ToLower(strings.TrimSpace(value))
+		important := strings.HasSuffix(value, "!important")
+		if important {
+			value = strings.TrimSpace(strings.TrimSuffix(value, "!important"))
+			importantValue = value
+		} else {
+			normalValue = value
 		}
-		idx += len("white-space") + next
 	}
-	return false
+	value := importantValue
+	if value == "" {
+		value = normalValue
+	}
+	if value == "" {
+		return false, false
+	}
+	switch value {
+	case "pre", "pre-wrap", "break-spaces":
+		return true, true
+	case "normal", "nowrap", "pre-line", "initial", "revert", "revert-layer":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func popPreformatted(preStack *[]string, closeTag string) {

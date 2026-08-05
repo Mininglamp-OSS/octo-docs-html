@@ -568,8 +568,22 @@ func TestLineDiffAllParagraphTextSubstitutionsStayBounded(t *testing.T) {
 	if len(result.CodeHunks) != 1 {
 		t.Fatalf("code hunks = %d; want 1", len(result.CodeHunks))
 	}
-	if got := len(result.CodeHunks[0].Lines); got >= 1500 {
-		t.Fatalf("all-text substitution produced %d lines", got)
+	// Myers must keep every unchanged structural line as context (2n+1 tags plus
+	// n '-' and n '+'), not dump whole windows.
+	context, changed := 0, 0
+	for _, line := range result.CodeHunks[0].Lines {
+		switch {
+		case strings.HasPrefix(line, "-"), strings.HasPrefix(line, "+"):
+			changed++
+		default:
+			context++
+		}
+	}
+	if want := 2*338 + 1; context != want {
+		t.Fatalf("context lines = %d; want %d", context, want)
+	}
+	if want := 2 * 338; changed != want {
+		t.Fatalf("changed lines = %d; want %d", changed, want)
 	}
 }
 
@@ -1234,7 +1248,50 @@ func assertVisibleAndValid(t *testing.T, before, after string) {
 // content holds a stray '<' that is text, not markup: the parser must scan to
 // the close tag rather than splitting the run into a spurious tag.
 func TestBuildVersionDiffRawTextWhitespaceAndStrayLtAreVisible(t *testing.T) {
-	assertVisibleAndValid(t, "<textarea>a b</textarea>", "<textarea>a  b</textarea>")
+	assertStructuralChange := func(before, after string) {
+		t.Helper()
+		result, err := buildVersionDiff(1, 2, before, after)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Changes) == 0 || result.Summary.Modified == 0 {
+			t.Fatalf("preformatted whitespace change missing from structural diff: %+v", result)
+		}
+	}
+	assertStructuralChange("<pre>a b</pre>", "<pre>a  b</pre>")
+	assertStructuralChange("<pre><code>if x:\n  y\n</code></pre>", "<pre><code>if x:\n    y\n</code></pre>")
+	assertStructuralChange("<textarea>a b</textarea>", "<textarea>a  b</textarea>")
+	assertStructuralChange(`<div style="white-space: pre">a b</div>`, `<div style="white-space: pre">a  b</div>`)
+	assertStructuralChange(`<div style="white-space: normal; white-space: pre">a b</div>`, `<div style="white-space: normal; white-space: pre">a  b</div>`)
+	assertStructuralChange(`<div style="white-space: pre !important; white-space: normal">a b</div>`, `<div style="white-space: pre !important; white-space: normal">a  b</div>`)
+
+	collapsed, err := buildVersionDiff(1, 2, "<div>a b</div>", "<div>a  b</div>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(collapsed.Changes) != 0 || collapsed.Summary.Modified != 0 {
+		t.Fatalf("collapsible whitespace became structural: %+v", collapsed)
+	}
+	collapsedCases := []struct {
+		name          string
+		before, after string
+	}{
+		{"last_declaration_wins", `<div style="white-space: pre; white-space: normal">a b</div>`, `<div style="white-space: pre; white-space: normal">a  b</div>`},
+		{"important_wins", `<div style="white-space: normal !important; white-space: pre">a b</div>`, `<div style="white-space: normal !important; white-space: pre">a  b</div>`},
+		{"descendant_override", `<pre><code style="white-space: normal">a b</code></pre>`, `<pre><code style="white-space: normal">a  b</code></pre>`},
+	}
+	for _, test := range collapsedCases {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) != 0 || result.Summary.Modified != 0 {
+				t.Fatalf("CSS-collapsible whitespace became structural: %+v", result)
+			}
+		})
+	}
+
 	assertVisibleAndValid(t, "<textarea>a < b</textarea>", "<textarea>a <  b</textarea>")
 	assertVisibleAndValid(t, "<title>a &amp; b</title>", "<title>a &amp;&amp; b</title>")
 	// Identical raw-text content still yields no diff.

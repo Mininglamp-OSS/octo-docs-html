@@ -1098,10 +1098,25 @@ func TestVersionDiffStrictVersionValidation(t *testing.T) {
 		"/v1/docs/diff-validate/diff?from=latest&to=1",
 		"/v1/docs/diff-validate/versions/0/source",
 		"/v1/docs/diff-validate/versions/nope/source",
+		"/v1/docs/diff-validate/diff?from=1&to=1&unexpected=1",
+		"/v1/docs/diff-validate/diff?from=1&from=2&to=1",
 	} {
 		rec := do(t, h, http.MethodGet, target, authorHdrNoCT(), "")
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("%s = %d; want 400: %s", target, rec.Code, rec.Body.String())
+		}
+	}
+	// The share link the API hands out carries ?code=, and clients append a cache
+	// buster; both must reach the handler instead of failing query validation.
+	_ = do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"diff-validate","html":"<html><body><p>y</p></body></html>"}`)
+	for _, target := range []string{
+		"/v1/docs/diff-validate/diff?from=1&to=2&code=deadbeef",
+		"/v1/docs/diff-validate/diff?from=1&to=2&_=12345",
+	} {
+		rec := do(t, h, http.MethodGet, target, authorHdrNoCT(), "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s = %d; want 200: %s", target, rec.Code, rec.Body.String())
 		}
 	}
 }

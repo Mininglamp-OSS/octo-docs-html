@@ -336,6 +336,9 @@ func (s *Server) handleVersionSource(w http.ResponseWriter, r *http.Request) err
 	etag := fmt.Sprintf(`"%x"`, sha256.Sum256([]byte(source)))
 	w.Header().Set("ETag", etag)
 	w.Header().Set("X-Document-Version", strconv.Itoa(resolved))
+	// Reads send Access-Control-Allow-Origin: *, so a cross-origin source-diff
+	// view cannot read these without an explicit expose list.
+	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Document-Version")
 	// Serve stored user-authored bytes as inert source, never active HTML.
 	// Consumers (the Web source-diff view) read this as text; nothing renders
 	// it as a document. text/plain + nosniff stops the browser from executing
@@ -365,8 +368,17 @@ func (s *Server) handleVersionDiff(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 	query := r.URL.Query()
-	if len(query) != 2 || len(query["from"]) != 1 || len(query["to"]) != 1 {
+	if len(query["from"]) != 1 || len(query["to"]) != 1 {
 		return apperr.Validation("exactly one from and to parameter are required", "invalid_diff_query")
+	}
+	// The share link this API hands out carries ?code=, and clients add a cache
+	// buster, so unknown params are rejected but those are allowed through.
+	for name := range query {
+		switch name {
+		case "from", "to", "code", "_":
+		default:
+			return apperr.Validation("unexpected query parameter", "invalid_diff_query")
+		}
 	}
 	from, ok := parsePublishedVersion(query.Get("from"))
 	if !ok {
