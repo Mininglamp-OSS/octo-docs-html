@@ -305,9 +305,9 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			nodes[parent].childTags = append(nodes[parent].childTags, tag)
 		}
 		selfClosing := strings.HasSuffix(strings.TrimSpace(raw), "/") || isDiffVoidTag(tag)
-		if selfClosing {
-			nodes[index].outer = source[lt : end+1]
-		} else if isDiffRawTextTag(tag) {
+		// A trailing '/' on a non-void start tag is ignored, so a raw-text element
+		// still opens and only its end tag closes it.
+		if isDiffRawTextTag(tag) {
 			closeStart, scanned := indexDiffRawClose(source, end+1, tag)
 			rawScanBytes += scanned
 			if rawScanBytes > maxDiffRawScanBytes {
@@ -327,6 +327,8 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			nodes[index].outer = source[lt : closeEnd+1]
 			cursor = closeEnd + 1
 			continue
+		} else if selfClosing {
+			nodes[index].outer = source[lt : end+1]
 		} else {
 			stack = append(stack, diffOpenNode{index: index, start: lt})
 		}
@@ -1847,10 +1849,8 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 				// never split as a spurious tag (the double-blind that hid
 				// textarea/title content changes); it is emitted to the line diff but
 				// never fed into the whitespace gap.
-				if !selfClosing && !isDiffVoidTag(tag) {
-					if preserve, establishes := isPreformattedContext(tag, attrRaw); establishes {
-						preStack = append(preStack, preContext{tag: tag, preserve: preserve})
-					}
+				if preserve, establishes := isPreformattedContext(tag, attrRaw); establishes {
+					preStack = append(preStack, preContext{tag: tag, preserve: preserve})
 				}
 				prevInline = boundaryInline(tag, attrRaw)
 				literalRaw := isDiffLiteralRawTextTag(tag)

@@ -142,28 +142,34 @@ func TestDiffCommentTerminatorMatrix(t *testing.T) {
 
 // Every element parsed by the generic raw-text / RCDATA algorithms holds text,
 // not markup: a literal "<!--" inside one is not a comment, and its content must
-// not become DOM nodes.
+// not become DOM nodes. A trailing '/' on the start tag is a parse error the
+// tokenizer ignores, so the element still opens as raw text.
 func TestDiffRawTextContextMatrix(t *testing.T) {
 	for _, tag := range []string{"script", "style", "textarea", "title", "iframe", "noembed", "noframes", "xmp", "noscript"} {
 		t.Run(tag, func(t *testing.T) {
-			document := func(target string) string {
-				return `<html><body><` + tag + `><!--</` + tag + `><p>` + target + `</p></body></html>`
-			}
-			probe := probeDiff(t, document("TARGET-OLD"), document("TARGET-NEW"))
-			if probe.structuralErr != nil {
-				t.Fatalf("parseDiffHTML err = %v, want nil", probe.structuralErr)
-			}
-			if !probe.sourceLinesOK {
-				t.Fatal("normalizedHTMLLines ok = false, want true")
-			}
-			if probe.diffErr != nil {
-				t.Fatalf("buildVersionDiff err = %v, want nil", probe.diffErr)
-			}
-			if !probe.hasPath("/html[1]/body[1]/p[1]") {
-				t.Fatalf("element after raw text missing from changes: paths=%v", probe.changePaths)
-			}
-			if probe.modified != 1 {
-				t.Fatalf("Summary.Modified = %d, want 1", probe.modified)
+			for _, open := range []string{"<" + tag + ">", "<" + tag + "/>", "<" + tag + ` src="a"/>`} {
+				document := func(target string) string {
+					return `<html><body>` + open + `<!--</` + tag + `><p>` + target + `</p></body></html>`
+				}
+				probe := probeDiff(t, document("TARGET-OLD"), document("TARGET-NEW"))
+				if probe.structuralErr != nil {
+					t.Fatalf("%s: parseDiffHTML err = %v, want nil", open, probe.structuralErr)
+				}
+				if !probe.sourceLinesOK {
+					t.Fatalf("%s: normalizedHTMLLines ok = false, want true", open)
+				}
+				if probe.diffErr != nil {
+					t.Fatalf("%s: buildVersionDiff err = %v, want nil", open, probe.diffErr)
+				}
+				if !probe.hasPath("/html[1]/body[1]/p[1]") {
+					t.Fatalf("%s: element after raw text missing from changes: paths=%v", open, probe.changePaths)
+				}
+				if probe.modified != 1 {
+					t.Fatalf("%s: Summary.Modified = %d, want 1", open, probe.modified)
+				}
+				if !strings.Contains(probe.hunkText, "TARGET-OLD") || !strings.Contains(probe.hunkText, "TARGET-NEW") {
+					t.Fatalf("%s: edited text missing from code hunks:\n%s", open, probe.hunkText)
+				}
 			}
 			// Raw-text content is text: it must not produce child nodes.
 			fallback := `<html><body><` + tag + `><p>inner</p></` + tag + `><p>outer-OLD</p></body></html>`
@@ -175,6 +181,45 @@ func TestDiffRawTextContextMatrix(t *testing.T) {
 				if strings.Contains(node.path, "/"+tag+"[1]/") {
 					t.Fatalf("raw-text content produced a child node: %q", node.path)
 				}
+			}
+		})
+	}
+	// Both layers must treat a self-closed raw-text open tag the same way; a
+	// disagreement here previously produced a 413 from one layer and acceptance
+	// from the other.
+	for _, source := range []string{
+		"<iframe/><!--", "<xmp/><!--", "<noscript/><!--", "<noembed/><!--",
+		"<noframes/><!--", "<script/><!--", "<style/><!--", "<textarea/><!--", "<title/><!--",
+	} {
+		_, structuralErr := parseDiffHTML(source)
+		_, linesOK := normalizedHTMLLines(source)
+		if structuralErr != nil {
+			t.Fatalf("%q: parseDiffHTML err = %v, want nil (the \"<!--\" is raw text)", source, structuralErr)
+		}
+		if !linesOK {
+			t.Fatalf("%q: normalizedHTMLLines ok = false, want true", source)
+		}
+	}
+	// A trailing '/' on a non-raw-text element keeps its existing meaning.
+	for _, test := range []struct{ name, source, wantPath string }{
+		{"div", `<html><body><div/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
+		{"section", `<html><body><section/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
+		{"void_br", `<html><body><br/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
+		{"void_img", `<html><body><img src="a"/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
+	} {
+		t.Run("self_close_"+test.name, func(t *testing.T) {
+			nodes, err := parseDiffHTML(test.source)
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			var found bool
+			for _, node := range nodes {
+				if node.path == test.wantPath {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("%s missing from the tree", test.wantPath)
 			}
 		})
 	}
@@ -442,6 +487,25 @@ func FuzzDiffMarkupScanner(f *testing.F) {
 		}
 		if _, err := buildVersionDiff(1, 2, source, source+"x"); err != nil && !errors.Is(err, errDiffLimit) {
 			t.Fatalf("buildVersionDiff err = %v", err)
+		}
+	})
+}
+
+func FuzzDiffSelfClosedRawText(f *testing.F) {
+	for _, seed := range []string{
+		"<iframe/><!--", "<script/><!--", `<iframe src="a"/><p>x</p>`,
+		"<xmp/>", "<noscript/><p>x</p>", "<div/><p>x</p>", "<br/><p>x</p>",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, source string) {
+		if len(source) > 1<<14 {
+			t.Skip()
+		}
+		_, structuralErr := parseDiffHTML(source)
+		_, linesOK := normalizedHTMLLines(source)
+		if errors.Is(structuralErr, errDiffLimit) && linesOK && isUnterminatedDiffComment(source) {
+			t.Fatalf("structural failed closed, source accepted: %q", source)
 		}
 	})
 }
