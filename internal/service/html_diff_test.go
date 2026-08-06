@@ -384,7 +384,6 @@ func TestDiffUnclosedTagTailIsPlainTextAndTerminates(t *testing.T) {
 		"<",
 		"abc<",
 		"<div",
-		"<!--",
 		"<script",
 		"text<",
 		"<!",
@@ -393,7 +392,6 @@ func TestDiffUnclosedTagTailIsPlainTextAndTerminates(t *testing.T) {
 		"</div",
 		"<div class=\"x",
 		"<a href='",
-		"<!--unterminated comment",
 		"<script>alert(1)",
 		"<style>body{",
 		"<textarea>hi",
@@ -414,6 +412,26 @@ func TestDiffUnclosedTagTailIsPlainTextAndTerminates(t *testing.T) {
 			}
 			if _, err := buildVersionDiff(1, 2, source, source+"x"); err != nil && err != errDiffLimit {
 				t.Fatalf("buildVersionDiff(%q) unexpected err = %v", source, err)
+			}
+		}()
+	}
+	// Unterminated comments are the one malformed shape that fails closed rather
+	// than degrading to text; see TestDiffUnterminatedCommentFailsClosed.
+	for _, source := range []string{"<!--", "<!--unterminated comment"} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parse panicked on %q: %v", source, r)
+				}
+			}()
+			if _, err := parseDiffHTML(source); !errors.Is(err, errDiffLimit) {
+				t.Fatalf("parseDiffHTML(%q) err = %v, want errDiffLimit", source, err)
+			}
+			if _, ok := normalizedHTMLLines(source); ok {
+				t.Fatalf("normalizedHTMLLines(%q) returned ok=true for an unterminated comment", source)
+			}
+			if _, err := buildVersionDiff(1, 2, source, source+"x"); !errors.Is(err, errDiffLimit) {
+				t.Fatalf("buildVersionDiff(%q) err = %v, want errDiffLimit", source, err)
 			}
 		}()
 	}
@@ -2491,5 +2509,111 @@ func TestInlineWhiteSpaceModeCSSGrammar(t *testing.T) {
 	}
 	if len(result.Changes) != 0 || result.Summary.Modified != 0 {
 		t.Fatalf("unparsable style became preserving: %+v", result)
+	}
+}
+
+// Quotes are attribute delimiters only in tags and DOCTYPEs. An apostrophe in a
+// comment must not swallow the rest of the document into one synthetic tag line,
+// which previously cut the real edit out of the hunks.
+func TestDiffCommentQuoteDoesNotSwallowSourceEdit(t *testing.T) {
+	document := func(marker, target string) string {
+		return `<html><body><!-- ` + marker + ` --><p>lead paragraph of ordinary prose</p><p>` +
+			target + `</p><p>tail paragraph of ordinary prose</p></body></html>`
+	}
+	for _, marker := range []string{"don't edit below", `say "hi"`, "author's note"} {
+		t.Run(marker, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, document(marker, "TARGET-OLD"), document(marker, "TARGET-NEW"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 || result.Summary.Modified == 0 {
+				t.Fatalf("structural change missing: %+v", result)
+			}
+			var sawOld, sawNew bool
+			for _, hunk := range result.CodeHunks {
+				for _, line := range hunk.Lines {
+					if strings.Contains(line, "TARGET-OLD") {
+						sawOld = true
+					}
+					if strings.Contains(line, "TARGET-NEW") {
+						sawNew = true
+					}
+				}
+			}
+			if !sawOld || !sawNew {
+				t.Fatalf("edited text missing from code hunks (old=%v new=%v): %+v", sawOld, sawNew, result.CodeHunks)
+			}
+		})
+	}
+	// A DOCTYPE keeps quote-aware scanning: '>' inside a quoted system identifier
+	// does not end the declaration.
+	doctype := `<!DOCTYPE html SYSTEM "about:legacy->compat">`
+	result, err := buildVersionDiff(1, 2, doctype+"<html><body><p>old</p></body></html>", doctype+"<html><body><p>new</p></body></html>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 || result.Summary.Modified == 0 {
+		t.Fatalf("change after a quoted DOCTYPE went missing: %+v", result)
+	}
+}
+
+// An unterminated comment runs to EOF, so nothing after it is markup and no
+// structural result is complete. Returning a partial tree as success let a
+// consumer read summary=0 for a document whose source changed, so both layers
+// fail closed instead.
+func TestDiffUnterminatedCommentFailsClosed(t *testing.T) {
+	_, err := buildVersionDiff(1, 2,
+		`<html><body><!-- TODO<p>old</p></body></html>`,
+		`<html><body><!-- TODO<p>new</p></body></html>`)
+	if !errors.Is(err, errDiffLimit) {
+		t.Fatalf("unterminated comment err = %v, want errDiffLimit", err)
+	}
+	// One side malformed is enough.
+	_, err = buildVersionDiff(1, 2,
+		`<html><body><p>old</p></body></html>`,
+		`<html><body><!-- TODO<p>new</p></body></html>`)
+	if !errors.Is(err, errDiffLimit) {
+		t.Fatalf("one-sided unterminated comment err = %v, want errDiffLimit", err)
+	}
+	// A properly closed comment stays a normal, fully reported diff.
+	result, err := buildVersionDiff(1, 2,
+		`<html><body><!-- TODO --><p>old</p></body></html>`,
+		`<html><body><!-- TODO --><p>new</p></body></html>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Summary.Modified != 1 {
+		t.Fatalf("closed comment document: Modified = %d, want 1: %+v", result.Summary.Modified, result)
+	}
+	// Bogus declarations and PIs still degrade to a first-'>' terminator.
+	for _, source := range []string{`<html><body><!bogus><p>x</p></body></html>`, `<html><body><?pi><p>x</p></body></html>`} {
+		if _, err := buildVersionDiff(1, 2, source, strings.Replace(source, "x", "y", 1)); err != nil {
+			t.Fatalf("buildVersionDiff(%q) unexpected err = %v", source, err)
+		}
+	}
+}
+
+// The fail-closed unterminated-comment path must reach the caller as the same
+// 413 the service already uses for a diff it cannot safely complete.
+func TestDiffMapsUnterminatedCommentToPayloadTooLarge(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	docs := NewDocService(store, store, NewCommentService(store, sluglock.NewMemory()), sluglock.NewMemory(), "", 5<<20)
+	sources := []string{
+		`<html><body><!-- TODO<p>old</p></body></html>`,
+		`<html><body><!-- TODO<p>new</p></body></html>`,
+	}
+	for version, value := range sources {
+		if _, err := store.PutDoc(ctx, "bad-comment", version+1, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.PutMeta(ctx, "bad-comment", storage.DocMeta{Slug: "bad-comment", Versions: []storage.VersionRef{{N: 1}, {N: 2}}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := docs.Diff(ctx, "bad-comment", 1, 2)
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Status != 413 || appErr.Code != "diff_too_complex" {
+		t.Fatalf("error = %#v; want 413 diff_too_complex", err)
 	}
 }

@@ -208,22 +208,25 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		}
 		lt += cursor
 		appendDiffText(nodes, stack, source[cursor:lt])
-		if strings.HasPrefix(source[lt:], "<!--") {
-			end := strings.Index(source[lt+4:], "-->")
-			if end < 0 {
-				break
+		end, kind, terminated := diffMarkupEnd(source, lt)
+		if !terminated {
+			if kind == diffMarkupComment {
+				// An unterminated comment swallows the rest of the document, so no
+				// structural result for it is complete. The response has no way to say
+				// "structure incomplete", so fail closed instead of returning a partial
+				// tree that looks whole.
+				return nil, errDiffLimit
 			}
-			cursor = lt + 4 + end + 3
-			continue
-		}
-		end := diffTagEnd(source, lt)
-		if end < 0 {
 			appendDiffText(nodes, stack, source[lt:])
 			break
 		}
+		if kind != diffMarkupTag {
+			cursor = end + 1
+			continue
+		}
 		raw := source[lt+1 : end]
 		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" || trimmed[0] == '!' || trimmed[0] == '?' {
+		if trimmed == "" {
 			cursor = end + 1
 			continue
 		}
@@ -436,6 +439,50 @@ func indexDiffRawClose(source string, start int, tag string) (int, int) {
 	return -1, len(source) - start
 }
 
+// diffMarkupKind classifies a `<…>` construct; each kind ends by its own rule.
+type diffMarkupKind int
+
+const (
+	diffMarkupTag diffMarkupKind = iota
+	diffMarkupComment
+	diffMarkupDeclaration
+)
+
+// diffMarkupEnd returns the index of the final byte of the construct starting at
+// start. ok is false when it is unterminated. Both the structural and the
+// source-line layer share it so their notion of where markup ends cannot drift.
+// Quotes delimit attribute values only in tags and DOCTYPEs; inside comments,
+// PIs and bogus declarations they are literal text.
+func diffMarkupEnd(source string, start int) (int, diffMarkupKind, bool) {
+	rest := source[start:]
+	switch {
+	case strings.HasPrefix(rest, "<!--"):
+		term := strings.Index(source[start+4:], "-->")
+		if term < 0 {
+			return -1, diffMarkupComment, false
+		}
+		return start + 4 + term + 2, diffMarkupComment, true
+	case hasDiffDoctypePrefix(rest):
+		end := diffTagEnd(source, start)
+		return end, diffMarkupDeclaration, end >= 0
+	case strings.HasPrefix(rest, "<!"), strings.HasPrefix(rest, "<?"):
+		// Bogus comment: ends at the first '>'.
+		relative := strings.IndexByte(source[start+1:], '>')
+		if relative < 0 {
+			return -1, diffMarkupDeclaration, false
+		}
+		return start + 1 + relative, diffMarkupDeclaration, true
+	default:
+		end := diffTagEnd(source, start)
+		return end, diffMarkupTag, end >= 0
+	}
+}
+
+func hasDiffDoctypePrefix(rest string) bool {
+	const prefix = "<!doctype"
+	return len(rest) >= len(prefix) && strings.EqualFold(rest[:len(prefix)], prefix)
+}
+
 func diffTagEnd(source string, start int) int {
 	var quote byte
 	for i := start + 1; i < len(source); i++ {
@@ -592,12 +639,12 @@ func nextBoundaryInline(rest string) bool {
 	if rest[0] != '<' {
 		return true
 	}
-	end := diffTagEnd(rest, 0)
-	if end < 0 {
+	end, kind, terminated := diffMarkupEnd(rest, 0)
+	if !terminated {
 		return true
 	}
 	trimmed := strings.TrimSpace(rest[1:end])
-	if trimmed == "" || trimmed[0] == '!' || trimmed[0] == '?' {
+	if kind != diffMarkupTag || trimmed == "" {
 		return true
 	}
 	name := trimmed
@@ -1718,8 +1765,13 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 			return nil, false
 		}
 		if source[cursor] == '<' {
-			end := diffTagEnd(source, cursor)
-			if end < 0 {
+			end, kind, terminated := diffMarkupEnd(source, cursor)
+			if !terminated {
+				if kind == diffMarkupComment {
+					// Same fail-closed rule as the structural layer: an unterminated
+					// comment runs to EOF, so neither layer can report a complete diff.
+					return nil, false
+				}
 				// Unclosed '<' tail (no closing '>'): treat the remainder as plain
 				// text and terminate; do not slice an invalid tag range.
 				if !appendNormalizedDiffText(&lines, source[cursor:], false, false, preformatted()) {
@@ -1734,7 +1786,7 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 			canonical := normalizeDiffHTML(source[cursor : end+1])
 			lines = append(lines, newDiffSourceLine("tag", canonical, canonical))
 			cursor = end + 1
-			if trimmed == "" || trimmed[0] == '!' || trimmed[0] == '?' {
+			if kind != diffMarkupTag || trimmed == "" {
 				// Comment/PI/doctype: transparent for whitespace anchoring — not an
 				// element boundary, so it neither closes the pending gap nor shifts an
 				// anchor. A whitespace-free comment insert/removal is invisible to the
