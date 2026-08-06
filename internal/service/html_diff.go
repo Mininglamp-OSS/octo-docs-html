@@ -451,22 +451,16 @@ const (
 // diffMarkupEnd returns the index of the final byte of the construct starting at
 // start. ok is false when it is unterminated. Both the structural and the
 // source-line layer share it so their notion of where markup ends cannot drift.
-// Quotes delimit attribute values only in tags and DOCTYPEs; inside comments,
-// PIs and bogus declarations they are literal text.
 func diffMarkupEnd(source string, start int) (int, diffMarkupKind, bool) {
 	rest := source[start:]
 	switch {
 	case strings.HasPrefix(rest, "<!--"):
-		term := strings.Index(source[start+4:], "-->")
-		if term < 0 {
-			return -1, diffMarkupComment, false
-		}
-		return start + 4 + term + 2, diffMarkupComment, true
-	case hasDiffDoctypePrefix(rest):
-		end := diffTagEnd(source, start)
-		return end, diffMarkupDeclaration, end >= 0
+		end, terminated := diffCommentEnd(source, start)
+		return end, diffMarkupComment, terminated
 	case strings.HasPrefix(rest, "<!"), strings.HasPrefix(rest, "<?"):
-		// Bogus comment: ends at the first '>'.
+		// Bogus comment and DOCTYPE both end at the first '>': in the DOCTYPE
+		// identifier states a '>' is an abrupt-doctype parse error whose action is to
+		// emit the token, so quotes do not defer it.
 		relative := strings.IndexByte(source[start+1:], '>')
 		if relative < 0 {
 			return -1, diffMarkupDeclaration, false
@@ -478,9 +472,36 @@ func diffMarkupEnd(source string, start int) (int, diffMarkupKind, bool) {
 	}
 }
 
-func hasDiffDoctypePrefix(rest string) bool {
-	const prefix = "<!doctype"
-	return len(rest) >= len(prefix) && strings.EqualFold(rest[:len(prefix)], prefix)
+// diffCommentEnd returns the index of the final byte of the comment opening at
+// start. Mirrors core.commentEnd: "<!-->" and "<!--->" are abrupt closings, and
+// otherwise the content ends at the EARLIER of "-->" (comment-end) and "--!>"
+// (comment-end-bang) so a comment written with "--!>" does not over-scan past a
+// following real element. Only a comment with neither terminator is unterminated.
+// One forward scan finds whichever comes first, so cost is bounded by the comment
+// rather than by the rest of the document.
+func diffCommentEnd(source string, start int) (int, bool) {
+	content := start + 4
+	if content < len(source) && source[content] == '>' {
+		return content, true
+	}
+	if content+1 < len(source) && source[content] == '-' && source[content+1] == '>' {
+		return content + 1, true
+	}
+	for cursor := content; cursor < len(source); {
+		relative := strings.Index(source[cursor:], "--")
+		if relative < 0 {
+			return -1, false
+		}
+		dashes := cursor + relative
+		switch {
+		case dashes+2 < len(source) && source[dashes+2] == '>':
+			return dashes + 2, true
+		case dashes+3 < len(source) && source[dashes+2] == '!' && source[dashes+3] == '>':
+			return dashes + 3, true
+		}
+		cursor = dashes + 1
+	}
+	return -1, false
 }
 
 func diffTagEnd(source string, start int) int {
@@ -913,9 +934,15 @@ func isDiffVoidTag(tag string) bool {
 	}
 }
 
+// isDiffRawTextTag covers the elements whose content the tokenizer reads as text
+// rather than markup (RAWTEXT and RCDATA): '<' inside them is literal and only the
+// matching end tag closes them. noscript is included because scripting is enabled
+// in any normal browser. plaintext is NOT here: it runs to EOF rather than to a
+// matching close tag, which this path cannot express.
 func isDiffRawTextTag(tag string) bool {
 	switch tag {
-	case "script", "style", "textarea", "title":
+	case "script", "style", "textarea", "title",
+		"iframe", "noembed", "noframes", "xmp", "noscript":
 		return true
 	default:
 		return false

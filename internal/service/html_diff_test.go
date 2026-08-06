@@ -2545,16 +2545,6 @@ func TestDiffCommentQuoteDoesNotSwallowSourceEdit(t *testing.T) {
 			}
 		})
 	}
-	// A DOCTYPE keeps quote-aware scanning: '>' inside a quoted system identifier
-	// does not end the declaration.
-	doctype := `<!DOCTYPE html SYSTEM "about:legacy->compat">`
-	result, err := buildVersionDiff(1, 2, doctype+"<html><body><p>old</p></body></html>", doctype+"<html><body><p>new</p></body></html>")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result.Changes) == 0 || result.Summary.Modified == 0 {
-		t.Fatalf("change after a quoted DOCTYPE went missing: %+v", result)
-	}
 }
 
 // An unterminated comment runs to EOF, so nothing after it is markup and no
