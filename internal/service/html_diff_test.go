@@ -1279,6 +1279,8 @@ func TestBuildVersionDiffRawTextWhitespaceAndStrayLtAreVisible(t *testing.T) {
 		{"last_declaration_wins", `<div style="white-space: pre; white-space: normal">a b</div>`, `<div style="white-space: pre; white-space: normal">a  b</div>`},
 		{"important_wins", `<div style="white-space: normal !important; white-space: pre">a b</div>`, `<div style="white-space: normal !important; white-space: pre">a  b</div>`},
 		{"descendant_override", `<pre><code style="white-space: normal">a b</code></pre>`, `<pre><code style="white-space: normal">a  b</code></pre>`},
+		{"self_override", `<pre style="white-space: normal">a b</pre>`, `<pre style="white-space: normal">a  b</pre>`},
+		{"textarea_self_override", `<textarea style="white-space: normal">a b</textarea>`, `<textarea style="white-space: normal">a  b</textarea>`},
 	}
 	for _, test := range collapsedCases {
 		t.Run(test.name, func(t *testing.T) {
@@ -1288,6 +1290,11 @@ func TestBuildVersionDiffRawTextWhitespaceAndStrayLtAreVisible(t *testing.T) {
 			}
 			if len(result.Changes) != 0 || result.Summary.Modified != 0 {
 				t.Fatalf("CSS-collapsible whitespace became structural: %+v", result)
+			}
+			// Both output fields must agree; a silent structural diff beside a
+			// non-empty hunk is a self-contradicting response.
+			if len(result.CodeHunks) != 0 {
+				t.Fatalf("collapsible whitespace surfaced in code hunks only: %+v", result)
 			}
 		})
 	}
@@ -2343,4 +2350,146 @@ func TestWhitespaceFingerprintRawInsertBeforeRunIsTransparent(t *testing.T) {
 		t.Fatalf("real whitespace beside a raw block was swallowed:\n%s", hunksBody(wsResult.CodeHunks))
 	}
 	assertNoLeakedInternals(t, wsResult.CodeHunks)
+}
+
+// Preformatted whitespace must surface for nested <pre>/<textarea>, not only when
+// the element is the document root: real documents always wrap them.
+func TestBuildVersionDiffNestedPreformattedWhitespaceIsVisible(t *testing.T) {
+	preserved := []struct {
+		name          string
+		before, after string
+	}{
+		{"html_body_pre", "<html><body><pre>a b</pre></body></html>", "<html><body><pre>a  b</pre></body></html>"},
+		{"div_pre", "<div><pre>a b</pre></div>", "<div><pre>a  b</pre></div>"},
+		{"section_div_pre", "<section><div><pre>a b</pre></div></section>", "<section><div><pre>a  b</pre></div></section>"},
+		{"body_pre_code_reindent", "<html><body><pre><code>if x:\n  y\n</code></pre></body></html>", "<html><body><pre><code>if x:\n    y\n</code></pre></body></html>"},
+		{"body_textarea", "<html><body><textarea>a b</textarea></body></html>", "<html><body><textarea>a  b</textarea></body></html>"},
+		{"form_textarea", "<form><textarea>a b</textarea></form>", "<form><textarea>a  b</textarea></form>"},
+		{"body_style_pre", `<html><body><div style="white-space: pre">a b</div></body></html>`, `<html><body><div style="white-space: pre">a  b</div></body></html>`},
+		{"pre_descendant_inherits", "<pre><span>a b</span></pre>", "<pre><span>a  b</span></pre>"},
+	}
+	for _, test := range preserved {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 || result.Summary.Modified == 0 {
+				t.Fatalf("nested preformatted whitespace change missing from structural diff: %+v", result)
+			}
+		})
+	}
+	collapsed := []struct {
+		name          string
+		before, after string
+	}{
+		{"html_body_div", "<html><body><div>a b</div></body></html>", "<html><body><div>a  b</div></body></html>"},
+		{"div_div", "<div><div>a b</div></div>", "<div><div>a  b</div></div>"},
+	}
+	for _, test := range collapsed {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) != 0 || result.Summary.Modified != 0 || len(result.CodeHunks) != 0 {
+				t.Fatalf("collapsible whitespace under a wrapper became a change: %+v", result)
+			}
+		})
+	}
+}
+
+// white-space: pre-line preserves forced line breaks, so a newline edit under it
+// must surface in both output fields; spaces under it still collapse.
+func TestBuildVersionDiffPreLineKeepsNewlines(t *testing.T) {
+	result, err := buildVersionDiff(1, 2,
+		`<div style="white-space: pre-line">a`+"\n"+`b</div>`,
+		`<div style="white-space: pre-line">a`+"\n\n"+`b</div>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 || result.Summary.Modified == 0 {
+		t.Fatalf("pre-line newline edit missing from structural diff: %+v", result)
+	}
+	if len(result.CodeHunks) == 0 {
+		t.Fatalf("pre-line newline edit missing from code hunks: %+v", result)
+	}
+	spaces, err := buildVersionDiff(1, 2,
+		`<div style="white-space: pre-line">a b</div>`,
+		`<div style="white-space: pre-line">a  b</div>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spaces.Changes) != 0 || spaces.Summary.Modified != 0 {
+		t.Fatalf("pre-line space run became structural: %+v", spaces)
+	}
+}
+
+// Loose text directly inside html/head/body has no child element to carry it, so
+// a wrapper's own text change must be reported instead of skipped.
+func TestBuildVersionDiffWrapperOwnTextChangeIsReported(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		before, after string
+	}{
+		{"body_text", "<html><body>hello</body></html>", "<html><body>world</body></html>"},
+		{"html_text", "<html>hello</html>", "<html>world</html>"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 || result.Summary.Modified == 0 {
+				t.Fatalf("wrapper text replacement missing from structural diff: %+v", result)
+			}
+		})
+	}
+	// Reindenting a wrapper around block children is still not a change.
+	result, err := buildVersionDiff(1, 2,
+		"<html><body><p>x</p></body></html>",
+		"<html><body>\n  <p>x</p>\n</body></html>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range result.Changes {
+		if change.DOMPath == "/html[1]/body[1]" {
+			t.Fatalf("wrapper reindent reported as a change: %+v", result)
+		}
+	}
+}
+
+// CSS-wide keywords are unspecified, so a <pre> keeps its UA preserving default;
+// invalid or comment-bearing declarations must not erase a valid earlier one.
+func TestInlineWhiteSpaceModeCSSGrammar(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		before, after string
+	}{
+		{"revert_on_pre", `<pre style="white-space: revert">a b</pre>`, `<pre style="white-space: revert">a  b</pre>`},
+		{"revert_layer_on_pre", `<pre style="white-space: revert-layer">a b</pre>`, `<pre style="white-space: revert-layer">a  b</pre>`},
+		{"inherit_on_pre", `<pre style="white-space: inherit">a b</pre>`, `<pre style="white-space: inherit">a  b</pre>`},
+		{"bang_space_important", `<div style="white-space: pre ! important">a b</div>`, `<div style="white-space: pre ! important">a  b</div>`},
+		{"invalid_later_declaration_dropped", `<div style="white-space: pre; white-space: garbage">a b</div>`, `<div style="white-space: pre; white-space: garbage">a  b</div>`},
+		{"invalid_important_dropped", `<div style="white-space: pre; white-space: garbage !important">a b</div>`, `<div style="white-space: pre; white-space: garbage !important">a  b</div>`},
+		{"css_comment", `<div style="white-space:/**/pre">a b</div>`, `<div style="white-space:/**/pre">a  b</div>`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 || result.Summary.Modified == 0 {
+				t.Fatalf("preserved whitespace edit missing from structural diff: %+v", result)
+			}
+		})
+	}
+	// Unclosed comment leaves nothing valid, so the tag default applies.
+	result, err := buildVersionDiff(1, 2, `<div style="white-space: /*pre">a b</div>`, `<div style="white-space: /*pre">a  b</div>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) != 0 || result.Summary.Modified != 0 {
+		t.Fatalf("unparsable style became preserving: %+v", result)
+	}
 }

@@ -122,7 +122,13 @@ func buildVersionDiff(fromVersion, toVersion int, before, after string) (*Versio
 	for beforeIndex, afterIndex := range matches {
 		matchedAfter[afterIndex] = beforeIndex
 		beforeNode, afterNode := beforeNodes[beforeIndex], afterNodes[afterIndex]
-		if isDiffWrapper(beforeNode.tag) || diffNodeSignature(beforeNode) == diffNodeSignature(afterNode) {
+		if diffNodeSignature(beforeNode) == diffNodeSignature(afterNode) {
+			continue
+		}
+		// html/head/body carry no visual identity of their own, so their children
+		// report structural edits — except loose text directly inside them, which has
+		// no child to carry it.
+		if isDiffWrapper(beforeNode.tag) && beforeNode.compareText == afterNode.compareText {
 			continue
 		}
 		changes = append(changes, ElementChange{
@@ -326,20 +332,26 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 	for _, entry := range stack {
 		nodes[entry.index].outer = source[entry.start:]
 	}
-	preformattedNode := make([]bool, len(nodes))
+	preformattedNode := make([]whiteSpaceMode, len(nodes))
 	for index := range nodes {
-		preserve := nodes[index].tag == "pre" || nodes[index].tag == "textarea"
+		// white-space inherits; the UA rule on pre/textarea beats inheritance, and an
+		// author inline style beats both.
+		mode := whiteSpaceCollapse
 		if parent := nodes[index].parent; parent >= 0 {
-			preserve = preformattedNode[parent]
+			mode = preformattedNode[parent]
 		}
-		if stylePreserves, specified := inlineWhiteSpaceMode(nodes[index].attrs["style"]); specified {
-			preserve = stylePreserves
+		if nodes[index].tag == "pre" || nodes[index].tag == "textarea" {
+			mode = whiteSpacePreserve
 		}
-		preformattedNode[index] = preserve
+		if styleMode, specified := inlineWhiteSpaceMode(nodes[index].attrs["style"]); specified {
+			mode = styleMode
+		}
+		preformattedNode[index] = mode
 	}
 	for index := range nodes {
 		literalRawText := isDiffLiteralRawTextTag(nodes[index].tag)
-		preserveWhitespace := preformattedNode[index]
+		whiteSpace := preformattedNode[index]
+		preserveWhitespace := whiteSpace == whiteSpacePreserve
 		fullText := ""
 		textDigest := sha256.New()
 		if literalRawText {
@@ -358,7 +370,12 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				start = end
 				fullTextBuilder.WriteString(segment)
 				normalizedSegment := segment
-				if !preserveWhitespace {
+				switch whiteSpace {
+				case whiteSpacePreserve:
+				case whiteSpacePreserveLines:
+					// pre-line collapses spaces but keeps forced line breaks.
+					normalizedSegment = normalizeDiffTextSegmentKeepLines(segment)
+				default:
 					normalizedSegment = normalizeDiffTextSegment(segment)
 				}
 				if normalizedSegment == "" {
@@ -369,7 +386,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				// boundary, so it must not perturb the digest. Whitespace touching an
 				// inline (or unknown/custom, treated inline) neighbor stays framed so
 				// "see <a>here</a>" keeps its visible space.
-				if !preserveWhitespace && isOnlyHTMLASCIIWhitespace(segment) && !diffSlotWhitespaceVisible(nodes[index], slot) {
+				if !preserveWhitespace && isOnlyHTMLASCIIWhitespace(segment) && !strings.Contains(normalizedSegment, "\n") && !diffSlotWhitespaceVisible(nodes[index], slot) {
 					continue
 				}
 				// Frame each non-empty segment with its boundary slot so text at
@@ -380,7 +397,11 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				writeDiffFrame(textDigest, normalizedSegment)
 			}
 			fullText = fullTextBuilder.String()
-			if !preserveWhitespace {
+			switch whiteSpace {
+			case whiteSpacePreserve:
+			case whiteSpacePreserveLines:
+				fullText = collapseHTMLASCIIWhitespaceKeepLines(fullText)
+			default:
 				fullText = collapseHTMLASCIIWhitespace(fullText)
 			}
 		}
@@ -747,6 +768,59 @@ func collapseHTMLASCIIWhitespace(value string) string {
 		builder.WriteByte(value[i])
 	}
 	return builder.String()
+}
+
+// collapseHTMLASCIIWhitespaceKeepLines implements white-space: pre-line: spaces
+// collapse, forced line breaks are preserved (including consecutive ones).
+func collapseHTMLASCIIWhitespaceKeepLines(value string) string {
+	var builder strings.Builder
+	builder.Grow(len(value))
+	pending := false
+	newlines := 0
+	flush := func() {
+		if !pending {
+			return
+		}
+		switch {
+		case newlines > 0:
+			builder.WriteString(strings.Repeat("\n", newlines))
+		case builder.Len() > 0:
+			builder.WriteByte(' ')
+		}
+		pending, newlines = false, 0
+	}
+	for i := 0; i < len(value); i++ {
+		if isHTMLASCIIWhitespace(value[i]) {
+			// CRLF counts once.
+			if value[i] == '\n' || (value[i] == '\r' && (i+1 == len(value) || value[i+1] != '\n')) {
+				newlines++
+			}
+			pending = true
+			continue
+		}
+		flush()
+		builder.WriteByte(value[i])
+	}
+	flush()
+	return builder.String()
+}
+
+// normalizeDiffTextSegmentKeepLines is normalizeDiffTextSegment for pre-line:
+// boundary whitespace stays representable, newlines are not collapsed away.
+func normalizeDiffTextSegmentKeepLines(value string) string {
+	if value == "" {
+		return ""
+	}
+	leading := isHTMLASCIIWhitespace(value[0])
+	trailing := isHTMLASCIIWhitespace(value[len(value)-1])
+	collapsed := collapseHTMLASCIIWhitespaceKeepLines(value)
+	if leading && !strings.HasPrefix(collapsed, "\n") {
+		collapsed = " " + collapsed
+	}
+	if trailing && !strings.HasSuffix(collapsed, "\n") {
+		collapsed += " "
+	}
+	return collapsed
 }
 
 func writeDiffFrame(builder interface{ Write([]byte) (int, error) }, value string) {
@@ -1615,8 +1689,8 @@ func newWhitespaceFingerprintLine(digest string) diffSourceLine {
 
 func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 	lines := make([]diffSourceLine, 0, 256)
-	preStack := make([]string, 0, 16)
-	preformatted := func() bool { return len(preStack) > 0 }
+	preStack := make([]preContext, 0, 16)
+	preformatted := func() bool { return len(preStack) > 0 && preStack[len(preStack)-1].preserve }
 	// layoutCSS is a bounded, conservative document-level signal that a stylesheet
 	// rule could turn a block boundary inline, making newline-free inter-tag
 	// whitespace visible. prevInline tracks the inline-ness of the boundary just
@@ -1694,8 +1768,10 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 				// never split as a spurious tag (the double-blind that hid
 				// textarea/title content changes); it is emitted to the line diff but
 				// never fed into the whitespace gap.
-				if !selfClosing && !isDiffVoidTag(tag) && isPreformattedContext(tag, attrRaw) {
-					preStack = append(preStack, tag)
+				if !selfClosing && !isDiffVoidTag(tag) {
+					if preserve, establishes := isPreformattedContext(tag, attrRaw); establishes {
+						preStack = append(preStack, preContext{tag: tag, preserve: preserve})
+					}
 				}
 				prevInline = boundaryInline(tag, attrRaw)
 				literalRaw := isDiffLiteralRawTextTag(tag)
@@ -1730,8 +1806,10 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 			// gap; only a gap carrying actual whitespace becomes a fingerprint event.
 			fingerprint.boundary()
 			prevInline = boundaryInline(tag, attrRaw)
-			if !selfClosing && !isDiffVoidTag(tag) && isPreformattedContext(tag, attrRaw) {
-				preStack = append(preStack, tag)
+			if !selfClosing && !isDiffVoidTag(tag) {
+				if preserve, establishes := isPreformattedContext(tag, attrRaw); establishes {
+					preStack = append(preStack, preContext{tag: tag, preserve: preserve})
+				}
 			}
 			continue
 		}
@@ -1804,63 +1882,113 @@ func appendNormalizedDiffText(lines *[]diffSourceLine, text string, literal, vis
 	return true
 }
 
+// preContext is one open element's whitespace context for the source-line layer.
+// Elements that explicitly set white-space are stacked even when they collapse,
+// so a descendant can override an ancestor <pre>.
+type preContext struct {
+	tag      string
+	preserve bool
+}
+
 // isPreformattedContext reports whether an open tag establishes a
-// whitespace-preserving context for its descendants: the native pre/textarea
-// elements, or any element whose inline style sets white-space to a preserving
-// value. attrRaw is the tag text after the name.
-func isPreformattedContext(tag, attrRaw string) bool {
+// whitespace-preserving context for its descendants, and whether it establishes
+// any context at all. An inline style wins over the tag default; pre-line counts
+// as preserving here because the source-line layer only needs line breaks kept.
+func isPreformattedContext(tag, attrRaw string) (preserve, establishes bool) {
+	if mode, specified := inlineWhiteSpaceMode(parseDiffAttrs(attrRaw)["style"]); specified {
+		return mode != whiteSpaceCollapse, true
+	}
 	if tag == "pre" || tag == "textarea" {
-		return true
+		return true, true
 	}
-	style := parseDiffAttrs(attrRaw)["style"]
-	if style == "" {
-		return false
-	}
-	return styleHasPreservedWhitespace(style)
+	return false, false
 }
 
-func styleHasPreservedWhitespace(style string) bool {
-	preserve, _ := inlineWhiteSpaceMode(style)
-	return preserve
-}
+// whiteSpaceMode is the effective CSS white-space behaviour for a node's text.
+type whiteSpaceMode int
 
-func inlineWhiteSpaceMode(style string) (preserve, specified bool) {
-	var normalValue string
-	var importantValue string
+const (
+	whiteSpaceCollapse whiteSpaceMode = iota
+	whiteSpacePreserveLines
+	whiteSpacePreserve
+)
+
+// inlineWhiteSpaceMode resolves an inline style's white-space declaration.
+// specified is false when no valid declaration exists — including the CSS-wide
+// keywords, which must fall back to the tag default (revert on <pre> is pre).
+func inlineWhiteSpaceMode(style string) (mode whiteSpaceMode, specified bool) {
+	style = stripCSSComments(style)
+	var normalMode, importantMode whiteSpaceMode
+	var hasNormal, hasImportant bool
 	for _, declaration := range strings.Split(style, ";") {
 		property, value, ok := strings.Cut(declaration, ":")
 		if !ok || !strings.EqualFold(strings.TrimSpace(property), "white-space") {
 			continue
 		}
 		value = strings.ToLower(strings.TrimSpace(value))
-		important := strings.HasSuffix(value, "!important")
+		important := false
+		// CSS allows whitespace (and comments, stripped above) between ! and important.
+		if marker := strings.LastIndexByte(value, '!'); marker >= 0 && strings.TrimSpace(value[marker+1:]) == "important" {
+			important = true
+			value = strings.TrimSpace(value[:marker])
+		}
+		parsed, valid := whiteSpaceKeyword(value)
+		if !valid {
+			// Invalid declarations are dropped at parse time; an earlier valid one wins.
+			continue
+		}
 		if important {
-			value = strings.TrimSpace(strings.TrimSuffix(value, "!important"))
-			importantValue = value
+			importantMode, hasImportant = parsed, true
 		} else {
-			normalValue = value
+			normalMode, hasNormal = parsed, true
 		}
 	}
-	value := importantValue
-	if value == "" {
-		value = normalValue
+	if hasImportant {
+		return importantMode, true
 	}
-	if value == "" {
-		return false, false
+	if hasNormal {
+		return normalMode, true
 	}
+	return whiteSpaceCollapse, false
+}
+
+func whiteSpaceKeyword(value string) (whiteSpaceMode, bool) {
 	switch value {
 	case "pre", "pre-wrap", "break-spaces":
-		return true, true
-	case "normal", "nowrap", "pre-line", "initial", "revert", "revert-layer":
-		return false, true
+		return whiteSpacePreserve, true
+	case "pre-line":
+		return whiteSpacePreserveLines, true
+	case "normal", "nowrap":
+		return whiteSpaceCollapse, true
 	default:
-		return false, false
+		return whiteSpaceCollapse, false
 	}
 }
 
-func popPreformatted(preStack *[]string, closeTag string) {
+func stripCSSComments(style string) string {
+	if !strings.Contains(style, "/*") {
+		return style
+	}
+	var builder strings.Builder
+	builder.Grow(len(style))
+	for {
+		open := strings.Index(style, "/*")
+		if open < 0 {
+			builder.WriteString(style)
+			return builder.String()
+		}
+		builder.WriteString(style[:open])
+		term := strings.Index(style[open+2:], "*/")
+		if term < 0 {
+			return builder.String()
+		}
+		style = style[open+2+term+2:]
+	}
+}
+
+func popPreformatted(preStack *[]preContext, closeTag string) {
 	for pos := len(*preStack) - 1; pos >= 0; pos-- {
-		if (*preStack)[pos] == closeTag {
+		if (*preStack)[pos].tag == closeTag {
 			*preStack = (*preStack)[:pos]
 			return
 		}
