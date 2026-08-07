@@ -95,7 +95,16 @@ func TestDiffRawTextDigestPreservesBytes(t *testing.T) {
 }
 
 func TestParseDiffAttrsDuplicateNamesUseFirstValue(t *testing.T) {
-	attrs := parseDiffAttrs(` VALUE="first" value="second" VaLuE="third"`)
+	var attrs map[string]string
+	err := scanDiffHTML(`<input VALUE="first" value="second" VaLuE="third">`, func(token diffHTMLToken) error {
+		if token.tag == "input" {
+			attrs = token.attrs
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if attrs["value"] != "first" {
 		t.Fatalf("value = %q; want first", attrs["value"])
 	}
@@ -943,11 +952,42 @@ func TestParseDiffHTMLCommentSeparatedTextAllocationsStayLinear(t *testing.T) {
 	runtime.GC()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	if _, err := parseDiffHTML(source.String()); err != nil {
+	nodes, err := parseDiffHTML(source.String())
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %d; want 1", len(nodes))
 	}
 	runtime.ReadMemStats(&after)
 	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<20 {
+		t.Fatalf("parse allocated %d bytes for %d-byte input", allocated, source.Len())
+	}
+}
+
+func TestParseDiffHTMLFiveMiBCommentSeparatedTextAllocationAndResult(t *testing.T) {
+	var source strings.Builder
+	source.Grow(5 << 20)
+	source.WriteString("<main>")
+	for source.Len() < 5<<20 {
+		source.WriteString("x<!-- separator -->")
+	}
+	source.WriteString("</main>")
+
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	nodes, err := parseDiffHTML(source.String())
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].tag != "main" {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("5MiB comment-separated parse: input=%d nodes=%d allocated=%d", source.Len(), len(nodes), allocated)
+	if allocated > 256<<20 {
 		t.Fatalf("parse allocated %d bytes for %d-byte input", allocated, source.Len())
 	}
 }

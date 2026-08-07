@@ -51,13 +51,22 @@ func TestDiffUnquotedAttributeValueKeepsSlashes(t *testing.T) {
 		{` href="docs/v1/intro"`, "href", "docs/v1/intro"},
 		{` href='docs/v1/intro'`, "href", "docs/v1/intro"},
 	} {
-		attrs := parseDiffAttrs(test.raw)
+		var attrs map[string]string
+		err := scanDiffHTML("<a"+test.raw+">", func(token diffHTMLToken) error {
+			if token.tag == "a" {
+				attrs = token.attrs
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("scan start tag %q: %v", test.raw, err)
+		}
 		if got := attrs[test.name]; got != test.want {
-			t.Errorf("parseDiffAttrs(%q)[%q] = %q, want %q (full: %v)", test.raw, test.name, got, test.want, attrs)
+			t.Errorf("start tag attrs for %q[%q] = %q, want %q (full: %v)", test.raw, test.name, got, test.want, attrs)
 		}
 		// No spurious boolean attributes from split value segments.
 		if len(attrs) != 1 {
-			t.Errorf("parseDiffAttrs(%q) = %v, want exactly one attribute", test.raw, attrs)
+			t.Errorf("start tag attrs for %q = %v, want exactly one attribute", test.raw, attrs)
 		}
 	}
 	// Reordering path segments must change the structural signature.

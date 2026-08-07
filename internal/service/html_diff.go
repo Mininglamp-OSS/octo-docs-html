@@ -13,9 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/sergi/go-diff/diffmatchpatch"
+	xhtml "golang.org/x/net/html"
 )
 
 var errDiffLimit = errors.New("diff complexity limit exceeded")
@@ -101,15 +101,131 @@ type diffOpenNode struct {
 	start int
 }
 
+type diffHTMLToken struct {
+	type_      xhtml.TokenType
+	raw        string
+	text       string
+	start, end int
+	tag        string
+	attrs      map[string]string
+	rawTextTag string
+	namespace  string
+}
+
+type diffNamespaceEntry struct {
+	tag, namespace string
+	integration    bool
+}
+
+// scanDiffHTML is the sole HTML boundary/attribute/raw-text front-end used by
+// both diff views. Tokens are ephemeral and raw aliases the original source.
+func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
+	z := xhtml.NewTokenizer(strings.NewReader(source))
+	z.SetMaxBuf(maxDiffRawScanBytes)
+	offset := 0
+	stack := make([]diffNamespaceEntry, 0, 32)
+	for {
+		z.AllowCDATA(len(stack) > 0 && stack[len(stack)-1].namespace != "" && !stack[len(stack)-1].integration)
+		type_ := z.Next()
+		if type_ == xhtml.ErrorToken {
+			if err := z.Err(); err != nil && !errors.Is(err, io.EOF) {
+				return errDiffLimit
+			}
+			if tailBytes := z.Raw(); len(tailBytes) != 0 {
+				if len(tailBytes) > len(source)-offset {
+					return errDiffLimit
+				}
+				tail := source[offset : offset+len(tailBytes)]
+				if err := visit(diffHTMLToken{type_: xhtml.TextToken, raw: tail, text: string(z.Text()), start: offset, end: offset + len(tail)}); err != nil {
+					return err
+				}
+				offset += len(tail)
+			}
+			break
+		}
+		rawBytes := z.Raw()
+		if len(rawBytes) > len(source)-offset {
+			return errDiffLimit
+		}
+		raw := source[offset : offset+len(rawBytes)]
+		token := diffHTMLToken{type_: type_, raw: raw, start: offset, end: offset + len(raw)}
+		offset = token.end
+		terminatedComment := strings.HasSuffix(raw, "-->") || len(raw) >= 8 && strings.HasSuffix(raw, "--!>") || raw == "<!-->" || raw == "<!--->"
+		if type_ == xhtml.CommentToken && strings.HasPrefix(raw, "<!--") && !terminatedComment {
+			return errDiffLimit
+		}
+		if type_ == xhtml.TextToken {
+			token.text = string(z.Text())
+		}
+		if type_ == xhtml.StartTagToken || type_ == xhtml.SelfClosingTagToken || type_ == xhtml.EndTagToken {
+			name, more := z.TagName()
+			token.tag = string(name)
+			token.attrs = map[string]string{}
+			for more {
+				key, value, next := z.TagAttr()
+				if _, exists := token.attrs[string(key)]; !exists {
+					token.attrs[string(key)] = string(value)
+				}
+				more = next
+			}
+		}
+		if type_ == xhtml.TextToken && len(stack) > 0 && stack[len(stack)-1].namespace == "" && isDiffRawTextTag(stack[len(stack)-1].tag) {
+			token.rawTextTag = stack[len(stack)-1].tag
+		}
+		if type_ == xhtml.StartTagToken || type_ == xhtml.SelfClosingTagToken {
+			for len(stack) > 0 && stack[len(stack)-1].namespace == "" && impliedDiffEndTag(stack[len(stack)-1].tag, token.tag) {
+				stack = stack[:len(stack)-1]
+			}
+			namespace := ""
+			if len(stack) > 0 && !stack[len(stack)-1].integration {
+				namespace = stack[len(stack)-1].namespace
+			}
+			if namespace == "" {
+				switch token.tag {
+				case "svg":
+					namespace = "svg"
+				case "math":
+					namespace = "math"
+				}
+			}
+			token.namespace = namespace
+			entry := diffNamespaceEntry{tag: token.tag, namespace: namespace}
+			entry.integration = diffHTMLIntegrationPoint(entry, token.attrs)
+			selfClosing := namespace != "" && type_ == xhtml.SelfClosingTagToken || namespace == "" && isDiffVoidTag(token.tag)
+			if !selfClosing {
+				stack = append(stack, entry)
+				if namespace != "" && isDiffRawTextTag(token.tag) {
+					z.NextIsNotRawText()
+				}
+			}
+		} else if type_ == xhtml.EndTagToken {
+			for index := len(stack) - 1; index >= 0; index-- {
+				if stack[index].tag == token.tag {
+					token.namespace = stack[index].namespace
+					stack = stack[:index]
+					break
+				}
+			}
+		}
+		if err := visit(token); err != nil {
+			return err
+		}
+	}
+	if offset != len(source) {
+		return errDiffLimit
+	}
+	return nil
+}
+
 func buildVersionDiff(fromVersion, toVersion int, before, after string) (*VersionDiff, error) {
 	if before == after {
 		return &VersionDiff{From: fromVersion, To: toVersion, Changes: []ElementChange{}, CodeHunks: []CodeHunk{}}, nil
 	}
-	beforeNodes, err := parseDiffHTML(before)
+	beforeNodes, beforeLines, err := scanDiffDocument(before, true)
 	if err != nil {
 		return nil, err
 	}
-	afterNodes, err := parseDiffHTML(after)
+	afterNodes, afterLines, err := scanDiffDocument(after, true)
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +288,7 @@ func buildVersionDiff(fromVersion, toVersion int, before, after string) (*Versio
 		}
 		return changes[i].DOMPath < changes[j].DOMPath
 	})
-	hunks, err := diffCodeHunks(before, after)
+	hunks, err := diffCodeHunksLines(beforeLines, afterLines)
 	if err != nil {
 		return nil, err
 	}
@@ -194,160 +310,123 @@ func buildVersionDiff(fromVersion, toVersion int, before, after string) (*Versio
 }
 
 func parseDiffHTML(source string) ([]htmlDiffNode, error) {
+	nodes, _, err := scanDiffDocument(source, false)
+	return nodes, err
+}
+
+func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSourceLine, error) {
 	nodes := make([]htmlDiffNode, 0, 128)
 	stack := make([]diffOpenNode, 0, 32)
 	rootCounts := map[string]int{}
 	childCounts := map[int]map[string]int{}
-	rawScanBytes := 0
 	pathBytes := 0
-	for cursor := 0; cursor < len(source); {
-		lt := strings.IndexByte(source[cursor:], '<')
-		if lt < 0 {
-			appendDiffText(nodes, stack, source[cursor:])
-			break
+	var lineConsumer *diffLineConsumer
+	if withLines {
+		lineConsumer = newDiffLineConsumer(source)
+	}
+	err := scanDiffHTML(source, func(token diffHTMLToken) error {
+		if lineConsumer != nil && !lineConsumer.consume(token) {
+			return errDiffLimit
 		}
-		lt += cursor
-		appendDiffText(nodes, stack, source[cursor:lt])
-		end, kind, terminated := diffMarkupEnd(source, lt)
-		if !terminated {
-			if kind == diffMarkupComment {
-				// An unterminated comment swallows the rest of the document, so no
-				// structural result for it is complete. The response has no way to say
-				// "structure incomplete", so fail closed instead of returning a partial
-				// tree that looks whole.
-				return nil, errDiffLimit
+		switch token.type_ {
+		case xhtml.TextToken:
+			text := token.text
+			if token.rawTextTag != "" && isDiffLiteralRawTextTag(token.rawTextTag) {
+				text = token.raw
 			}
-			appendDiffText(nodes, stack, source[lt:])
-			break
-		}
-		if kind != diffMarkupTag {
-			cursor = end + 1
-			continue
-		}
-		raw := source[lt+1 : end]
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" {
-			cursor = end + 1
-			continue
-		}
-		if trimmed[0] == '/' {
-			tag, ok := diffTagName(trimmed[1:])
-			if !ok {
-				return nil, errDiffLimit
-			}
+			appendDiffText(nodes, stack, text)
+		case xhtml.EndTagToken:
 			for pos := len(stack) - 1; pos >= 0; pos-- {
 				entry := stack[pos]
-				if nodes[entry.index].tag != tag {
+				if nodes[entry.index].tag != token.tag {
 					continue
 				}
 				for popped := len(stack) - 1; popped > pos; popped-- {
 					open := stack[popped]
-					nodes[open.index].outer = source[open.start:lt]
+					nodes[open.index].outer = source[open.start:token.start]
 				}
-				nodes[entry.index].outer = source[entry.start : end+1]
+				nodes[entry.index].outer = source[entry.start:token.end]
 				stack = stack[:pos]
 				break
 			}
-			cursor = end + 1
-			continue
-		}
-		tag, ok := diffTagName(trimmed)
-		if !ok {
-			return nil, errDiffLimit
-		}
-		if tag == "" {
-			cursor = end + 1
-			continue
-		}
-		for len(stack) > 0 && impliedDiffEndTag(nodes[stack[len(stack)-1].index].tag, tag) {
-			entry := stack[len(stack)-1]
-			nodes[entry.index].outer = source[entry.start:lt]
-			stack = stack[:len(stack)-1]
-		}
-		if len(nodes) >= maxDiffNodes || len(stack) >= maxDiffDepth {
-			return nil, errDiffLimit
-		}
-		parent := -1
-		counts := rootCounts
-		if len(stack) > 0 {
-			parent = stack[len(stack)-1].index
-			counts = childCounts[parent]
-			if counts == nil {
-				counts = map[string]int{}
-				childCounts[parent] = counts
+		case xhtml.StartTagToken, xhtml.SelfClosingTagToken:
+			tag := token.tag
+			if len(tag) > maxDiffTagBytes {
+				return errDiffLimit
+			}
+			for len(stack) > 0 && impliedDiffEndTag(nodes[stack[len(stack)-1].index].tag, tag) {
+				entry := stack[len(stack)-1]
+				nodes[entry.index].outer = source[entry.start:token.start]
+				stack = stack[:len(stack)-1]
+			}
+			if len(nodes) >= maxDiffNodes || len(stack) >= maxDiffDepth {
+				return errDiffLimit
+			}
+			parent := -1
+			counts := rootCounts
+			if len(stack) > 0 {
+				parent = stack[len(stack)-1].index
+				counts = childCounts[parent]
+				if counts == nil {
+					counts = map[string]int{}
+					childCounts[parent] = counts
+				}
+			}
+			counts[tag]++
+			segment := "/" + tag + fmt.Sprintf("[%d]", counts[tag])
+			pathLen := len(segment)
+			if parent >= 0 {
+				pathLen += len(nodes[parent].path)
+			}
+			if pathLen > maxDiffPathBytes || pathBytes > maxDiffPathsBytes-pathLen {
+				return errDiffLimit
+			}
+			path := segment
+			if parent >= 0 {
+				path = nodes[parent].path + segment
+			}
+			pathBytes += pathLen
+			siblingPos := counts[tag] - 1
+			if parent >= 0 {
+				siblingPos = len(nodes[parent].children)
+			}
+			node := htmlDiffNode{tag: tag, aid: token.attrs["data-odoc-aid"], attrs: token.attrs, path: path, parent: parent, siblingPos: siblingPos, order: len(nodes)}
+			nodes = append(nodes, node)
+			index := len(nodes) - 1
+			if parent >= 0 {
+				nodes[parent].textBounds = append(nodes[parent].textBounds, len(nodes[parent].textParts))
+				nodes[parent].children = append(nodes[parent].children, index)
+				nodes[parent].childTags = append(nodes[parent].childTags, tag)
+			}
+			selfClosing := isDiffVoidTag(tag) || token.type_ == xhtml.SelfClosingTagToken && token.namespace != ""
+			if selfClosing {
+				nodes[index].outer = source[token.start:token.end]
+			} else {
+				stack = append(stack, diffOpenNode{index: index, start: token.start})
 			}
 		}
-		counts[tag]++
-		segment := "/" + tag + fmt.Sprintf("[%d]", counts[tag])
-		pathLen := len(segment)
-		if parent >= 0 {
-			pathLen += len(nodes[parent].path)
-		}
-		if pathLen > maxDiffPathBytes || pathBytes > maxDiffPathsBytes-pathLen {
-			return nil, errDiffLimit
-		}
-		path := segment
-		if parent >= 0 {
-			path = nodes[parent].path + segment
-		}
-		pathBytes += pathLen
-		attrs := parseDiffAttrs(trimmed[len(tag):])
-		siblingPos := counts[tag] - 1
-		if parent >= 0 {
-			siblingPos = len(nodes[parent].children)
-		}
-		node := htmlDiffNode{tag: tag, aid: attrs["data-odoc-aid"], attrs: attrs, path: path, parent: parent, siblingPos: siblingPos, order: len(nodes)}
-		nodes = append(nodes, node)
-		index := len(nodes) - 1
-		if parent >= 0 {
-			nodes[parent].textBounds = append(nodes[parent].textBounds, len(nodes[parent].textParts))
-			nodes[parent].children = append(nodes[parent].children, index)
-			nodes[parent].childTags = append(nodes[parent].childTags, tag)
-		}
-		// The self-closing flag is a real flag only when the '/' is immediately before
-		// '>' and not part of an unquoted attribute value. Outside foreign content the
-		// tree builder IGNORES it on a non-void element, so <div/> still opens; inside
-		// SVG/MathML it does close the element.
-		selfClosing := isDiffVoidTag(tag)
-		if !selfClosing && hasDiffSelfClosingFlag(strings.TrimPrefix(trimmed, tag)) {
-			selfClosing = inDiffForeignContent(nodes, parent)
-		}
-		// A trailing '/' on a non-void start tag is ignored, so a raw-text element
-		// still opens and only its end tag closes it.
-		if isDiffRawTextTag(tag) {
-			closeStart, scanned := indexDiffRawClose(source, end+1, tag)
-			rawScanBytes += scanned
-			if rawScanBytes > maxDiffRawScanBytes {
-				return nil, errDiffLimit
-			}
-			if closeStart < 0 {
-				appendDiffNodeText(&nodes[index], source[end+1:])
-				nodes[index].outer = source[lt:]
-				cursor = len(source)
-				continue
-			}
-			closeEnd := diffTagEnd(source, closeStart)
-			if closeEnd < 0 {
-				closeEnd = len(source) - 1
-			}
-			appendDiffNodeText(&nodes[index], source[end+1:closeStart])
-			nodes[index].outer = source[lt : closeEnd+1]
-			cursor = closeEnd + 1
-			continue
-		} else if selfClosing {
-			nodes[index].outer = source[lt : end+1]
-		} else {
-			stack = append(stack, diffOpenNode{index: index, start: lt})
-		}
-		cursor = end + 1
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
 	}
 	for _, entry := range stack {
 		nodes[entry.index].outer = source[entry.start:]
 	}
+	finalizeDiffNodes(nodes)
+	if lineConsumer == nil {
+		return nodes, nil, nil
+	}
+	lines, ok := lineConsumer.finish()
+	if !ok {
+		return nil, nil, errDiffLimit
+	}
+	return nodes, lines, nil
+}
+
+func finalizeDiffNodes(nodes []htmlDiffNode) {
 	preformattedNode := make([]whiteSpaceMode, len(nodes))
 	for index := range nodes {
-		// white-space inherits; the UA rule on pre/textarea beats inheritance, and an
-		// author inline style beats both.
 		mode := whiteSpaceCollapse
 		if parent := nodes[index].parent; parent >= 0 {
 			mode = preformattedNode[parent]
@@ -370,10 +449,7 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			fullText = strings.Join(nodes[index].textParts, "")
 			writeDiffFrame(textDigest, fullText)
 		} else {
-			parts := make([]string, 0, len(nodes[index].textParts))
-			for _, rawText := range nodes[index].textParts {
-				parts = append(parts, html.UnescapeString(rawText))
-			}
+			parts := append([]string(nil), nodes[index].textParts...)
 			bounds := append(append([]int(nil), nodes[index].textBounds...), len(parts))
 			start := 0
 			var fullTextBuilder strings.Builder
@@ -385,26 +461,13 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 				switch whiteSpace {
 				case whiteSpacePreserve:
 				case whiteSpacePreserveLines:
-					// pre-line collapses spaces but keeps forced line breaks.
 					normalizedSegment = normalizeDiffTextSegmentKeepLines(segment)
 				default:
 					normalizedSegment = normalizeDiffTextSegment(segment)
 				}
-				if normalizedSegment == "" {
+				if normalizedSegment == "" || !preserveWhitespace && isOnlyHTMLASCIIWhitespace(segment) && !strings.Contains(normalizedSegment, "\n") && !diffSlotWhitespaceVisible(nodes[index], slot) {
 					continue
 				}
-				// Pure ASCII-whitespace between block-like siblings (or against a
-				// block edge) is reindent/pretty-print noise with no visible inline
-				// boundary, so it must not perturb the digest. Whitespace touching an
-				// inline (or unknown/custom, treated inline) neighbor stays framed so
-				// "see <a>here</a>" keeps its visible space.
-				if !preserveWhitespace && isOnlyHTMLASCIIWhitespace(segment) && !strings.Contains(normalizedSegment, "\n") && !diffSlotWhitespaceVisible(nodes[index], slot) {
-					continue
-				}
-				// Frame each non-empty segment with its boundary slot so text at
-				// different child boundaries cannot collide, while a purely
-				// structural child insertion (all-empty slots) leaves the digest
-				// unchanged.
 				writeDiffFrame(textDigest, strconv.Itoa(slot))
 				writeDiffFrame(textDigest, normalizedSegment)
 			}
@@ -428,179 +491,6 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		}
 		nodes[index].signature = computeDiffNodeSignature(nodes[index])
 	}
-	return nodes, nil
-}
-
-func indexDiffRawClose(source string, start int, tag string) (int, int) {
-	for cursor := start; cursor < len(source); {
-		relative := strings.IndexByte(source[cursor:], '<')
-		if relative < 0 {
-			return -1, len(source) - start
-		}
-		candidate := cursor + relative
-		nameStart := candidate + 2
-		nameEnd := nameStart + len(tag)
-		if candidate+1 < len(source) && source[candidate+1] == '/' && nameEnd <= len(source) && strings.EqualFold(source[nameStart:nameEnd], tag) && (nameEnd == len(source) || unicode.IsSpace(rune(source[nameEnd])) || source[nameEnd] == '>' || source[nameEnd] == '/') {
-			return candidate, candidate - start + 1
-		}
-		cursor = candidate + 1
-	}
-	return -1, len(source) - start
-}
-
-// diffMarkupKind classifies a `<…>` construct; each kind ends by its own rule.
-type diffMarkupKind int
-
-const (
-	diffMarkupTag diffMarkupKind = iota
-	diffMarkupComment
-	diffMarkupDeclaration
-)
-
-// diffMarkupEnd returns the index of the final byte of the construct starting at
-// start. ok is false when it is unterminated. Both the structural and the
-// source-line layer share it so their notion of where markup ends cannot drift.
-func diffMarkupEnd(source string, start int) (int, diffMarkupKind, bool) {
-	rest := source[start:]
-	switch {
-	case strings.HasPrefix(rest, "<!--"):
-		end, terminated := diffCommentEnd(source, start)
-		return end, diffMarkupComment, terminated
-	case strings.HasPrefix(rest, "<!"), strings.HasPrefix(rest, "<?"):
-		// Bogus comment and DOCTYPE both end at the first '>': in the DOCTYPE
-		// identifier states a '>' is an abrupt-doctype parse error whose action is to
-		// emit the token, so quotes do not defer it.
-		relative := strings.IndexByte(source[start+1:], '>')
-		if relative < 0 {
-			return -1, diffMarkupDeclaration, false
-		}
-		return start + 1 + relative, diffMarkupDeclaration, true
-	default:
-		end := diffTagEnd(source, start)
-		return end, diffMarkupTag, end >= 0
-	}
-}
-
-// diffCommentEnd returns the index of the final byte of the comment opening at
-// start. Mirrors core.commentEnd: "<!-->" and "<!--->" are abrupt closings, and
-// otherwise the content ends at the EARLIER of "-->" (comment-end) and "--!>"
-// (comment-end-bang) so a comment written with "--!>" does not over-scan past a
-// following real element. Only a comment with neither terminator is unterminated.
-// One forward scan finds whichever comes first, so cost is bounded by the comment
-// rather than by the rest of the document.
-func diffCommentEnd(source string, start int) (int, bool) {
-	content := start + 4
-	if content < len(source) && source[content] == '>' {
-		return content, true
-	}
-	if content+1 < len(source) && source[content] == '-' && source[content+1] == '>' {
-		return content + 1, true
-	}
-	for cursor := content; cursor < len(source); {
-		relative := strings.Index(source[cursor:], "--")
-		if relative < 0 {
-			return -1, false
-		}
-		dashes := cursor + relative
-		switch {
-		case dashes+2 < len(source) && source[dashes+2] == '>':
-			return dashes + 2, true
-		case dashes+3 < len(source) && source[dashes+2] == '!' && source[dashes+3] == '>':
-			return dashes + 3, true
-		}
-		cursor = dashes + 1
-	}
-	return -1, false
-}
-
-func diffTagEnd(source string, start int) int {
-	var quote byte
-	for i := start + 1; i < len(source); i++ {
-		c := source[i]
-		if quote != 0 {
-			if c == quote {
-				quote = 0
-			}
-			continue
-		}
-		switch c {
-		case '\'', '"':
-			quote = c
-		case '>':
-			return i
-		}
-	}
-	return -1
-}
-
-func diffTagName(raw string) (string, bool) {
-	raw = strings.TrimLeftFunc(raw, unicode.IsSpace)
-	end := 0
-	for end < len(raw) {
-		c := raw[end]
-		letter := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
-		suffix := end > 0 && (c == '-' || c == ':' || c >= '0' && c <= '9')
-		if !letter && !suffix {
-			break
-		}
-		end++
-		if end > maxDiffTagBytes {
-			return "", false
-		}
-	}
-	return strings.ToLower(raw[:end]), true
-}
-
-func parseDiffAttrs(raw string) map[string]string {
-	attrs := map[string]string{}
-	for cursor := 0; cursor < len(raw); {
-		for cursor < len(raw) && (unicode.IsSpace(rune(raw[cursor])) || raw[cursor] == '/') {
-			cursor++
-		}
-		start := cursor
-		for cursor < len(raw) && !unicode.IsSpace(rune(raw[cursor])) && raw[cursor] != '=' && raw[cursor] != '/' {
-			cursor++
-		}
-		if start == cursor {
-			cursor++
-			continue
-		}
-		name := strings.ToLower(raw[start:cursor])
-		for cursor < len(raw) && unicode.IsSpace(rune(raw[cursor])) {
-			cursor++
-		}
-		value := ""
-		if cursor < len(raw) && raw[cursor] == '=' {
-			cursor++
-			for cursor < len(raw) && unicode.IsSpace(rune(raw[cursor])) {
-				cursor++
-			}
-			if cursor < len(raw) && (raw[cursor] == '\'' || raw[cursor] == '"') {
-				quote := raw[cursor]
-				cursor++
-				start = cursor
-				for cursor < len(raw) && raw[cursor] != quote {
-					cursor++
-				}
-				value = raw[start:cursor]
-				if cursor < len(raw) {
-					cursor++
-				}
-			} else {
-				// Only whitespace or '>' ends an unquoted value, so '/' is an ordinary
-				// value character ("href=a/b" is one attribute, not three).
-				start = cursor
-				for cursor < len(raw) && !unicode.IsSpace(rune(raw[cursor])) {
-					cursor++
-				}
-				value = raw[start:cursor]
-			}
-		}
-		if _, exists := attrs[name]; !exists {
-			attrs[name] = html.UnescapeString(value)
-		}
-	}
-	return attrs
 }
 
 func appendDiffText(nodes []htmlDiffNode, stack []diffOpenNode, text string) {
@@ -638,7 +528,7 @@ func isBlockLevelDiffTag(tag string) bool {
 	}
 }
 
-// boundaryInline reports whether an element boundary is inline-level for
+// boundaryInlineAttrs reports whether an element boundary is inline-level for
 // inter-tag whitespace visibility in the source-hunk view: a non-block tag
 // (default-inline, or unknown/custom treated as inline for safety) or a
 // default-block tag carrying an inline display override. It shares
@@ -647,51 +537,7 @@ func isBlockLevelDiffTag(tag string) bool {
 // document-wide <style>/stylesheet is not a per-boundary inline signal (that
 // global gate would force every reindented block boundary visible and overflow
 // the hunk budget); the global case is handled for newline-free runs in
-// whitespaceRunVisible. attrRaw is the tag text after the name.
-func boundaryInline(tag, attrRaw string) bool {
-	if !isBlockLevelDiffTag(tag) {
-		return true
-	}
-	if attrRaw == "" {
-		return false
-	}
-	return styleHasInlineDisplay(parseDiffAttrs(attrRaw)["style"])
-}
-
-// nextBoundaryInline peeks at the tag opening or closing immediately after a
-// text/whitespace run to classify the run's trailing neighbour. rest begins at
-// the '<' following the run (or is empty at document end, an inline/unknown
-// boundary).
-func nextBoundaryInline(rest string) bool {
-	if len(rest) == 0 {
-		// Document end is a clean block edge, not an inline neighbour; trailing
-		// formatting whitespace is not visible.
-		return false
-	}
-	if rest[0] != '<' {
-		return true
-	}
-	end, kind, terminated := diffMarkupEnd(rest, 0)
-	if !terminated {
-		return true
-	}
-	trimmed := strings.TrimSpace(rest[1:end])
-	if kind != diffMarkupTag || trimmed == "" {
-		return true
-	}
-	name := trimmed
-	if name[0] == '/' {
-		name = name[1:]
-	}
-	tag, ok := diffTagName(name)
-	if !ok {
-		return true
-	}
-	if trimmed[0] == '/' {
-		return boundaryInline(tag, "")
-	}
-	return boundaryInline(tag, trimmed[len(tag):])
-}
+// whitespaceRunVisible. attrs contains the tokenizer-decoded attributes.
 
 // whitespaceRunVisible reports whether an inter-tag whitespace run can render as
 // a visible space and therefore must surface in the source hunk. A run is
@@ -922,6 +768,8 @@ func impliedDiffEndTag(open, next string) bool {
 		return next == "dt" || next == "dd"
 	case "option":
 		return next == "option" || next == "optgroup"
+	case "optgroup":
+		return next == "optgroup"
 	case "thead":
 		return next == "tbody" || next == "tfoot"
 	case "tbody":
@@ -936,34 +784,18 @@ func impliedDiffEndTag(open, next string) bool {
 	return false
 }
 
-// hasDiffSelfClosingFlag reports whether a start tag carries a real self-closing
-// flag: the trailing '/' must not be part of an unquoted attribute value, which is
-// what an empty attribute list, a preceding whitespace, or a quoted value
-// guarantees. attrRaw is the tag text AFTER the element name.
-func hasDiffSelfClosingFlag(attrRaw string) bool {
-	if !strings.HasSuffix(attrRaw, "/") {
-		return false
+func diffHTMLIntegrationPoint(entry diffNamespaceEntry, attrs map[string]string) bool {
+	if entry.namespace == "svg" {
+		return entry.tag == "foreignobject" || entry.tag == "desc" || entry.tag == "title"
 	}
-	body := attrRaw[:len(attrRaw)-1]
-	if body == "" {
-		return true
-	}
-	last := body[len(body)-1]
-	return isHTMLASCIIWhitespace(last) || last == '"' || last == '\''
-}
-
-// inDiffForeignContent reports whether a node opened under parent lives in an SVG
-// or MathML subtree, where the self-closing flag really closes an element.
-func inDiffForeignContent(nodes []htmlDiffNode, parent int) bool {
-	for depth := 0; parent >= 0 && depth <= maxDiffDepth; depth++ {
-		switch nodes[parent].tag {
-		case "svg", "math":
+	if entry.namespace == "math" {
+		switch entry.tag {
+		case "mi", "mo", "mn", "ms", "mtext":
 			return true
-		case "foreignobject", "annotation-xml", "desc", "title":
-			// HTML integration points: content below them is HTML again.
-			return false
+		case "annotation-xml":
+			encoding := attrs["encoding"]
+			return strings.EqualFold(encoding, "text/html") || strings.EqualFold(encoding, "application/xhtml+xml")
 		}
-		parent = nodes[parent].parent
 	}
 	return false
 }
@@ -1485,14 +1317,18 @@ func normalizeDiffHTML(value string) string {
 }
 
 func diffCodeHunks(before, after string) ([]CodeHunk, error) {
-	oldLines, ok := normalizedHTMLLines(before)
-	if !ok {
+	_, oldLines, err := scanDiffDocument(before, true)
+	if err != nil {
 		return nil, errDiffLimit
 	}
-	newLines, ok := normalizedHTMLLines(after)
-	if !ok {
+	_, newLines, err := scanDiffDocument(after, true)
+	if err != nil {
 		return nil, errDiffLimit
 	}
+	return diffCodeHunksLines(oldLines, newLines)
+}
+
+func diffCodeHunksLines(oldLines, newLines []diffSourceLine) ([]CodeHunk, error) {
 	ops, ok := diffLineOps(oldLines, newLines)
 	if !ok {
 		return nil, errDiffLimit
@@ -1808,163 +1644,138 @@ func newWhitespaceFingerprintLine(digest string) diffSourceLine {
 }
 
 func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
-	lines := make([]diffSourceLine, 0, 256)
-	preStack := make([]preContext, 0, 16)
-	preformatted := func() bool { return len(preStack) > 0 && preStack[len(preStack)-1].preserve }
-	// layoutCSS is a bounded, conservative document-level signal that a stylesheet
-	// rule could turn a block boundary inline, making newline-free inter-tag
-	// whitespace visible. prevInline tracks the inline-ness of the boundary just
-	// before a whitespace run; the document start is a clean block edge (false).
-	// Together with the peeked trailing boundary this decides run significance
-	// without a per-run line explosion (see whitespaceRunVisible).
-	layoutCSS := hasLayoutAffectingCSS(source)
-	// The document-level whitespace fingerprint is built unconditionally for every
-	// document, never gated on a CSS heuristic. whitespaceRunVisible deliberately
-	// drops a newline-bearing block-boundary run so plain reindents stay
-	// zero-noise and bounded; that trade-off would otherwise double-blind a
-	// whitespace-only change (e.g. a newline inserted between two block <p>
-	// elements that some stylesheet — possibly external, dynamically injected, or
-	// added via <link>/preload/JS after load — renders inline). Because the
-	// fingerprint streams every inter-tag whitespace slot into one fixed-memory
-	// digest regardless of any CSS guess, no such unknown/dynamic style can hide a
-	// whitespace-layout change: it always surfaces as a single synthetic record at
-	// document end — one bounded hunk, no per-slot lines, no line-count growth, and
-	// no digest leaked. hasLayoutAffectingCSS is retained only as a per-slot
-	// display signal (whitespaceRunVisible), never as a correctness gate.
-	fingerprint := newWSFingerprint()
-	prevInline := false
-	for cursor := 0; cursor < len(source); {
-		if len(lines) >= maxDiffInputLines {
-			return nil, false
-		}
-		if source[cursor] == '<' {
-			end, kind, terminated := diffMarkupEnd(source, cursor)
-			if !terminated {
-				if kind == diffMarkupComment {
-					// Same fail-closed rule as the structural layer: an unterminated
-					// comment runs to EOF, so neither layer can report a complete diff.
-					return nil, false
-				}
-				// Unclosed '<' tail (no closing '>'): treat the remainder as plain
-				// text and terminate; do not slice an invalid tag range.
-				if !appendNormalizedDiffText(&lines, source[cursor:], false, false, preformatted()) {
-					return nil, false
-				}
-				// Trailing text run feeds the pending gap; sum() closes it at the edge.
-				fingerprint.text(source[cursor:])
-				break
-			}
-			rawTag := source[cursor+1 : end]
-			trimmed := strings.TrimSpace(rawTag)
-			canonical := normalizeDiffHTML(source[cursor : end+1])
-			lines = append(lines, newDiffSourceLine("tag", canonical, canonical))
-			cursor = end + 1
-			if kind != diffMarkupTag || trimmed == "" {
-				// Comment/PI/doctype: transparent for whitespace anchoring — not an
-				// element boundary, so it neither closes the pending gap nor shifts an
-				// anchor. A whitespace-free comment insert/removal is invisible to the
-				// fingerprint; whitespace beside it stays attributed to the surrounding
-				// element boundaries.
-				fingerprint.transparent()
-				continue
-			}
-			if trimmed[0] == '/' {
-				if closeTag, ok := diffTagName(trimmed[1:]); ok {
-					popPreformatted(&preStack, closeTag)
-					prevInline = boundaryInline(closeTag, "")
-				}
-				fingerprint.boundary()
-				continue
-			}
-			tag, ok := diffTagName(trimmed)
-			if !ok {
-				return nil, false
-			}
-			attrRaw := trimmed[len(tag):]
-			// Same rule as the structural layer: a trailing '/' does not close an
-			// ordinary HTML element, so only void elements take no content here.
-			selfClosing := isDiffVoidTag(tag)
-			if isDiffRawTextTag(tag) {
-				// Raw-text elements (script/style/textarea/title) hold text, not
-				// markup, and are transparent for whitespace anchoring: neither their
-				// open/close tags nor their content are element boundaries or
-				// inter-tag whitespace, so inserting or removing a whitespace-free raw
-				// block leaves the fingerprint identical while whitespace beside it
-				// stays attributed to the surrounding element boundaries. Their
-				// content is scanned to the matching close tag so an inner '<' is
-				// never split as a spurious tag (the double-blind that hid
-				// textarea/title content changes); it is emitted to the line diff but
-				// never fed into the whitespace gap.
-				if preserve, establishes := isPreformattedContext(tag, attrRaw); establishes {
-					preStack = append(preStack, preContext{tag: tag, preserve: preserve})
-				}
-				prevInline = boundaryInline(tag, attrRaw)
-				literalRaw := isDiffLiteralRawTextTag(tag)
-				rawPreformatted := preformatted()
-				fingerprint.transparent()
-				closeStart, _ := indexDiffRawClose(source, cursor, tag)
-				if closeStart < 0 {
-					if !appendNormalizedDiffText(&lines, source[cursor:], literalRaw, false, rawPreformatted) {
-						return nil, false
-					}
-					cursor = len(source)
-					continue
-				}
-				if !appendNormalizedDiffText(&lines, source[cursor:closeStart], literalRaw, false, rawPreformatted) || len(lines) >= maxDiffInputLines {
-					return nil, false
-				}
-				closeEnd := diffTagEnd(source, closeStart)
-				if closeEnd < 0 {
-					closeEnd = len(source) - 1
-				}
-				canonical = normalizeDiffHTML(source[closeStart : closeEnd+1])
-				lines = append(lines, newDiffSourceLine("tag", canonical, canonical))
-				fingerprint.transparent()
-				cursor = closeEnd + 1
-				if rawPreformatted {
-					popPreformatted(&preStack, tag)
-				}
-				prevInline = boundaryInline(tag, "")
-				continue
-			}
-			// A tag is a structural element boundary that closes the pending inter-tag
-			// gap; only a gap carrying actual whitespace becomes a fingerprint event.
-			fingerprint.boundary()
-			prevInline = boundaryInline(tag, attrRaw)
-			if !selfClosing {
-				if preserve, establishes := isPreformattedContext(tag, attrRaw); establishes {
-					preStack = append(preStack, preContext{tag: tag, preserve: preserve})
-				}
-			}
-			continue
-		}
-		end := strings.IndexByte(source[cursor:], '<')
-		if end < 0 {
-			end = len(source) - cursor
-		}
-		run := source[cursor : cursor+end]
-		// Inter-tag text run: feed the pending slot. Whitespace-only runs contribute
-		// their exact bytes; content runs contribute only their whitespace edges (via
-		// whitespaceLayoutSignature), keeping the fingerprint content-independent.
-		fingerprint.text(run)
-		visible := whitespaceRunVisible(run, prevInline, nextBoundaryInline(source[cursor+end:]), layoutCSS)
-		if !appendNormalizedDiffText(&lines, run, false, visible, preformatted()) {
-			return nil, false
-		}
-		cursor += end
+	_, lines, err := scanDiffDocument(source, true)
+	return lines, err == nil
+}
+
+type diffLineConsumer struct {
+	lines       []diffSourceLine
+	preStack    []preContext
+	layoutCSS   bool
+	fingerprint *wsFingerprint
+	prevInline  bool
+	pendingText *diffHTMLToken
+}
+
+func newDiffLineConsumer(source string) *diffLineConsumer {
+	return &diffLineConsumer{
+		lines:       make([]diffSourceLine, 0, 256),
+		preStack:    make([]preContext, 0, 16),
+		layoutCSS:   hasLayoutAffectingCSS(source),
+		fingerprint: newWSFingerprint(),
 	}
-	// One synthetic record at document end carries the whole-document whitespace
-	// layout so any whitespace-only change surfaces without adding a line per
-	// event (see wsFingerprint). It is built unconditionally so no unknown or
-	// dynamic CSS can double-blind a whitespace-layout change, and structural-only
-	// edits can perturb its boundary positions by design. Hitting the line budget
-	// is an error rather than silently dropping this reserved record.
-	digest := fingerprint.sum()
-	if len(lines)+1 > maxDiffInputLines {
+}
+
+func (c *diffLineConsumer) consume(token diffHTMLToken) bool {
+	if c.pendingText != nil {
+		if !c.consumeText(*c.pendingText, &token) {
+			return false
+		}
+		c.pendingText = nil
+	}
+	if token.type_ == xhtml.TextToken && token.rawTextTag == "" {
+		c.pendingText = &token
+		return true
+	}
+	return c.consumeNonText(token)
+}
+
+func (c *diffLineConsumer) consumeText(token diffHTMLToken, next *diffHTMLToken) bool {
+	if len(c.lines) >= maxDiffInputLines {
+		return false
+	}
+	c.fingerprint.text(token.raw)
+	nextInline := false
+	if next != nil {
+		if next.type_ == xhtml.StartTagToken || next.type_ == xhtml.SelfClosingTagToken || next.type_ == xhtml.EndTagToken {
+			nextInline = boundaryInlineAttrs(next.tag, next.attrs)
+		} else {
+			nextInline = true
+		}
+	}
+	visible := whitespaceRunVisible(token.raw, c.prevInline, nextInline, c.layoutCSS)
+	return appendNormalizedDiffText(&c.lines, token.raw, false, visible, c.preformatted())
+}
+
+func (c *diffLineConsumer) consumeNonText(token diffHTMLToken) bool {
+	if len(c.lines) >= maxDiffInputLines {
+		return false
+	}
+	switch token.type_ {
+	case xhtml.TextToken: // RCDATA/RAWTEXT content.
+		literal := isDiffLiteralRawTextTag(token.rawTextTag)
+		if !appendNormalizedDiffText(&c.lines, token.raw, literal, false, c.preformatted()) {
+			return false
+		}
+		c.fingerprint.transparent()
+	case xhtml.CommentToken, xhtml.DoctypeToken:
+		canonical := normalizeDiffHTML(token.raw)
+		c.lines = append(c.lines, newDiffSourceLine("tag", canonical, canonical))
+		c.fingerprint.transparent()
+	case xhtml.EndTagToken:
+		canonical := normalizeDiffHTML(token.raw)
+		c.lines = append(c.lines, newDiffSourceLine("tag", canonical, canonical))
+		if token.namespace == "" && isDiffRawTextTag(token.tag) {
+			c.fingerprint.transparent()
+		} else {
+			c.fingerprint.boundary()
+		}
+		popPreformatted(&c.preStack, token.tag)
+		c.prevInline = boundaryInlineAttrs(token.tag, nil)
+	case xhtml.StartTagToken, xhtml.SelfClosingTagToken:
+		canonical := normalizeDiffHTML(token.raw)
+		c.lines = append(c.lines, newDiffSourceLine("tag", canonical, canonical))
+		c.prevInline = boundaryInlineAttrs(token.tag, token.attrs)
+		rawText := token.namespace == "" && isDiffRawTextTag(token.tag)
+		if rawText {
+			c.fingerprint.transparent()
+		} else {
+			c.fingerprint.boundary()
+		}
+		// HTML ignores a self-closing flag on ordinary/raw-text HTML elements.
+		if !isDiffVoidTag(token.tag) && (token.type_ != xhtml.SelfClosingTagToken || token.namespace == "") {
+			if preserve, establishes := isPreformattedContextAttrs(token.tag, token.attrs); establishes {
+				c.preStack = append(c.preStack, preContext{tag: token.tag, preserve: preserve})
+			}
+		}
+	}
+	return len(c.lines) <= maxDiffInputLines
+}
+
+func (c *diffLineConsumer) preformatted() bool {
+	return len(c.preStack) > 0 && c.preStack[len(c.preStack)-1].preserve
+}
+
+func (c *diffLineConsumer) finish() ([]diffSourceLine, bool) {
+	if c.pendingText != nil && !c.consumeText(*c.pendingText, nil) {
 		return nil, false
 	}
-	lines = append(lines, newWhitespaceFingerprintLine(digest))
-	return lines, true
+	digest := c.fingerprint.sum()
+	if len(c.lines)+1 > maxDiffInputLines {
+		return nil, false
+	}
+	c.lines = append(c.lines, newWhitespaceFingerprintLine(digest))
+	return c.lines, true
+}
+
+func boundaryInlineAttrs(tag string, attrs map[string]string) bool {
+	if !isBlockLevelDiffTag(tag) {
+		return true
+	}
+	return styleHasInlineDisplay(attrs["style"])
+}
+
+// isPreformattedContextAttrs reports whether an element establishes an explicit
+// white-space context and whether that context preserves whitespace. attrs
+// contains tokenizer-decoded attributes; nil means no inline style is present.
+func isPreformattedContextAttrs(tag string, attrs map[string]string) (preserve, establishes bool) {
+	if mode, specified := inlineWhiteSpaceMode(attrs["style"]); specified {
+		return mode != whiteSpaceCollapse, true
+	}
+	if tag == "pre" || tag == "textarea" {
+		return true, true
+	}
+	return false, false
 }
 
 func appendNormalizedDiffText(lines *[]diffSourceLine, text string, literal, visible, preformatted bool) bool {
@@ -2013,20 +1824,6 @@ func appendNormalizedDiffText(lines *[]diffSourceLine, text string, literal, vis
 type preContext struct {
 	tag      string
 	preserve bool
-}
-
-// isPreformattedContext reports whether an open tag establishes a
-// whitespace-preserving context for its descendants, and whether it establishes
-// any context at all. An inline style wins over the tag default; pre-line counts
-// as preserving here because the source-line layer only needs line breaks kept.
-func isPreformattedContext(tag, attrRaw string) (preserve, establishes bool) {
-	if mode, specified := inlineWhiteSpaceMode(parseDiffAttrs(attrRaw)["style"]); specified {
-		return mode != whiteSpaceCollapse, true
-	}
-	if tag == "pre" || tag == "textarea" {
-		return true, true
-	}
-	return false, false
 }
 
 // whiteSpaceMode is the effective CSS white-space behaviour for a node's text.

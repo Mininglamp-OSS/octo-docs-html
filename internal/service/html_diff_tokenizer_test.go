@@ -1,0 +1,235 @@
+package service
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	xhtml "golang.org/x/net/html"
+)
+
+func TestDiffSVGTitleUsesForeignContentTokenization(t *testing.T) {
+	before := `<svg><title><b>x</b></title></svg>`
+	after := `<svg><title>&lt;b>x&lt;/b></title></svg>`
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 {
+		t.Fatal("structure layer lost the svg:title child-element change")
+	}
+	if len(result.CodeHunks) == 0 {
+		t.Fatal("code layer lost the foreign-content markup/text change")
+	}
+
+	// The standard parser is the semantic oracle: SVG title is not HTML RCDATA,
+	// so the first document contains a child element and the second does not.
+	parsed, err := xhtml.Parse(strings.NewReader(before))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var title *xhtml.Node
+	var walk func(*xhtml.Node)
+	walk = func(n *xhtml.Node) {
+		if n.Type == xhtml.ElementNode && n.Namespace == "svg" && n.Data == "title" {
+			title = n
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(parsed)
+	if title == nil || title.FirstChild == nil || title.FirstChild.Type != xhtml.ElementNode || title.FirstChild.Data != "b" {
+		t.Fatalf("parser oracle did not produce svg:title > svg:b: %#v", title)
+	}
+}
+
+func TestDiffForeignIntegrationPointsFollowParserOracle(t *testing.T) {
+	tests := []struct {
+		name, source, wantPath string
+	}{
+		{"svg_foreignObject", `<svg><foreignObject><p>x</p></foreignObject></svg>`, `/svg[1]/foreignobject[1]/p[1]`},
+		{"svg_desc", `<svg><desc><p>x</p></desc></svg>`, `/svg[1]/desc[1]/p[1]`},
+		{"math_annotation_html", `<math><annotation-xml encoding="text/html"><p>x</p></annotation-xml></math>`, `/math[1]/annotation-xml[1]/p[1]`},
+		{"math_annotation_xhtml", `<math><annotation-xml encoding="APPLICATION/XHTML+XML"><p>x</p></annotation-xml></math>`, `/math[1]/annotation-xml[1]/p[1]`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, err := xhtml.Parse(strings.NewReader(test.source))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var parserHasHTMLP bool
+			var walk func(*xhtml.Node)
+			walk = func(n *xhtml.Node) {
+				parserHasHTMLP = parserHasHTMLP || n.Type == xhtml.ElementNode && n.Data == "p" && n.Namespace == ""
+				for child := n.FirstChild; child != nil; child = child.NextSibling {
+					walk(child)
+				}
+			}
+			walk(parsed)
+			if !parserHasHTMLP {
+				t.Fatal("parser oracle did not create an HTML p")
+			}
+			if paths := diffNodePaths(t, test.source); !hasDiffPath(paths, test.wantPath) {
+				t.Fatalf("paths = %v, want %s", paths, test.wantPath)
+			}
+		})
+	}
+}
+
+func TestDiffMathMLTextIntegrationPointsFollowParserOracle(t *testing.T) {
+	for _, tag := range []string{"mi", "mo", "mn", "ms", "mtext"} {
+		t.Run(tag, func(t *testing.T) {
+			selfClosed := "<math><" + tag + "><div/><p>x</p></" + tag + "></math>"
+			explicit := "<math><" + tag + "><div><p>x</p></div></" + tag + "></math>"
+
+			parsed, err := xhtml.Parse(strings.NewReader(selfClosed))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var integration *xhtml.Node
+			var walk func(*xhtml.Node)
+			walk = func(n *xhtml.Node) {
+				if n.Type == xhtml.ElementNode && n.Namespace == "math" && n.Data == tag {
+					integration = n
+				}
+				for child := n.FirstChild; child != nil; child = child.NextSibling {
+					walk(child)
+				}
+			}
+			walk(parsed)
+			if integration == nil || integration.FirstChild == nil || integration.FirstChild.Namespace != "" || integration.FirstChild.Data != "div" ||
+				integration.FirstChild.FirstChild == nil || integration.FirstChild.FirstChild.Namespace != "" || integration.FirstChild.FirstChild.Data != "p" {
+				t.Fatalf("parser oracle did not produce math:%s > html:div > html:p: %#v", tag, integration)
+			}
+
+			gotPaths := diffNodePaths(t, selfClosed)
+			wantPaths := diffNodePaths(t, explicit)
+			if strings.Join(gotPaths, "\n") != strings.Join(wantPaths, "\n") {
+				t.Fatalf("self-closing paths = %v, explicit paths = %v", gotPaths, wantPaths)
+			}
+			wantP := "/math[1]/" + tag + "[1]/div[1]/p[1]"
+			if !hasDiffPath(gotPaths, wantP) {
+				t.Fatalf("paths = %v, want p nested under div at %s", gotPaths, wantP)
+			}
+
+			for _, source := range []string{selfClosed, explicit} {
+				if err := scanDiffHTML(source, func(token diffHTMLToken) error {
+					if (token.tag == "div" || token.tag == "p") && token.namespace != "" {
+						t.Errorf("%s token namespace = %q, want HTML", token.tag, token.namespace)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestDiffInvalidUTF8DoesNotDriftBetweenLayers(t *testing.T) {
+	result, err := buildVersionDiff(1, 2, "<p>a\xffb</p>", "<p>a\xfeb</p>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 {
+		t.Fatal("structure layer lost the invalid UTF-8 text change")
+	}
+	if len(result.CodeHunks) == 0 {
+		t.Fatal("code layer lost the invalid UTF-8 source-byte change")
+	}
+}
+
+func TestDiffSequentialOptgroupsDoNotCreateFalseDepth(t *testing.T) {
+	source := "<select>" + strings.Repeat("<optgroup><option>x", maxDiffDepth+1) + "</select>"
+	if _, err := parseDiffHTML(source); err != nil {
+		t.Fatalf("sequential implied-close optgroups rejected as nested depth: %v", err)
+	}
+}
+
+func TestDiffScannerRawOffsetsAreExact(t *testing.T) {
+	source := "π\r\n<!DOCTYPE html><DIV data-x='&amp;>z'>a&amp;b<!-- x --!><svg><path d='M0 0'/></svg></DIV>tail"
+	cursor := 0
+	err := scanDiffHTML(source, func(token diffHTMLToken) error {
+		if token.start != cursor || token.end != cursor+len(token.raw) {
+			t.Fatalf("offsets = [%d,%d), raw bytes=%d, want [%d,%d)", token.start, token.end, len(token.raw), cursor, cursor+len(token.raw))
+		}
+		if got := source[token.start:token.end]; got != token.raw {
+			t.Fatalf("source slice = %q, Raw = %q", got, token.raw)
+		}
+		cursor = token.end
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor != len(source) {
+		t.Fatalf("tokens end at byte %d, source has %d bytes", cursor, len(source))
+	}
+}
+
+func TestDiffTokenizerMalformedAndForeignSemantics(t *testing.T) {
+	for _, source := range []string{"<!--", "<div><!-- never closes", "<!--!>"} {
+		if err := scanDiffHTML(source, func(diffHTMLToken) error { return nil }); !errors.Is(err, errDiffLimit) {
+			t.Fatalf("scanDiffHTML(%q) err = %v, want errDiffLimit", source, err)
+		}
+	}
+
+	source := `<html><body><div data-x=a/><p>html child</p></div><svg><g/><path d="x"/></svg><math><mspace/><mi>y</mi></math></body></html>`
+	paths := diffNodePaths(t, source)
+	for _, want := range []string{
+		"/html[1]/body[1]/div[1]/p[1]",
+		"/html[1]/body[1]/svg[1]/path[1]",
+		"/html[1]/body[1]/math[1]/mi[1]",
+	} {
+		if !hasDiffPath(paths, want) {
+			t.Fatalf("paths = %v, want %s", paths, want)
+		}
+	}
+}
+
+func TestDiffSnippetUsesOriginalSourceBytes(t *testing.T) {
+	before := `<html><body><DIV DATA-X='&amp;>z' weird="a  b">old</DIV></body></html>`
+	after := `<html><body><DIV DATA-X='&amp;>z' weird="a  b">new</DIV></body></html>`
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range result.Changes {
+		if change.DOMPath != "/html[1]/body[1]/div[1]" {
+			continue
+		}
+		if change.BeforeHTML != `<DIV DATA-X='&amp;>z' weird="a  b">old</DIV>` {
+			t.Fatalf("BeforeHTML = %q; original spelling/quotes/entities were not preserved", change.BeforeHTML)
+		}
+		return
+	}
+	t.Fatalf("div change missing: %+v", result.Changes)
+}
+
+func TestParseDiffHTMLLargeTokenAcrossFormerPrefixBoundary(t *testing.T) {
+	padding := strings.Repeat("x", (128<<10)-len("<div><!--"))
+	for _, source := range []string{
+		"<div><!--" + padding + "--><p>ok</p></div>",
+		`<div title="` + padding + `"><p>ok</p></div>`,
+		"<style>/*" + padding + "*/</style><p>ok</p>",
+	} {
+		if _, err := parseDiffHTML(source); err != nil {
+			t.Fatalf("valid large document rejected: %v", err)
+		}
+	}
+}
+
+func TestDiffTextUsesTokenizerRCDATAAndRAWTEXTSemantics(t *testing.T) {
+	nodes, err := parseDiffHTML(`<textarea>&amp;amp;</textarea><script>&amp;amp;</script>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes[0].text != "&amp;" {
+		t.Fatalf("textarea text = %q, want one tokenizer entity decode", nodes[0].text)
+	}
+	if nodes[1].text != "&amp;amp;" {
+		t.Fatalf("script text = %q, want literal raw text", nodes[1].text)
+	}
+}

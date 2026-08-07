@@ -10,6 +10,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
+	xhtml "golang.org/x/net/html"
 )
 
 // diffProbe runs a before/after pair through both scanning layers and the public
@@ -281,7 +282,7 @@ func TestDiffDoctypeMatrix(t *testing.T) {
 
 // Both layers must agree on where every construct ends, and only a genuinely
 // unterminated comment may fail closed. A disagreement is what let the two layers
-// drift apart before diffMarkupEnd existed.
+// drift apart before both views shared the standard tokenizer front-end.
 func TestDiffMarkupScannerInvariants(t *testing.T) {
 	seeds := []string{
 		"<!--",
@@ -371,9 +372,8 @@ func TestDiffTerminatedCommentIsNotPayloadTooLarge(t *testing.T) {
 }
 
 // referenceCommentEnd is core.commentEnd's rule written the way core writes it
-// (two independent searches, earlier terminator wins). diffCommentEnd finds the
-// same boundary in one forward scan; this pins the two against each other so the
-// optimisation cannot drift from the behaviour core already ships.
+// (two independent searches, earlier terminator wins). This pins the standard
+// tokenizer's emitted boundary against the behaviour core already ships.
 func referenceCommentEnd(s string, lt int) int {
 	n := len(s)
 	if lt+3 >= n || s[lt+1] != '!' || s[lt+2] != '-' || s[lt+3] != '-' {
@@ -413,7 +413,7 @@ func referenceCommentTerminated(s string, lt int) bool {
 	return strings.Contains(rest, "-->") || strings.Contains(rest, "--!>")
 }
 
-func TestDiffCommentEndMatchesCoreRule(t *testing.T) {
+func TestDiffScannerCommentBoundariesMatchCoreRule(t *testing.T) {
 	bodies := []string{
 		"", ">", "->", "-->", "--!>", "x", "x-->", "x--!>", "-", "--", "---", "----",
 		"--->", "---!>", "x--y-->", "x--!y-->", "x-->y--!>", "x--!>y-->",
@@ -421,17 +421,28 @@ func TestDiffCommentEndMatchesCoreRule(t *testing.T) {
 	}
 	check := func(source string, start int) {
 		t.Helper()
-		got, ok := diffCommentEnd(source, start)
 		wantTerminated := referenceCommentTerminated(source, start)
-		if ok != wantTerminated {
-			t.Fatalf("%q: diffCommentEnd ok = %v, want %v", source, ok, wantTerminated)
+		var gotRaw string
+		gotEnd := -1
+		err := scanDiffHTML(source, func(token diffHTMLToken) error {
+			if token.type_ == xhtml.CommentToken && token.start == start {
+				gotRaw = token.raw
+				gotEnd = token.end
+			}
+			return nil
+		})
+		if (err == nil) != wantTerminated {
+			t.Fatalf("%q: scanner err = %v, terminated = %v", source, err, wantTerminated)
 		}
-		if !ok {
+		if !wantTerminated {
 			return
 		}
-		// core.commentEnd returns one past the terminator; this returns its last byte.
-		if want := referenceCommentEnd(source, start) - 1; got != want {
-			t.Fatalf("%q: diffCommentEnd = %d, reference end = %d", source, got, want)
+		wantEnd := referenceCommentEnd(source, start)
+		if gotEnd != wantEnd {
+			t.Fatalf("%q: scanner end = %d, reference end = %d (raw %q)", source, gotEnd, wantEnd, gotRaw)
+		}
+		if gotRaw != source[start:wantEnd] {
+			t.Fatalf("%q: scanner raw = %q, want %q", source, gotRaw, source[start:wantEnd])
 		}
 	}
 	for _, body := range bodies {
