@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -126,6 +127,144 @@ func TestDiffMathMLTextIntegrationPointsFollowParserOracle(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDiffForeignBreakoutMatchesParserOracle(t *testing.T) {
+	tests := []struct {
+		name, before, after string
+	}{
+		{"svg_html_breakout", `<svg><div/><p>x</p></div></svg>`, `<svg><div></div><p>x</p></svg>`},
+		{"math_mglyph_exception", `<math><mi><mglyph/><mrow>x</mrow></mi></math>`, `<math><mi><mglyph><mrow>x</mrow></mglyph></mi></math>`},
+		{"annotation_xml_svg_exception", `<math><annotation-xml><svg><title><div/><p>x</p></div></title></svg></annotation-xml></math>`, `<math><annotation-xml><svg><title><div></div><p>x</p></title></svg></annotation-xml></math>`},
+		{"font_empty_attribute_breakout", `<svg><g><font color=""/><circle/></g></svg>`, `<svg><g><font color=""></font><circle/></g></svg>`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			beforeTree := parserElementTree(t, test.before)
+			afterTree := parserElementTree(t, test.after)
+			if beforeTree == afterTree {
+				t.Fatal("parser oracle trees unexpectedly match")
+			}
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Changes) == 0 {
+				t.Fatalf("different parser trees produced no structural changes\nbefore: %s\nafter:  %s", beforeTree, afterTree)
+			}
+		})
+	}
+}
+
+func TestDiffForeignCDATAAtIntegrationPointMatchesParserOracle(t *testing.T) {
+	before := `<svg><foreignObject><![CDATA[visible]]></foreignObject></svg>`
+	after := `<svg><foreignObject></foreignObject></svg>`
+	if parserElementTree(t, before) == parserElementTree(t, after) {
+		t.Fatal("parser oracle trees unexpectedly match")
+	}
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 {
+		t.Fatal("CDATA text deletion produced no structural changes")
+	}
+}
+
+func TestDiffForeignStartTagsDoNotLeakRawTextMode(t *testing.T) {
+	tests := []struct {
+		name, source string
+		want         []string
+	}{
+		{"self_closing_title", `<svg><title/>tail<circle/></svg><p>A</p>`, []string{"/svg[1]/circle[1]", "/p[1]"}},
+		{"plaintext", `<div><svg><plaintext>a</plaintext><circle/></svg><p>A</p></div>`, []string{"/div[1]/svg[1]/circle[1]", "/div[1]/p[1]"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			paths := diffNodePaths(t, test.source)
+			for _, want := range test.want {
+				if !hasDiffPath(paths, want) {
+					t.Fatalf("paths = %v, want %s", paths, want)
+				}
+			}
+		})
+	}
+}
+
+func TestDiffConstrainsDOMPathTagBytes(t *testing.T) {
+	tests := []struct {
+		source, want string
+	}{
+		{`<div><b){x=1}<>y</div>`, `/div[1]/b[1]`},
+		{`<div><a"onerror=alert(1)">y</div>`, `/div[1]/a[1]`},
+		{`<A!>x</A!>`, `/a[1]`},
+	}
+	for _, test := range tests {
+		paths := diffNodePaths(t, test.source)
+		if !hasDiffPath(paths, test.want) {
+			t.Fatalf("paths = %v, want %s", paths, test.want)
+		}
+	}
+}
+
+func TestDiffDOMPathSanitizingDoesNotChangeForeignSemantics(t *testing.T) {
+	before := `<svg><g><div!/><circle/></g></svg>`
+	after := `<svg><g><div!></div!><circle/></g></svg>`
+	if parserElementTree(t, before) != parserElementTree(t, after) {
+		t.Fatal("parser oracle trees unexpectedly differ")
+	}
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) != 0 {
+		t.Fatalf("parser-equivalent foreign tags produced changes: %+v", result.Changes)
+	}
+}
+
+func TestDiffForeignEndTagBreakoutMatchesParserOracle(t *testing.T) {
+	for _, source := range []string{
+		`<svg><g></p><x></x><circle/></g></svg>`,
+		`<math><mrow></br><x></x></mrow></math>`,
+	} {
+		parserTree := parserElementTree(t, source)
+		paths := diffNodePaths(t, source)
+		if !strings.Contains(parserTree, ":p\n") && !strings.Contains(parserTree, ":br\n") {
+			t.Fatalf("parser oracle did not create breakout element: %s", parserTree)
+		}
+		if !hasDiffPath(paths, "/x[1]") {
+			t.Fatalf("paths = %v, want breakout sibling /x[1]", paths)
+		}
+	}
+}
+
+func parserElementTree(t *testing.T, source string) string {
+	t.Helper()
+	root, err := xhtml.Parse(strings.NewReader(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	var walk func(*xhtml.Node, int)
+	walk = func(node *xhtml.Node, depth int) {
+		if node.Type == xhtml.ElementNode {
+			out.WriteString(strings.Repeat("  ", depth))
+			out.WriteString(node.Namespace)
+			out.WriteByte(':')
+			out.WriteString(node.Data)
+			out.WriteByte('\n')
+			depth++
+		} else if node.Type == xhtml.TextNode && strings.TrimSpace(node.Data) != "" {
+			out.WriteString(strings.Repeat("  ", depth))
+			out.WriteString(strconv.Quote(node.Data))
+			out.WriteByte('\n')
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child, depth)
+		}
+	}
+	walk(root, 0)
+	return out.String()
 }
 
 func TestDiffInvalidUTF8DoesNotDriftBetweenLayers(t *testing.T) {

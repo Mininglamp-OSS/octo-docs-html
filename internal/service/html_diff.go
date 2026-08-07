@@ -102,14 +102,17 @@ type diffOpenNode struct {
 }
 
 type diffHTMLToken struct {
-	type_      xhtml.TokenType
-	raw        string
-	text       string
-	start, end int
-	tag        string
-	attrs      map[string]string
-	rawTextTag string
-	namespace  string
+	type_       xhtml.TokenType
+	raw         string
+	text        string
+	start, end  int
+	tag         string
+	pathTag     string
+	attrs       map[string]string
+	rawTextTag  string
+	namespace   string
+	parentDepth int
+	forceClose  bool
 }
 
 type diffNamespaceEntry struct {
@@ -125,7 +128,7 @@ func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
 	offset := 0
 	stack := make([]diffNamespaceEntry, 0, 32)
 	for {
-		z.AllowCDATA(len(stack) > 0 && stack[len(stack)-1].namespace != "" && !stack[len(stack)-1].integration)
+		z.AllowCDATA(len(stack) > 0 && stack[len(stack)-1].namespace != "")
 		type_ := z.Next()
 		if type_ == xhtml.ErrorToken {
 			if err := z.Err(); err != nil && !errors.Is(err, io.EOF) {
@@ -160,6 +163,7 @@ func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
 		if type_ == xhtml.StartTagToken || type_ == xhtml.SelfClosingTagToken || type_ == xhtml.EndTagToken {
 			name, more := z.TagName()
 			token.tag = string(name)
+			token.pathTag = diffPathTag(token.tag)
 			token.attrs = map[string]string{}
 			for more {
 				key, value, next := z.TagAttr()
@@ -172,12 +176,28 @@ func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
 		if type_ == xhtml.TextToken && len(stack) > 0 && stack[len(stack)-1].namespace == "" && isDiffRawTextTag(stack[len(stack)-1].tag) {
 			token.rawTextTag = stack[len(stack)-1].tag
 		}
+		if type_ == xhtml.EndTagToken && (token.tag == "p" || token.tag == "br") && diffTokenInForeignContent(stack, type_, token.tag) {
+			type_ = xhtml.StartTagToken
+			token.type_ = type_
+			token.forceClose = true
+		}
 		if type_ == xhtml.StartTagToken || type_ == xhtml.SelfClosingTagToken {
 			for len(stack) > 0 && stack[len(stack)-1].namespace == "" && impliedDiffEndTag(stack[len(stack)-1].tag, token.tag) {
 				stack = stack[:len(stack)-1]
 			}
+			foreign := diffTokenInForeignContent(stack, type_, token.tag)
+			if foreign && diffForeignBreakout(token.tag, token.attrs) {
+				for len(stack) > 0 {
+					top := stack[len(stack)-1]
+					if top.namespace == "" || top.integration {
+						break
+					}
+					stack = stack[:len(stack)-1]
+				}
+				foreign = false
+			}
 			namespace := ""
-			if len(stack) > 0 && !stack[len(stack)-1].integration {
+			if foreign && len(stack) > 0 {
 				namespace = stack[len(stack)-1].namespace
 			}
 			if namespace == "" {
@@ -189,14 +209,15 @@ func scanDiffHTML(source string, visit func(diffHTMLToken) error) error {
 				}
 			}
 			token.namespace = namespace
+			token.parentDepth = len(stack)
 			entry := diffNamespaceEntry{tag: token.tag, namespace: namespace}
 			entry.integration = diffHTMLIntegrationPoint(entry, token.attrs)
-			selfClosing := namespace != "" && type_ == xhtml.SelfClosingTagToken || namespace == "" && isDiffVoidTag(token.tag)
+			selfClosing := token.forceClose || namespace != "" && type_ == xhtml.SelfClosingTagToken || namespace == "" && isDiffVoidTag(token.tag)
+			if foreign {
+				z.NextIsNotRawText()
+			}
 			if !selfClosing {
 				stack = append(stack, entry)
-				if namespace != "" && isDiffRawTextTag(token.tag) {
-					z.NextIsNotRawText()
-				}
 			}
 		} else if type_ == xhtml.EndTagToken {
 			for index := len(stack) - 1; index >= 0; index-- {
@@ -338,7 +359,7 @@ func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSour
 		case xhtml.EndTagToken:
 			for pos := len(stack) - 1; pos >= 0; pos-- {
 				entry := stack[pos]
-				if nodes[entry.index].tag != token.tag {
+				if nodes[entry.index].tag != token.pathTag {
 					continue
 				}
 				for popped := len(stack) - 1; popped > pos; popped-- {
@@ -350,7 +371,13 @@ func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSour
 				break
 			}
 		case xhtml.StartTagToken, xhtml.SelfClosingTagToken:
-			tag := token.tag
+			tag := token.pathTag
+			if len(stack) > token.parentDepth {
+				for _, entry := range stack[token.parentDepth:] {
+					nodes[entry.index].outer = source[entry.start:token.start]
+				}
+				stack = stack[:token.parentDepth]
+			}
 			if len(tag) > maxDiffTagBytes {
 				return errDiffLimit
 			}
@@ -398,7 +425,7 @@ func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSour
 				nodes[parent].children = append(nodes[parent].children, index)
 				nodes[parent].childTags = append(nodes[parent].childTags, tag)
 			}
-			selfClosing := isDiffVoidTag(tag) || token.type_ == xhtml.SelfClosingTagToken && token.namespace != ""
+			selfClosing := token.forceClose || isDiffVoidTag(tag) || token.type_ == xhtml.SelfClosingTagToken && token.namespace != ""
 			if selfClosing {
 				nodes[index].outer = source[token.start:token.end]
 			} else {
@@ -782,6 +809,60 @@ func impliedDiffEndTag(open, next string) bool {
 		return next == "td" || next == "th" || next == "tr" || next == "thead" || next == "tbody" || next == "tfoot"
 	}
 	return false
+}
+
+func diffPathTag(tag string) string {
+	for index := range tag {
+		char := tag[index]
+		letter := char >= 'a' && char <= 'z'
+		validSuffix := index > 0 && (char == '-' || char == ':' || char >= '0' && char <= '9')
+		if !letter && !validSuffix {
+			return tag[:index]
+		}
+	}
+	return tag
+}
+
+func diffTokenInForeignContent(stack []diffNamespaceEntry, type_ xhtml.TokenType, tag string) bool {
+	if len(stack) == 0 || stack[len(stack)-1].namespace == "" {
+		return false
+	}
+	top := stack[len(stack)-1]
+	if top.namespace == "math" && diffMathTextIntegrationTag(top.tag) {
+		return type_ != xhtml.TextToken && (type_ != xhtml.StartTagToken && type_ != xhtml.SelfClosingTagToken || tag == "mglyph" || tag == "malignmark")
+	}
+	if top.namespace == "math" && top.tag == "annotation-xml" && (type_ == xhtml.StartTagToken || type_ == xhtml.SelfClosingTagToken) && tag == "svg" {
+		return false
+	}
+	if top.integration && (type_ == xhtml.StartTagToken || type_ == xhtml.SelfClosingTagToken || type_ == xhtml.TextToken) {
+		return false
+	}
+	return type_ != xhtml.ErrorToken
+}
+
+func diffMathTextIntegrationTag(tag string) bool {
+	switch tag {
+	case "mi", "mo", "mn", "ms", "mtext":
+		return true
+	default:
+		return false
+	}
+}
+
+func diffForeignBreakout(tag string, attrs map[string]string) bool {
+	switch tag {
+	case "b", "big", "blockquote", "body", "br", "center", "code", "dd", "div", "dl", "dt", "em", "embed",
+		"h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i", "img", "li", "listing", "menu", "meta",
+		"nobr", "ol", "p", "pre", "ruby", "s", "small", "span", "strong", "strike", "sub", "sup", "table", "tt", "u", "ul", "var":
+		return true
+	case "font":
+		_, color := attrs["color"]
+		_, face := attrs["face"]
+		_, size := attrs["size"]
+		return color || face || size
+	default:
+		return false
+	}
 }
 
 func diffHTMLIntegrationPoint(entry diffNamespaceEntry, attrs map[string]string) bool {
