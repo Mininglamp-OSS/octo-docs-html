@@ -304,7 +304,14 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 			nodes[parent].children = append(nodes[parent].children, index)
 			nodes[parent].childTags = append(nodes[parent].childTags, tag)
 		}
-		selfClosing := strings.HasSuffix(strings.TrimSpace(raw), "/") || isDiffVoidTag(tag)
+		// The self-closing flag is a real flag only when the '/' is immediately before
+		// '>' and not part of an unquoted attribute value. Outside foreign content the
+		// tree builder IGNORES it on a non-void element, so <div/> still opens; inside
+		// SVG/MathML it does close the element.
+		selfClosing := isDiffVoidTag(tag)
+		if !selfClosing && hasDiffSelfClosingFlag(strings.TrimPrefix(trimmed, tag)) {
+			selfClosing = inDiffForeignContent(nodes, parent)
+		}
 		// A trailing '/' on a non-void start tag is ignored, so a raw-text element
 		// still opens and only its end tag closes it.
 		if isDiffRawTextTag(tag) {
@@ -580,8 +587,10 @@ func parseDiffAttrs(raw string) map[string]string {
 					cursor++
 				}
 			} else {
+				// Only whitespace or '>' ends an unquoted value, so '/' is an ordinary
+				// value character ("href=a/b" is one attribute, not three).
 				start = cursor
-				for cursor < len(raw) && !unicode.IsSpace(rune(raw[cursor])) && raw[cursor] != '/' {
+				for cursor < len(raw) && !unicode.IsSpace(rune(raw[cursor])) {
 					cursor++
 				}
 				value = raw[start:cursor]
@@ -927,6 +936,38 @@ func impliedDiffEndTag(open, next string) bool {
 	return false
 }
 
+// hasDiffSelfClosingFlag reports whether a start tag carries a real self-closing
+// flag: the trailing '/' must not be part of an unquoted attribute value, which is
+// what an empty attribute list, a preceding whitespace, or a quoted value
+// guarantees. attrRaw is the tag text AFTER the element name.
+func hasDiffSelfClosingFlag(attrRaw string) bool {
+	if !strings.HasSuffix(attrRaw, "/") {
+		return false
+	}
+	body := attrRaw[:len(attrRaw)-1]
+	if body == "" {
+		return true
+	}
+	last := body[len(body)-1]
+	return isHTMLASCIIWhitespace(last) || last == '"' || last == '\''
+}
+
+// inDiffForeignContent reports whether a node opened under parent lives in an SVG
+// or MathML subtree, where the self-closing flag really closes an element.
+func inDiffForeignContent(nodes []htmlDiffNode, parent int) bool {
+	for depth := 0; parent >= 0 && depth <= maxDiffDepth; depth++ {
+		switch nodes[parent].tag {
+		case "svg", "math":
+			return true
+		case "foreignobject", "annotation-xml", "desc", "title":
+			// HTML integration points: content below them is HTML again.
+			return false
+		}
+		parent = nodes[parent].parent
+	}
+	return false
+}
+
 func isDiffVoidTag(tag string) bool {
 	switch tag {
 	case "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr":
@@ -951,8 +992,11 @@ func isDiffRawTextTag(tag string) bool {
 	}
 }
 
+// isDiffLiteralRawTextTag covers the raw-text elements that do NOT decode
+// character references. Derived from isDiffRawTextTag so the two cannot drift:
+// every raw-text element is literal except the two RCDATA ones.
 func isDiffLiteralRawTextTag(tag string) bool {
-	return tag == "script" || tag == "style"
+	return isDiffRawTextTag(tag) && tag != "textarea" && tag != "title"
 }
 
 func isDiffWrapper(tag string) bool {
@@ -1832,12 +1876,14 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 				fingerprint.boundary()
 				continue
 			}
-			selfClosing := strings.HasSuffix(strings.TrimSpace(rawTag), "/")
 			tag, ok := diffTagName(trimmed)
 			if !ok {
 				return nil, false
 			}
 			attrRaw := trimmed[len(tag):]
+			// Same rule as the structural layer: a trailing '/' does not close an
+			// ordinary HTML element, so only void elements take no content here.
+			selfClosing := isDiffVoidTag(tag)
 			if isDiffRawTextTag(tag) {
 				// Raw-text elements (script/style/textarea/title) hold text, not
 				// markup, and are transparent for whitespace anchoring: neither their
@@ -1885,7 +1931,7 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 			// gap; only a gap carrying actual whitespace becomes a fingerprint event.
 			fingerprint.boundary()
 			prevInline = boundaryInline(tag, attrRaw)
-			if !selfClosing && !isDiffVoidTag(tag) {
+			if !selfClosing {
 				if preserve, establishes := isPreformattedContext(tag, attrRaw); establishes {
 					preStack = append(preStack, preContext{tag: tag, preserve: preserve})
 				}

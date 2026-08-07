@@ -200,10 +200,12 @@ func TestDiffRawTextContextMatrix(t *testing.T) {
 			t.Fatalf("%q: normalizedHTMLLines ok = false, want true", source)
 		}
 	}
-	// A trailing '/' on a non-raw-text element keeps its existing meaning.
+	// A trailing '/' on a non-raw-text element keeps its existing meaning: void
+	// elements take no content, ordinary ones still open (see
+	// TestDiffSelfClosingFlagFollowsNamespace).
 	for _, test := range []struct{ name, source, wantPath string }{
-		{"div", `<html><body><div/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
-		{"section", `<html><body><section/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
+		{"div", `<html><body><div/><p>x</p></div></body></html>`, "/html[1]/body[1]/div[1]/p[1]"},
+		{"section", `<html><body><section/><p>x</p></section></body></html>`, "/html[1]/body[1]/section[1]/p[1]"},
 		{"void_br", `<html><body><br/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
 		{"void_img", `<html><body><img src="a"/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
 	} {
