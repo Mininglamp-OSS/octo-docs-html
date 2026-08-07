@@ -147,12 +147,20 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) error {
 	// Stamped into DocMeta on first create only; requireWriteOrBotOwnerAuth already
 	// guaranteed a session is present.
 	creatorUID := creatorUIDFromCtx(r.Context())
-	res, err := s.docs.Publish(r.Context(), service.PublishInput{
+	res, err := s.docs.PublishAuthorized(r.Context(), service.PublishInput{
 		Slug: slug, HTML: body.HTML, Version: body.Version, Title: body.Title, LocalComments: body.LocalComments,
 		MountType: body.MountType, MountTypePresent: body.MountTypePresent,
 		GroupNo: body.GroupNo, ThreadID: body.ThreadID,
 		CreatorUID:     creatorUID,
 		PublisherToken: botTokenFromCtx(r.Context()),
+	}, func(key string, exists bool) error {
+		if !exists {
+			return nil
+		}
+		// Gate the RESOLVED key, not the client identifier: for a derived-key doc the
+		// two differ, and authorizing the alias would check capabilities on a
+		// document that is not the write target.
+		return s.requireDocEditSlug(r, key)
 	})
 	if err != nil {
 		return err
