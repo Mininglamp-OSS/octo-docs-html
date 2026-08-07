@@ -79,6 +79,7 @@ type CodeHunk struct {
 
 type htmlDiffNode struct {
 	tag         string
+	pathTag     string
 	aid         string
 	attrs       map[string]string
 	text        string
@@ -359,7 +360,7 @@ func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSour
 		case xhtml.EndTagToken:
 			for pos := len(stack) - 1; pos >= 0; pos-- {
 				entry := stack[pos]
-				if nodes[entry.index].tag != token.pathTag {
+				if nodes[entry.index].tag != token.tag {
 					continue
 				}
 				for popped := len(stack) - 1; popped > pos; popped-- {
@@ -371,7 +372,8 @@ func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSour
 				break
 			}
 		case xhtml.StartTagToken, xhtml.SelfClosingTagToken:
-			tag := token.pathTag
+			tag := token.tag
+			pathTag := token.pathTag
 			if len(stack) > token.parentDepth {
 				for _, entry := range stack[token.parentDepth:] {
 					nodes[entry.index].outer = source[entry.start:token.start]
@@ -399,8 +401,8 @@ func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSour
 					childCounts[parent] = counts
 				}
 			}
-			counts[tag]++
-			segment := "/" + tag + fmt.Sprintf("[%d]", counts[tag])
+			counts[pathTag]++
+			segment := "/" + pathTag + fmt.Sprintf("[%d]", counts[pathTag])
 			pathLen := len(segment)
 			if parent >= 0 {
 				pathLen += len(nodes[parent].path)
@@ -417,7 +419,7 @@ func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSour
 			if parent >= 0 {
 				siblingPos = len(nodes[parent].children)
 			}
-			node := htmlDiffNode{tag: tag, aid: token.attrs["data-odoc-aid"], attrs: token.attrs, path: path, parent: parent, siblingPos: siblingPos, order: len(nodes)}
+			node := htmlDiffNode{tag: tag, pathTag: pathTag, aid: token.attrs["data-odoc-aid"], attrs: token.attrs, path: path, parent: parent, siblingPos: siblingPos, order: len(nodes)}
 			nodes = append(nodes, node)
 			index := len(nodes) - 1
 			if parent >= 0 {
@@ -425,7 +427,7 @@ func scanDiffDocument(source string, withLines bool) ([]htmlDiffNode, []diffSour
 				nodes[parent].children = append(nodes[parent].children, index)
 				nodes[parent].childTags = append(nodes[parent].childTags, tag)
 			}
-			selfClosing := token.forceClose || isDiffVoidTag(tag) || token.type_ == xhtml.SelfClosingTagToken && token.namespace != ""
+			selfClosing := token.forceClose || token.namespace == "" && isDiffVoidTag(tag) || token.type_ == xhtml.SelfClosingTagToken && token.namespace != ""
 			if selfClosing {
 				nodes[index].outer = source[token.start:token.end]
 			} else {

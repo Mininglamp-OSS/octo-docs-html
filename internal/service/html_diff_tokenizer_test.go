@@ -238,6 +238,87 @@ func TestDiffForeignEndTagBreakoutMatchesParserOracle(t *testing.T) {
 	}
 }
 
+func TestDiffSemanticTagIdentityMatchesParserOracle(t *testing.T) {
+	tests := []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{"component_underscore", `<div><icon_home></icon_home></div>`, `<div><icon_close></icon_close></div>`},
+		{"component_dot", `<div><app.header>a</app.header></div>`, `<div><app.footer>a</app.footer></div>`},
+		{"malformed_suffix", `<div><b"q">y</b></div>`, `<div><b>y</b></div>`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assertParserStructuralChangeDetected(t, test.before, test.after)
+		})
+	}
+}
+
+func TestDiffSanitizedPathTagsRemainUnique(t *testing.T) {
+	nodes, err := parseDiffHTML(`<div><icon_home>A</icon_home><icon_close>B</icon_close></div>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]struct{}{}
+	for _, node := range nodes {
+		if _, duplicate := seen[node.path]; duplicate {
+			t.Fatalf("duplicate DOM path %q", node.path)
+		}
+		seen[node.path] = struct{}{}
+	}
+}
+
+func TestDiffSanitizedTagDoesNotInheritBuiltInSemantics(t *testing.T) {
+	tests := []struct {
+		name   string
+		before string
+		after  string
+	}{
+		{"pre", `<pre_x> a  b </pre_x>`, `<pre_x> a b </pre_x>`},
+		{"script", `<script_x>&lt;b&gt;</script_x>`, `<script_x><b></b></script_x>`},
+		{"textarea", `<textarea_x>&lt;b&gt;</textarea_x>`, `<textarea_x><b></b></textarea_x>`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := buildVersionDiff(1, 2, test.before, test.after)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.name == "pre" && len(result.Changes) != 0 {
+				t.Fatalf("ordinary custom element inherited preformatted semantics: %+v", result.Changes)
+			}
+			if test.name != "pre" && len(result.Changes) == 0 {
+				t.Fatal("ordinary custom element inherited raw-text semantics")
+			}
+		})
+	}
+}
+
+func TestDiffForeignVoidNamesMatchParserOracle(t *testing.T) {
+	for _, tag := range []string{"input", "link", "wbr"} {
+		t.Run(tag, func(t *testing.T) {
+			before := `<svg><` + tag + `><circle/></svg>`
+			after := `<svg><` + tag + `/><circle/></svg>`
+			assertParserStructuralChangeDetected(t, before, after)
+		})
+	}
+}
+
+func assertParserStructuralChangeDetected(t *testing.T, before, after string) {
+	t.Helper()
+	if parserElementTree(t, before) == parserElementTree(t, after) {
+		t.Fatal("parser oracle trees unexpectedly equal")
+	}
+	result, err := buildVersionDiff(1, 2, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 {
+		t.Fatalf("structural change was silently missed: summary=%+v", result.Summary)
+	}
+}
+
 func parserElementTree(t *testing.T, source string) string {
 	t.Helper()
 	root, err := xhtml.Parse(strings.NewReader(source))
