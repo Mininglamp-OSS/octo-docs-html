@@ -16,6 +16,7 @@ import (
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/platform/sluglock"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/service/docsbackend"
+	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage"
 	"github.com/Mininglamp-OSS/octo-docs-html/internal/storage/memory"
 )
 
@@ -44,6 +45,62 @@ func TestPublishAutoIncrementsVersion(t *testing.T) {
 	}
 	if r2.Version != 2 {
 		t.Fatalf("second version = %d", r2.Version)
+	}
+}
+
+func TestPublishAuthorizationRunsUnderSlugLockWithCurrentExistence(t *testing.T) {
+	tests := []struct {
+		name string
+		seed func(t *testing.T, store *memory.Store)
+	}{
+		{
+			name: "metadata",
+			seed: func(t *testing.T, store *memory.Store) {
+				t.Helper()
+				if err := store.PutMeta(context.Background(), "claimed", storage.DocMeta{Slug: "claimed"}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "published blob",
+			seed: func(t *testing.T, store *memory.Store) {
+				t.Helper()
+				if _, err := store.PutDoc(context.Background(), "claimed", 1, "<html>old</html>"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "draft blob",
+			seed: func(t *testing.T, store *memory.Store) {
+				t.Helper()
+				if _, err := store.PutDraft(context.Background(), "claimed", "<html>draft</html>"); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := memory.New()
+			locker := sluglock.NewMemory()
+			docs := service.NewDocService(store, store, service.NewCommentService(store, locker), locker, "", 5<<20)
+			tc.seed(t, store)
+
+			_, err := docs.PublishAuthorized(context.Background(), service.PublishInput{
+				Slug: "claimed", HTML: "<html>new</html>",
+			}, func(exists bool) error {
+				if !exists {
+					t.Fatal("authorization saw an empty slug")
+				}
+				return apperr.Forbidden("edit required", "edit_required")
+			})
+			var appErr *apperr.Error
+			if !errors.As(err, &appErr) || appErr.Code != "edit_required" {
+				t.Fatalf("publish authorization error = %v; want edit_required", err)
+			}
+		})
 	}
 }
 
