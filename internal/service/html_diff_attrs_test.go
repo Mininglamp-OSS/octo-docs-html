@@ -225,3 +225,129 @@ func TestDiffRawTextEntityDecodingMatrix(t *testing.T) {
 		t.Fatalf("structural diff silent while hunks show the edit: %q", probe.hunkText)
 	}
 }
+
+// hasDiffSelfClosingFlag must follow the tokenizer's attribute states: after a
+// quoted value a '/' does set the flag, but inside an unquoted value it is an
+// ordinary character (quotes there are ordinary too), and an unterminated quoted
+// value swallows it.
+func TestDiffSelfClosingFlagGrammar(t *testing.T) {
+	for _, test := range []struct {
+		attrRaw string
+		want    bool
+	}{
+		{"/", true},
+		{" /", true},
+		{"\t/", true},
+		{"\n/", true},
+		{"\f/", true},
+		{" //", true},
+		{` a="b"/`, true},
+		{` a="b" /`, true},
+		{` a='b' /`, true},
+		{` a="b>c" /`, true},
+		{` a="b/c" /`, true},
+		{" a=b /", true},
+		{" a /", true},
+		{" a=b/", false},
+		{" a=b'/", false},
+		{" a=b' c=d'/", false},
+		{` a="b/`, false},
+		{" a='b/", false},
+		{" a=http://x/", false},
+		{" a", false},
+		{"", false},
+	} {
+		if got := hasDiffSelfClosingFlag(test.attrRaw); got != test.want {
+			t.Errorf("hasDiffSelfClosingFlag(%q) = %v, want %v", test.attrRaw, got, test.want)
+		}
+	}
+}
+
+// "svg"/"math" in body pop themselves when the flag is set, so a self-closed
+// inline icon must not swallow the rest of the document, and camelCase SVG names
+// must not lose the flag (the tag name is lowercased, the raw text is not).
+func TestDiffForeignSelfClosingIsNotSwallowing(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		source   string
+		wantPath string
+	}{
+		{"svg_root", `<html><body><svg/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
+		{"svg_icon", `<html><body><p>a</p><svg class="icon" aria-hidden="true"/><p>b</p></body></html>`, "/html[1]/body[1]/p[2]"},
+		{"math_root", `<html><body><math/><p>x</p></body></html>`, "/html[1]/body[1]/p[1]"},
+		{"camel_clipPath", `<html><body><svg><clipPath/><rect/></svg><p>x</p></body></html>`, "/html[1]/body[1]/svg[1]/rect[1]"},
+		{"camel_linearGradient", `<html><body><svg><linearGradient/><rect/></svg><p>x</p></body></html>`, "/html[1]/body[1]/svg[1]/rect[1]"},
+		{"upper_CIRCLE", `<html><body><svg><CIRCLE/><rect/></svg><p>x</p></body></html>`, "/html[1]/body[1]/svg[1]/rect[1]"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := diffNodePaths(t, test.source); !hasDiffPath(got, test.wantPath) {
+				t.Fatalf("paths = %v, want %s", got, test.wantPath)
+			}
+		})
+	}
+	// A self-closed foreign element must not consume a depth slot for the rest of
+	// the document.
+	deep := `<html><body><svg class="i"/>` + strings.Repeat("<div>", maxDiffDepth-2) + "x" + strings.Repeat("</div>", maxDiffDepth-2) + `</body></html>`
+	if _, err := parseDiffHTML(deep); err != nil {
+		t.Fatalf("self-closed <svg/> leaked a stack level: %v", err)
+	}
+	// Structural content changes under a self-closed foreign element stay visible.
+	result, err := buildVersionDiff(1, 2,
+		`<html><body><svg/><g>x</g></body></html>`,
+		`<html><body><svg><g>x</g></svg></body></html>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Changes) == 0 {
+		t.Fatalf("reparenting <g> into <svg> reported no change: %+v", result)
+	}
+}
+
+// Both layers must agree on whether a foreign self-closing element opens: the
+// source layer keeps its own foreign stack, and a disagreement leaks the
+// preformatted context to EOF (inflating lines and shifting the 413 threshold).
+func TestDiffForeignSelfCloseLayersAgree(t *testing.T) {
+	baseline := `<html><body><p>a` + "\n  " + `b</p></body></html>`
+	withForeign := `<html><body><svg><text style="white-space:pre"/></svg><p>a` + "\n  " + `b</p></body></html>`
+	baseLines, ok := normalizedHTMLLines(baseline)
+	if !ok {
+		t.Fatal("baseline source lines rejected")
+	}
+	foreignLines, ok := normalizedHTMLLines(withForeign)
+	if !ok {
+		t.Fatal("foreign source lines rejected")
+	}
+	countPre := func(lines []diffSourceLine) int {
+		total := 0
+		for _, line := range lines {
+			if strings.HasPrefix(line.identity, "pre:") {
+				total++
+			}
+		}
+		return total
+	}
+	if got := countPre(foreignLines); got != countPre(baseLines) {
+		t.Fatalf("self-closed foreign element leaked the preformatted context: pre lines = %d, want %d", got, countPre(baseLines))
+	}
+	// The structural layer must reach the same conclusion about the <p> text.
+	textOf := func(source string) string {
+		nodes, err := parseDiffHTML(source)
+		if err != nil {
+			t.Fatalf("parseDiffHTML(%q) err = %v", source, err)
+		}
+		for _, node := range nodes {
+			if node.tag == "p" {
+				return node.text
+			}
+		}
+		return ""
+	}
+	if got, want := textOf(withForeign), textOf(baseline); got != want {
+		t.Fatalf("structural text = %q, want %q", got, want)
+	}
+	// A closing tag must pop the foreign stack, so HTML rules resume afterwards.
+	afterForeign := `<html><body><svg><circle r="1"/></svg><div/><p>x</p></div></body></html>`
+	if got := diffNodePaths(t, afterForeign); !hasDiffPath(got, "/html[1]/body[1]/div[1]/p[1]") {
+		t.Fatalf("paths = %v, want the <p> inside <div> once the svg subtree closed", got)
+	}
+}

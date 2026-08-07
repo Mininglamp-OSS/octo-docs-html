@@ -309,8 +309,10 @@ func parseDiffHTML(source string) ([]htmlDiffNode, error) {
 		// tree builder IGNORES it on a non-void element, so <div/> still opens; inside
 		// SVG/MathML it does close the element.
 		selfClosing := isDiffVoidTag(tag)
-		if !selfClosing && hasDiffSelfClosingFlag(strings.TrimPrefix(trimmed, tag)) {
-			selfClosing = inDiffForeignContent(nodes, parent)
+		if !selfClosing && hasDiffSelfClosingFlag(trimmed[len(tag):]) {
+			// "svg"/"math" in body pop themselves on a set flag, so the element
+			// carrying it need not already be inside foreign content.
+			selfClosing = tag == "svg" || tag == "math" || inDiffForeignContent(nodes, parent)
 		}
 		// A trailing '/' on a non-void start tag is ignored, so a raw-text element
 		// still opens and only its end tag closes it.
@@ -937,19 +939,63 @@ func impliedDiffEndTag(open, next string) bool {
 }
 
 // hasDiffSelfClosingFlag reports whether a start tag carries a real self-closing
-// flag: the trailing '/' must not be part of an unquoted attribute value, which is
-// what an empty attribute list, a preceding whitespace, or a quoted value
-// guarantees. attrRaw is the tag text AFTER the element name.
+// flag. The trailing '/' is a flag unless it was consumed as part of an unquoted
+// attribute value: in the unquoted-value state only whitespace or '>' ends the
+// value, and a quote there is an ordinary character. After a quoted value the '/'
+// does set the flag. attrRaw is the tag text AFTER the element name.
 func hasDiffSelfClosingFlag(attrRaw string) bool {
 	if !strings.HasSuffix(attrRaw, "/") {
 		return false
 	}
-	body := attrRaw[:len(attrRaw)-1]
-	if body == "" {
-		return true
+	final := len(attrRaw) - 1
+	for cursor := 0; cursor < len(attrRaw); {
+		if isHTMLASCIIWhitespace(attrRaw[cursor]) || attrRaw[cursor] == '/' {
+			if cursor == final {
+				// Reached the trailing '/' outside any value: a real flag.
+				return true
+			}
+			cursor++
+			continue
+		}
+		// Attribute name.
+		for cursor < len(attrRaw) && !isHTMLASCIIWhitespace(attrRaw[cursor]) && attrRaw[cursor] != '=' && attrRaw[cursor] != '/' {
+			cursor++
+		}
+		for cursor < len(attrRaw) && isHTMLASCIIWhitespace(attrRaw[cursor]) {
+			cursor++
+		}
+		if cursor >= len(attrRaw) || attrRaw[cursor] != '=' {
+			continue
+		}
+		cursor++
+		for cursor < len(attrRaw) && isHTMLASCIIWhitespace(attrRaw[cursor]) {
+			cursor++
+		}
+		if cursor >= len(attrRaw) {
+			break
+		}
+		if quote := attrRaw[cursor]; quote == '"' || quote == '\'' {
+			cursor++
+			for cursor < len(attrRaw) && attrRaw[cursor] != quote {
+				cursor++
+			}
+			if cursor >= len(attrRaw) {
+				// Unterminated quoted value swallows the '/'.
+				return false
+			}
+			cursor++
+			continue
+		}
+		// Unquoted value: runs to the next whitespace, quotes and '/' included.
+		for cursor < len(attrRaw) && !isHTMLASCIIWhitespace(attrRaw[cursor]) {
+			if cursor == final {
+				// The trailing '/' belongs to the value, so there is no flag.
+				return false
+			}
+			cursor++
+		}
 	}
-	last := body[len(body)-1]
-	return isHTMLASCIIWhitespace(last) || last == '"' || last == '\''
+	return false
 }
 
 // inDiffForeignContent reports whether a node opened under parent lives in an SVG
@@ -1810,6 +1856,11 @@ func newWhitespaceFingerprintLine(digest string) diffSourceLine {
 func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 	lines := make([]diffSourceLine, 0, 256)
 	preStack := make([]preContext, 0, 16)
+	// foreignStack tracks open svg/math ancestors so this layer applies the same
+	// self-closing rule as the structural one. HTML integration points are not
+	// modelled here; over-reporting a foreign context can only close an element the
+	// structural layer also closes.
+	foreignStack := make([]string, 0, 4)
 	preformatted := func() bool { return len(preStack) > 0 && preStack[len(preStack)-1].preserve }
 	// layoutCSS is a bounded, conservative document-level signal that a stylesheet
 	// rule could turn a block boundary inline, making newline-free inter-tag
@@ -1871,6 +1922,7 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 			if trimmed[0] == '/' {
 				if closeTag, ok := diffTagName(trimmed[1:]); ok {
 					popPreformatted(&preStack, closeTag)
+					popDiffForeign(&foreignStack, closeTag)
 					prevInline = boundaryInline(closeTag, "")
 				}
 				fingerprint.boundary()
@@ -1881,9 +1933,13 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 				return nil, false
 			}
 			attrRaw := trimmed[len(tag):]
-			// Same rule as the structural layer: a trailing '/' does not close an
-			// ordinary HTML element, so only void elements take no content here.
+			// Same rule as the structural layer: a trailing '/' closes an element only
+			// in foreign content (and "svg"/"math" pop themselves), never on an
+			// ordinary HTML element.
 			selfClosing := isDiffVoidTag(tag)
+			if !selfClosing && hasDiffSelfClosingFlag(attrRaw) {
+				selfClosing = tag == "svg" || tag == "math" || len(foreignStack) > 0
+			}
 			if isDiffRawTextTag(tag) {
 				// Raw-text elements (script/style/textarea/title) hold text, not
 				// markup, and are transparent for whitespace anchoring: neither their
@@ -1932,6 +1988,9 @@ func normalizedHTMLLines(source string) ([]diffSourceLine, bool) {
 			fingerprint.boundary()
 			prevInline = boundaryInline(tag, attrRaw)
 			if !selfClosing {
+				if tag == "svg" || tag == "math" {
+					foreignStack = append(foreignStack, tag)
+				}
 				if preserve, establishes := isPreformattedContext(tag, attrRaw); establishes {
 					preStack = append(preStack, preContext{tag: tag, preserve: preserve})
 				}
@@ -2115,6 +2174,15 @@ func popPreformatted(preStack *[]preContext, closeTag string) {
 	for pos := len(*preStack) - 1; pos >= 0; pos-- {
 		if (*preStack)[pos].tag == closeTag {
 			*preStack = (*preStack)[:pos]
+			return
+		}
+	}
+}
+
+func popDiffForeign(foreignStack *[]string, closeTag string) {
+	for pos := len(*foreignStack) - 1; pos >= 0; pos-- {
+		if (*foreignStack)[pos] == closeTag {
+			*foreignStack = (*foreignStack)[:pos]
 			return
 		}
 	}
