@@ -863,3 +863,260 @@ func TestSentinelNumericVersionRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestVersionSourceReturnsStoredHTMLAndImmutableETag(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	rec := do(t, h, http.MethodPost, "/v1/docs", auth,
+		`{"slug":"source","html":"<html><body><section><p>raw</p></section></body></html>"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, h, http.MethodGet, "/v1/docs/source/versions/1/source", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("source = %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "raw") || !strings.Contains(body, "data-odoc-aid=") {
+		t.Fatalf("source body = %s", body)
+	}
+	if strings.Contains(body, "window.__ODOC__") || strings.Contains(body, "/* overlay */") {
+		t.Fatalf("source contains overlay injection: %s", body)
+	}
+	// Source bytes must be served inert, never as an executable same-origin
+	// document. The Web source-diff view consumes this as text.
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Fatalf("source Content-Type = %q; want text/plain; charset=utf-8", ct)
+	}
+	if nosniff := rec.Header().Get("X-Content-Type-Options"); nosniff != "nosniff" {
+		t.Fatalf("source X-Content-Type-Options = %q; want nosniff", nosniff)
+	}
+	etag := rec.Header().Get("ETag")
+	if etag == "" || rec.Header().Get("Cache-Control") != "private, max-age=31536000, immutable" {
+		t.Fatalf("cache headers: ETag=%q Cache-Control=%q", etag, rec.Header().Get("Cache-Control"))
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/docs/source/versions/1/source", nil)
+	for key, value := range authorHdrNoCT() {
+		req.Header.Set(key, value)
+	}
+	req.Header.Set("If-None-Match", etag)
+	notModified := httptest.NewRecorder()
+	h.ServeHTTP(notModified, req)
+	if notModified.Code != http.StatusNotModified || notModified.Body.Len() != 0 {
+		t.Fatalf("conditional source = %d body=%q", notModified.Code, notModified.Body.String())
+	}
+
+	latest := do(t, h, http.MethodGet, "/v1/docs/source/versions/latest/source", authorHdrNoCT(), "")
+	if latest.Code != http.StatusOK || latest.Header().Get("Cache-Control") != "private, no-cache" {
+		t.Fatalf("latest source = %d cache=%q", latest.Code, latest.Header().Get("Cache-Control"))
+	}
+	latestReq := httptest.NewRequest(http.MethodGet, "/v1/docs/source/versions/latest/source", nil)
+	for key, value := range authorHdrNoCT() {
+		latestReq.Header.Set(key, value)
+	}
+	latestReq.Header.Set("If-None-Match", latest.Header().Get("ETag"))
+	latestNotModified := httptest.NewRecorder()
+	h.ServeHTTP(latestNotModified, latestReq)
+	if latestNotModified.Code != http.StatusNotModified || latestNotModified.Body.Len() != 0 {
+		t.Fatalf("conditional latest = %d body=%q", latestNotModified.Code, latestNotModified.Body.String())
+	}
+}
+
+// TestVersionSourceIsInertAndAuthGated pins the security contract for the raw
+// source endpoint: stored user-authored bytes are returned verbatim (the Web
+// source-diff view needs them) but are served inert so a browser cannot execute
+// them as a same-origin HTML/script document, and read authorization is still
+// required. This is a regression guard for the same-origin executable-surface
+// finding on PR #25.
+func TestVersionSourceIsInertAndAuthGated(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	// A payload that would run script if the browser ever treated it as HTML.
+	rec := do(t, h, http.MethodPost, "/v1/docs", auth,
+		`{"slug":"inert","html":"<html><body><section><p>needle</p><script>window.__pwned=1<\/script></section></body></html>"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Read auth remains: an unauthenticated caller gets a hidden 404, not the bytes.
+	if anon := do(t, h, http.MethodGet, "/v1/docs/inert/versions/1/source", nil, ""); anon.Code != http.StatusNotFound {
+		t.Fatalf("unauthenticated source = %d; want 404", anon.Code)
+	}
+
+	rec = do(t, h, http.MethodGet, "/v1/docs/inert/versions/1/source", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("source = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The bytes are returned (the source-diff consumer reads them as text)...
+	body := rec.Body.String()
+	if !strings.Contains(body, "needle") || !strings.Contains(body, "window.__pwned") {
+		t.Fatalf("source did not return stored bytes: %s", body)
+	}
+
+	// ...but the response cannot execute as HTML in a same-origin context.
+	if ct := rec.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Fatalf("Content-Type = %q; want inert text/plain; charset=utf-8", ct)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q; want nosniff (no content sniffing into HTML)", got)
+	}
+	if csp := rec.Header().Get("Content-Security-Policy"); csp != "default-src 'none'; sandbox" {
+		t.Fatalf("Content-Security-Policy = %q; want default-src 'none'; sandbox", csp)
+	}
+	if xfo := rec.Header().Get("X-Frame-Options"); xfo != "DENY" {
+		t.Fatalf("X-Frame-Options = %q; want DENY", xfo)
+	}
+	if ref := rec.Header().Get("Referrer-Policy"); ref != "no-referrer" {
+		t.Fatalf("Referrer-Policy = %q; want no-referrer", ref)
+	}
+}
+
+func TestVersionSourceAndDiffAreDefaultDeny(t *testing.T) {
+	h := newTestServer(t, nil)
+	_ = do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"private-diff","html":"<html><body><p>one</p></body></html>"}`)
+	for _, target := range []string{
+		"/v1/docs/private-diff/versions/1/source",
+		"/v1/docs/private-diff/diff?from=1&to=1",
+	} {
+		rec := do(t, h, http.MethodGet, target, nil, "")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("unauthenticated %s = %d; want 404", target, rec.Code)
+		}
+	}
+}
+
+func TestVersionDiffReturnsLocalChangesWithoutWholeDocuments(t *testing.T) {
+	h := newTestServer(t, nil)
+	auth := authorHdr()
+	for _, payload := range []string{
+		`{"slug":"diff","html":"<html><body><section><p class=\"lead\">alpha</p></section><footer>same</footer></body></html>"}`,
+		`{"slug":"diff","html":"<html><body><section><p class=\"lead\">alpha updated</p></section><aside>new</aside><footer>same</footer></body></html>"}`,
+	} {
+		rec := do(t, h, http.MethodPost, "/v1/docs", auth, payload)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	rec := do(t, h, http.MethodGet, "/v1/docs/diff/diff?from=1&to=2", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("diff = %d: %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Data struct {
+			Summary struct {
+				Added    int `json:"added"`
+				Removed  int `json:"removed"`
+				Modified int `json:"modified"`
+			} `json:"summary"`
+			Changes []struct {
+				Kind       string `json:"kind"`
+				DOMPath    string `json:"dom_path"`
+				BeforeHTML string `json:"before_html"`
+				AfterHTML  string `json:"after_html"`
+			} `json:"changes"`
+			CodeHunks []any `json:"code_hunks"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Data.Summary.Modified == 0 || response.Data.Summary.Added == 0 || len(response.Data.CodeHunks) == 0 {
+		t.Fatalf("diff response = %s", rec.Body.String())
+	}
+	for _, change := range response.Data.Changes {
+		if strings.Contains(change.BeforeHTML, "<html") || strings.Contains(change.AfterHTML, "<html") {
+			t.Fatalf("change leaked whole document: %+v", change)
+		}
+	}
+}
+
+func TestVersionDiffReportsDuplicateAttributeWhitespaceChange(t *testing.T) {
+	h := newTestServer(t, nil)
+	for _, source := range []string{
+		`<html><body><input value="A B" value="same"></body></html>`,
+		`<html><body><input value="A  B" value="same"></body></html>`,
+	} {
+		payload, err := json.Marshal(map[string]string{"slug": "duplicate-attr-diff", "html": source})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), string(payload))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	rec := do(t, h, http.MethodGet, "/v1/docs/duplicate-attr-diff/diff?from=1&to=2", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("diff = %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"changes":[],"code_hunks":[]`) {
+		t.Fatalf("browser-visible change was lost: %s", rec.Body.String())
+	}
+}
+
+func TestVersionDiffHandlesManyOrdinaryEdits(t *testing.T) {
+	h := newTestServer(t, nil)
+	var before, after strings.Builder
+	before.WriteString("<html><body>")
+	after.WriteString("<html><body>")
+	for index := range 100 {
+		fmt.Fprintf(&before, "<p>paragraph %03d has the original ordinary text.</p>", index)
+		fmt.Fprintf(&after, "<p>paragraph %03d has the revised ordinary text.</p>", index)
+	}
+	before.WriteString("</body></html>")
+	after.WriteString("</body></html>")
+	for _, source := range []string{before.String(), after.String()} {
+		payload, err := json.Marshal(map[string]string{"slug": "many-edits", "html": source})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), string(payload))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("publish = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	rec := do(t, h, http.MethodGet, "/v1/docs/many-edits/diff?from=1&to=2", authorHdrNoCT(), "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("diff = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"modified":100`) {
+		t.Fatalf("unexpected diff: %s", rec.Body.String())
+	}
+}
+
+func TestVersionDiffStrictVersionValidation(t *testing.T) {
+	h := newTestServer(t, nil)
+	_ = do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"diff-validate","html":"<html><body><p>x</p></body></html>"}`)
+	for _, target := range []string{
+		"/v1/docs/diff-validate/diff?from=&to=1",
+		"/v1/docs/diff-validate/diff?from=0&to=1",
+		"/v1/docs/diff-validate/diff?from=latest&to=1",
+		"/v1/docs/diff-validate/versions/0/source",
+		"/v1/docs/diff-validate/versions/nope/source",
+		"/v1/docs/diff-validate/diff?from=1&to=1&unexpected=1",
+		"/v1/docs/diff-validate/diff?from=1&from=2&to=1",
+	} {
+		rec := do(t, h, http.MethodGet, target, authorHdrNoCT(), "")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s = %d; want 400: %s", target, rec.Code, rec.Body.String())
+		}
+	}
+	// The share link the API hands out carries ?code=, and clients append a cache
+	// buster; both must reach the handler instead of failing query validation.
+	_ = do(t, h, http.MethodPost, "/v1/docs", authorHdr(),
+		`{"slug":"diff-validate","html":"<html><body><p>y</p></body></html>"}`)
+	for _, target := range []string{
+		"/v1/docs/diff-validate/diff?from=1&to=2&code=deadbeef",
+		"/v1/docs/diff-validate/diff?from=1&to=2&_=12345",
+	} {
+		rec := do(t, h, http.MethodGet, target, authorHdrNoCT(), "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s = %d; want 200: %s", target, rec.Code, rec.Body.String())
+		}
+	}
+}

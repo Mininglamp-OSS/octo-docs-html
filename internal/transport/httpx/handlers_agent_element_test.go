@@ -111,14 +111,13 @@ func TestAgentElementReplaceMakesNewVersion(t *testing.T) {
 	}
 	var pub struct {
 		Data struct {
-			Version int
+			Version int `json:"version"`
 		}
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &pub)
 	if pub.Data.Version != 2 {
 		t.Fatalf("replace version = %d; want 2 (new version)", pub.Data.Version)
 	}
-
 	// v2 HTML reflects the change; the old content is gone.
 	v2 := do(t, h, http.MethodGet, "/d/elrep/v/2", auth, "").Body.String()
 	if !strings.Contains(v2, "replaced text") {
