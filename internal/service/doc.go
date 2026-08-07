@@ -177,6 +177,12 @@ const (
 
 // Publish publishes a new (or explicitly-versioned) document.
 func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResult, error) {
+	return s.PublishAuthorized(ctx, in, nil)
+}
+
+// PublishAuthorized publishes after authorize checks the slug's current
+// existence while the per-slug lock is held.
+func (s *DocService) PublishAuthorized(ctx context.Context, in PublishInput, authorize func(exists bool) error) (*PublishResult, error) {
 	if in.HTML == "" {
 		return nil, apperr.Validation("html (file) required", "html_required")
 	}
@@ -201,6 +207,15 @@ func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResu
 	// version and clobber each other (and drift meta vs blobs).
 	var result *PublishResult
 	err = s.lock.With(ctx, in.Slug, func() error {
+		if authorize != nil {
+			exists, xerr := s.slugExists(ctx, in.Slug)
+			if xerr != nil {
+				return xerr
+			}
+			if aerr := authorize(exists); aerr != nil {
+				return aerr
+			}
+		}
 		r, perr := s.publishLocked(ctx, in, stamped)
 		result = r
 		return perr
@@ -210,6 +225,25 @@ func (s *DocService) Publish(ctx context.Context, in PublishInput) (*PublishResu
 	}
 	s.afterPublished(ctx, result)
 	return result, nil
+}
+
+func (s *DocService) slugExists(ctx context.Context, slug string) (bool, error) {
+	meta, err := s.meta.GetMeta(ctx, slug)
+	if err != nil {
+		return false, err
+	}
+	if meta != nil {
+		return true, nil
+	}
+	versions, err := s.blobs.ListVersions(ctx, slug)
+	if err != nil {
+		return false, err
+	}
+	if len(versions) > 0 {
+		return true, nil
+	}
+	_, hasDraft, err := s.blobs.GetDraft(ctx, slug)
+	return hasDraft, err
 }
 
 // publishLocked runs the publish critical section. The caller MUST hold the
