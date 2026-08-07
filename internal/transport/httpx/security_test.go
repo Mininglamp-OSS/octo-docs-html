@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -389,6 +390,33 @@ func TestFrameAncestorsCSPHeader(t *testing.T) {
 // TestRateLimitIgnoresSpoofedXFF verifies that, without TrustProxyHeaders, a
 // client cannot mint a fresh rate-limit bucket by rotating X-Forwarded-For — the
 // socket peer (shared in httptest) is used, so the shared limit still applies.
+func TestVersionDiffGETIsRateLimited(t *testing.T) {
+	cfg := &config.Config{
+		WriteToken: "test-token", MaxHTMLBytes: 1 << 20, RepoURL: "https://x",
+		RateLimitWindow: 60_000_000_000,
+		RateLimitMax:    2,
+	}
+	h := newTestServer(t, cfg)
+	for version, text := range map[int]string{1: "before", 2: "after"} {
+		body := fmt.Sprintf(`{"slug":"limited-diff","version":%d,"html":"<html><body><p>%s</p></body></html>"}`, version, text)
+		if rec := do(t, h, http.MethodPost, "/v1/docs", authorHdr(), body); rec.Code != http.StatusOK {
+			t.Fatalf("publish v%d = %d: %s", version, rec.Code, rec.Body.String())
+		}
+	}
+
+	got429 := false
+	for range 4 {
+		rec := do(t, h, http.MethodGet, "/v1/docs/limited-diff/diff?from=1&to=2", authorHdrNoCT(), "")
+		if rec.Code == http.StatusTooManyRequests {
+			got429 = true
+			break
+		}
+	}
+	if !got429 {
+		t.Fatal("diff GET bypassed the rate limiter")
+	}
+}
+
 func TestRateLimitIgnoresSpoofedXFF(t *testing.T) {
 	cfg := &config.Config{
 		WriteToken: "test-token", MaxHTMLBytes: 1 << 20, RepoURL: "https://x",

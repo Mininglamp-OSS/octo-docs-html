@@ -2,8 +2,10 @@ package httpx
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -304,6 +306,117 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeData(w, 200, toVersionListDTO(res))
 	return nil
+}
+
+func (s *Server) handleVersionSource(w http.ResponseWriter, r *http.Request) error {
+	slug, err := requireSlug(chi.URLParam(r, "slug"))
+	if err != nil {
+		return err
+	}
+	rawVersion := chi.URLParam(r, "version")
+	version := 0
+	immutable := false
+	if strings.EqualFold(rawVersion, "latest") {
+		w.Header().Set("Cache-Control", "private, no-cache")
+	} else {
+		var ok bool
+		version, ok = parsePublishedVersion(rawVersion)
+		if !ok {
+			return apperr.Validation("version must be a positive integer or latest", "invalid_version")
+		}
+		immutable = true
+	}
+	source, resolved, ok, err := s.docs.Source(r.Context(), slug, version)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return apperr.NotFound("")
+	}
+	etag := fmt.Sprintf(`"%x"`, sha256.Sum256([]byte(source)))
+	w.Header().Set("ETag", etag)
+	w.Header().Set("X-Document-Version", strconv.Itoa(resolved))
+	// Reads send Access-Control-Allow-Origin: *, so a cross-origin source-diff
+	// view cannot read these without an explicit expose list.
+	w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Document-Version")
+	// Serve stored user-authored bytes as inert source, never active HTML.
+	// Consumers (the Web source-diff view) read this as text; nothing renders
+	// it as a document. text/plain + nosniff stops the browser from executing
+	// or content-sniffing it into an HTML/script context on this same origin.
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// This route sets headers by hand (not secHeaders), so re-apply the raw-byte
+	// lockdown the asset route uses for same-origin user content: no execution
+	// context, no framing, no Referer leak. Mirrors handleServeAsset.
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	if immutable {
+		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	}
+	if matchETag(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return nil
+	}
+	_, _ = io.WriteString(w, source)
+	return nil
+}
+
+func (s *Server) handleVersionDiff(w http.ResponseWriter, r *http.Request) error {
+	slug, err := requireSlug(chi.URLParam(r, "slug"))
+	if err != nil {
+		return err
+	}
+	query := r.URL.Query()
+	if len(query["from"]) != 1 || len(query["to"]) != 1 {
+		return apperr.Validation("exactly one from and to parameter are required", "invalid_diff_query")
+	}
+	// The share link this API hands out carries ?code=, and clients add a cache
+	// buster, so unknown params are rejected but those are allowed through.
+	for name := range query {
+		switch name {
+		case "from", "to", "code", "_":
+		default:
+			return apperr.Validation("unexpected query parameter", "invalid_diff_query")
+		}
+	}
+	from, ok := parsePublishedVersion(query.Get("from"))
+	if !ok {
+		return apperr.Validation("from must be a positive integer", "invalid_from_version")
+	}
+	to, ok := parsePublishedVersion(query.Get("to"))
+	if !ok {
+		return apperr.Validation("to must be a positive integer", "invalid_to_version")
+	}
+	result, err := s.docs.Diff(r.Context(), slug, from, to)
+	if err != nil {
+		return err
+	}
+	writeData(w, http.StatusOK, result)
+	return nil
+}
+
+func parsePublishedVersion(raw string) (int, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	for _, char := range raw {
+		if char < '0' || char > '9' {
+			return 0, false
+		}
+	}
+	version, ok := parseVersionParam(raw)
+	return version, ok && version > 0
+}
+
+func matchETag(header, etag string) bool {
+	for _, candidate := range strings.Split(header, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" || candidate == etag || strings.TrimPrefix(candidate, "W/") == etag {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleGetDoc(w http.ResponseWriter, r *http.Request) error {
